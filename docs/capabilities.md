@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.1) |
+| **Status** | Agreed baseline (v1.2) |
 | **Date** | 2026-10-17 |
 | **Phase** | Capability definition — precedes non-functional requirements and reference architecture |
 
@@ -41,9 +41,9 @@ The same software is deployed twice. The two deployments share nothing: no data,
 | Agent runtime | Copilot SDK with the company's Copilot subscription | Copilot SDK in bring-your-own-key mode with a personal Anthropic API key |
 | Models | Those enabled in the company's Copilot | Anthropic Claude models |
 | Billing | Copilot premium requests (company) | Anthropic API, per token (personal) |
-| Sign-in | Company SSO | Personal account (to be confirmed) |
-| Ticket tools | Jira Cloud, GitHub Issues | GitHub Issues (to be confirmed) |
-| Channels | Web app, Microsoft Teams | Web app (to be confirmed) |
+| Sign-in | Company SSO | Personal account |
+| Ticket tools | Jira Cloud, GitHub Issues | GitHub Issues |
+| Channels | Web app, Microsoft Teams | Web app |
 | Observability | Company observability stack | To be confirmed |
 | Hosting | Company public cloud | To be confirmed |
 
@@ -376,7 +376,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 | Copilot licensing and billing for automated agents (seats, premium requests, bring-your-own-key option) | Determines cost model and agent identity setup | Platform + procurement |
 | Copilot SDK maturity and language choice | Affects stability and the worker implementation | Architecture |
 | Copilot SDK bring-your-own-key with Anthropic: feature parity and maturity | The personal deployment depends on it | Architecture |
-| Personal deployment settings: hosting, sign-in, ticket tools, channels, observability | Only the agent runtime is decided so far (§2.1) | Personal deployment owner |
+| Personal deployment hosting and observability | The last undecided settings of the personal deployment (§2.1) | Personal deployment owner |
 | Cloud provider choice | Affects workspace sandboxing and managed services | Platform |
 | Build vs. adopt for durable execution | No existing workflow engine | Architecture |
 | Generative UI protocol: evaluate AG-UI, A2UI, MCP Apps vs. our own spec | Avoid inventing a protocol if a standard fits | Architecture + frontend |
@@ -397,3 +397,4 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 |---|---|
 | 1.0 | Initial agreed baseline |
 | 1.1 | Two separate deployments, business and personal (§2.1, D8). Copilot SDK as the only runtime in both, with Anthropic models via bring-your-own-key in the personal deployment (D9). Notes added to CAP-04, CAP-15, CAP-16 and CAP-20; design rule 6; two open items |
+| 1.2 | Personal deployment: sign-in (personal account), ticket tools (GitHub Issues) and channels (web app) confirmed |
