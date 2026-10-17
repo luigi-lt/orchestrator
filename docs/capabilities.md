@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.6) |
+| **Status** | Agreed baseline (v1.7) |
 | **Date** | 2026-10-17 |
 | **Phase** | Capability definition — precedes non-functional requirements and reference architecture |
 
@@ -29,7 +29,7 @@ The capability map is shaped by these answers.
 | Ticket tools | Business: Jira Cloud. Personal: GitHub Issues | Two intake adapters behind one common work-item model |
 | Source control and CI | Business: Bitbucket Data Center on-prem, Jenkins, on-prem package mirror; every repository builds with Gradle. Personal: GitHub | Sandboxes and workers reach on-prem systems over the existing private link |
 | Ticket write-back | Full: sub-tasks, status, comments, PR links | The ticket is where people follow progress |
-| Operators | Platform/SRE, agent developers, engineering leads, auditors | Role-based operator console |
+| Operators | Platform/SRE, agent developers, engineering leads, auditors | Role-based operator view |
 | Channels | User view: web app and Microsoft Teams. Operator view: web only | Generative UI must render on web and as Teams Adaptive Cards |
 
 ### 2.1 Deployment scenarios
@@ -257,7 +257,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 
 **Purpose:** people approve, steer and take over when it matters.
 
-- **One approval object** per decision, actionable from the web user view, a Teams card or the operator console. Resolved in one place means resolved everywhere. The ticket shows that approval is pending and links to it.
+- **One approval object** per decision, actionable from the web user view, a Teams card or the operator view. Resolved in one place means resolved everywhere. The ticket shows that approval is pending and links to it.
 - Approval content is built from **orchestrator data, never from agent text**, and the orchestrator verifies who approved and that they had the authority.
 - Plan approval, risk-tier approvals, clarifying questions, escalation on repeated failure.
 - Pause, resume, cancel, take over a step.
@@ -276,15 +276,17 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 - Any action from a component goes through the same authorization as an API call (CAP-08).
 - Long-running work: progress updates in the thread; notification on completion or when input is needed; the conversation resumes days later.
 - Starting work from a ticket ("plan PROJ-123") or from scratch, which creates the ticket.
+- In the web app, the user view is **conversation only**, with a thin frame for past conversations and pending actions. A **toggle** switches to the operator view (CAP-11) and back, keeping the run in focus.
 
 #### CAP-11 Operator view: run console
 
-**Purpose:** see and control what the system is doing. **Web only.**
+**Purpose:** see and control what the system is doing, in technical detail. **Web only**, built as conventional pages (no generative UI). **Open to everyone, scoped by role**, through the toggle in the web app.
 
 - **Role-based workspaces:**
 
 | Persona | Primary needs |
 |---|---|
+| Developers | Technical detail of their own runs, read-only |
 | Platform / SRE | Health, failures, queues, capacity, incident handling |
 | Agent developers | Step transcripts, tool calls, prompts, model usage, evaluation results |
 | Engineering leads | What agents are working on, pending approvals, delivery outcomes and quality |
@@ -379,7 +381,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 2. The front-door agent submits the ticket. Intake pulls it from Jira, adds linked context and passes the readiness check.
 3. The planner proposes three sub-tasks. Teams shows a summary card; the developer opens the editable plan on the web, adjusts one sub-task and approves.
 4. Sub-tasks appear in Jira. Sandboxed workers implement and test each one and open a pull request.
-5. CI fails on one PR; the fix loop handles it. An agent developer watches the transcript in the operator console.
+5. CI fails on one PR; the fix loop handles it. An agent developer watches the transcript in the operator view.
 6. One change touches the CI configuration, which is high risk. An approval card appears for the engineering lead, who approves it in Teams.
 7. Human review passes, the PR is merged, the Jira ticket moves to Done with PR links, and the developer is notified in Teams.
 
@@ -410,7 +412,7 @@ Deferred by decision:
 2. **Reference architecture:** components mapped to capabilities, interfaces, the run event model — see [architecture.md](architecture.md).
 3. **Build vs. adopt decisions** for the remaining components (durable execution: Temporal, D12).
 4. **Proof of concept** early in the build: Copilot SDK bring-your-own-key with Anthropic in the personal deployment (D9).
-5. **First release scope:** a thin slice through every Tier 1 capability — for example, one Jira Cloud project, one repository, web user view plus essential operator console, the full skeleton from intake to merged PR.
+5. **First release scope:** a thin slice through every Tier 1 capability — for example, one Jira Cloud project, one repository, web user view plus essential operator view, the full skeleton from intake to merged PR.
 
 ## Change history
 
@@ -423,3 +425,4 @@ Deferred by decision:
 | 1.4 | Business deployment runs on Azure. Open items closed: cloud provider; volume, concurrency and latency targets (now in the non-functional requirements) |
 | 1.5 | All open items closed: decisions D10–D15 (requester's Copilot seat, TypeScript, Temporal, AG-UI + A2UI, Jira issue-key linking, risk-tier baseline); compliance baseline; proof of concept for bring-your-own-key; personal cloud hosting deferred |
 | 1.6 | Correction: business source control is Bitbucket Data Center on-prem with Jenkins and an on-prem package mirror; GitHub is personal only. D14 now links Jira Cloud and Bitbucket. Ticket tools split per deployment. D7 and design rule 1 refined: write-back runs as workflow activities. See the [reference architecture](architecture.md) |
+| 1.7 | CAP-10 and CAP-11: one web app with a conversation-only user view and a conventional operator view, switched by a toggle; operator view open to everyone, scoped by role (architecture AD-25) |

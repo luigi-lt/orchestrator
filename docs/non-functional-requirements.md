@@ -58,7 +58,7 @@ Targets are 95th percentile. Model and agent thinking time is excluded unless st
 | NFR-PF-01 | Chat acknowledges a message | < 2 s | Same | Synthetic monitoring |
 | NFR-PF-02 | Agent reply starts streaming | < 5 s, including model time | Same | Synthetic monitoring |
 | NFR-PF-03 | Work that takes longer becomes a background run with progress in the chat; status never ambiguous | Always | Same | UX acceptance test |
-| NFR-PF-04 | Run status in the web user view and operator console reflects run events | < 5 s | Same | Event-lag metric |
+| NFR-PF-04 | Run status in the web user view and operator view reflects run events | < 5 s | Same | Event-lag metric |
 | NFR-PF-05 | Teams cards are updated in place at key milestones, not re-posted | Always | n/a (no Teams) | UX acceptance test |
 | NFR-PF-06 | New ticket picked up and run started | < 1 min after the webhook | Polling every ≤ 5 min (configurable) | Intake latency metric |
 | NFR-PF-07 | Orchestration overhead per step (scheduling, checkpoint, policy check) | < 1 s | Same | Tracing |

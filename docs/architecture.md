@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed (v1.0) — for review |
+| **Status** | Proposed (v1.1) — for review |
 | **Date** | 2026-10-17 |
 | **Phase** | Reference architecture — follows the [capability map](capabilities.md) and the [non-functional requirements](non-functional-requirements.md) |
 
@@ -78,6 +78,7 @@ New decisions of this phase. They complement D1–D15 in the capability map.
 | AD-22 | **Secrets in Azure Key Vault**, reached with Entra workload identity; locally from the OS keychain, injected by the launcher. **User OAuth refresh tokens are envelope-encrypted** in PostgreSQL | NFR-SE-03 | — |
 | AD-23 | **Temporal server runs as a single process on Container Apps** for the pilot, on PostgreSQL. Scale-out path in §19 | Matches best-effort availability; minimal operations | Temporal Cloud: run metadata at a third party; AKS Helm: needs AKS |
 | AD-24 | **The sandbox has a read-only checkout; commits leave as a git bundle** and are pushed by the worker after secret scanning and a policy check | Nothing inside the sandbox can write to Bitbucket | Pushing from inside the sandbox |
+| AD-25 | **One web app with two views and a toggle.** User view: conversation with generative UI only. Operator view: conventional role-scoped pages, open to everyone within their scope. Switching keeps context; every run has a home conversation | One sign-in and design system; each audience gets the interaction that fits | Two separate apps; generative UI in the operator view |
 
 ## 5. System context
 
@@ -207,7 +208,7 @@ flowchart TB
 |---|---|---|
 | Edge | Entra ID sign-in (OIDC, authorization code with PKCE) as a backend-for-frontend: tokens stay server-side, browser holds an httpOnly, SameSite=strict session cookie; CSRF protection; request rate limits | HTTPS |
 | Conversation | Front-door agent: one Copilot session per conversation on the shared `copilot-runtime` (AD-15); conversation history persisted in PostgreSQL (the Copilot session is a cache, rebuilt from history when needed); idle sessions closed after 15–30 min | Copilot SDK (JSON-RPC to sidecar) |
-| Channels / web | AG-UI event stream over Server-Sent Events, resumable with `Last-Event-ID`; A2UI component payloads | AG-UI |
+| Channels / web | User view: AG-UI event stream over Server-Sent Events, resumable with `Last-Event-ID`, carrying catalog components. Operator view: REST queries on projections plus an SSE subscription to run events. Toggle state and landing-view preference | AG-UI; REST; SSE |
 | Channels / Teams | Teams SDK bot: Teams SSO, A2UI → Adaptive Cards rendering, `Action.Execute` handling, in-place card updates, proactive notifications (conversation references stored per user) | Azure Bot Service |
 | Runs | Commands (start, pause, resume, cancel, edit plan, re-route, retry, take over) mapped to Temporal starts, signals and updates; queries served from projections | Temporal client; REST |
 | Approvals | Approval objects; renders approval content from orchestrator data only; verifies the approver with policy; signals the workflow | REST, Temporal signal |
@@ -257,24 +258,96 @@ Two listeners: **sandbox-facing** (workspace control channel and MCP) and **inte
 - **Storage**: transcript and progress to Blob plus a progress index in PostgreSQL; artifacts to Blob with content hashes.
 - **Budget and limit enforcement**: can stop a step when its budget or limits are exhausted.
 
-### 7.5 Web app and generative UI
+### 7.5 Web app: user view and operator view
 
-- **One web app**, two areas with role-based navigation: *user view* (chat, my runs) and *operator console* (runs, plan graph, live transcript, approvals inbox, interventions; later audit, evaluation, cost, registry and policy admin).
-- **Generative UI** (D4, D13): agents produce A2UI component data from a catalog; the internal model is independent of A2UI so that the pre-1.0 spec only affects the renderer adapters.
+**One web app** — one codebase, one sign-in, one design system — with **two views** and a **toggle in the header** to switch between them (AD-25). Teams carries the user view only.
 
-| Component | Who may emit it | Web | Teams |
+| | User view | Operator view |
+|---|---|---|
+| Purpose | Ask for work, follow it, answer questions and approve — in a conversation | See and control everything, in technical detail |
+| Interaction | Chat with the front-door agent; content appears as generative UI inside the conversation | Conventional pages: lists, graphs, timelines, transcripts, forms |
+| Who | Everyone | Everyone, scoped by role |
+| Who builds the screen | Composed at runtime from the component catalog by the agent and the orchestrator | Fixed pages designed and built by the team; no agent-generated UI |
+| Data channel | AG-UI stream (SSE) per conversation | REST queries on projections plus an SSE subscription to run events |
+| Channels | Web and Teams | Web only |
+
+#### Toggle and navigation
+
+- **Visible to everyone.** What the operator view shows depends on the person's role (table below).
+- **Context is kept when switching:**
+
+| From | To | Opens |
+|---|---|---|
+| A conversation with a focused run | Operator view | That run's detail page |
+| A conversation without a run | Operator view | The runs list (developers: their own runs) |
+| A run detail page | User view | That run's home conversation |
+| Any other operator page | User view | The last conversation |
+
+- **Landing view**: the last view each person used, stored as a server-side preference so it follows them across devices. First visit: user view for developers, operator view for operator roles.
+- **Addressable URLs** for both views (e.g., `/chat/<conversation>`, `/ops/runs/<run>`), used by deep links from Teams cards and notifications.
+
+#### User view
+
+**Layout.** The conversation fills the center. A **thin frame** around it holds a side panel with past conversations and a **pending-actions badge** (approvals, questions waiting for the person). Selecting a conversation or a pending action opens it in its conversation.
+
+**Conversations and runs.** Every run has a **home conversation**. A run started from the chat lives in the conversation that started it. A run started from a Jira ticket gets a conversation created the first time the orchestrator needs the requester (a question, an approval, a milestone). A conversation can hold several runs; the run most recently shown in it is its **focused run**, which the toggle uses.
+
+**Two sources of content** in the conversation timeline:
+
+1. **Agent turns** from the front-door agent: text and agent-allowed components (text, form, table).
+2. **Orchestrator cards**: system-only components posted by the orchestrator from run events and approvals (progress tracker, plan editor, approval card, pull request summary, test report). They are visually marked as coming from the orchestrator, so people can trust what an approval card says.
+
+The agent can **bring up an orchestrator card by reference** — for example, "show me the plan of PROJ-123" makes the agent call `show(runId, "plan")` — and the orchestrator renders it from its own data. The agent never writes the content of a system-only component; the `api` strips any that appear in agent output.
+
+**Actions on cards** (approve, reject, answer, edit the plan, pause or cancel one's own run) are sent as typed events straight to the `api` and authorized by policy (CAP-08). They never pass through the agent.
+
+**Component catalog** (D4, D13). The catalog is defined in our own contracts package; A2UI is used only inside the renderer adapters, so A2UI's move to 1.0 touches the renderers only.
+
+| Component | Source | Web | Teams |
 |---|---|---|---|
-| Text (markdown) | Agents, system | Rendered | TextBlock |
-| Form (text, choice, number, date) | Agents, system | Rendered | `Input.*` + `Action.Execute` |
-| Table | Agents, system | Rendered | Table |
-| Work item card | System | Rendered | Card |
-| Plan editor | System (plan data from the planner, validated by schema) | Full editor | Summary + "Edit on web" |
-| Approval card | **System only** | Rendered | `Action.Execute` approve/reject |
-| Progress tracker | System | Live | Updated in place at milestones |
-| Pull request summary, test report | System | Rendered | Summary card with link |
-| Diff viewer | System | Rendered | Link to web |
+| Text (markdown) | Agent, orchestrator | Rendered | TextBlock |
+| Form (text, choice, number, date) | Agent, orchestrator | Rendered | `Input.*` + `Action.Execute` |
+| Table | Agent, orchestrator | Rendered | Table |
+| Work item card | Orchestrator | Rendered | Card |
+| Plan editor | Orchestrator (plan data from the planner, validated by schema) | Full editor | Summary + "Edit on web" |
+| Approval card | **Orchestrator only** | Rendered | `Action.Execute` approve/reject |
+| Progress tracker | Orchestrator | Live, with pause/cancel for the requester | Updated in place at milestones |
+| Pull request summary, test report | Orchestrator | Rendered | Summary card with link |
+| Diff viewer | Orchestrator | Rendered | Link to web |
 
-The `api` strips any system-only component found in agent output before rendering. Because the web app is corporate-network only (AD-07), **Teams cards must fully support the actions people take on the move**: approving, answering clarifying questions and following progress. Plan editing and diffs need the web app.
+Because the web app is reachable only from the corporate network (AD-07), **Teams cards must fully support the actions people take on the move**: approving, answering questions and following progress. Plan editing and diffs need the web app.
+
+#### Operator view
+
+| Page | What it shows | Who |
+|---|---|---|
+| Runs | List and search by state, project, requester, date | Everyone within scope |
+| Run detail | Plan graph with sub-task status; event timeline; step detail (brief, result, live transcript, tool calls, usage, cost); linked ticket, pull requests and builds; approvals | Everyone within scope |
+| Interventions | Pause, resume, cancel, retry, edit plan, re-route, take over | Engineering leads (their projects), platform admins |
+| Approvals inbox | Pending approvals the person may decide | Approvers |
+| Workspaces | Live sandboxes, resource use, blocked egress attempts | Platform admins |
+| Agent profiles | Versions, promotion, evaluation results | Agent developers (below production), platform admins |
+| Policies and project configuration | Cedar policies, risk overrides, repository mapping, budgets | Platform admins |
+| Audit | Search and export of the audit trail; chain verification status | Auditors, platform admins |
+| Dashboards | Agent quality metrics, cost and usage, system health | Everyone within scope |
+
+**Scope by role** (§12):
+
+| Role | Sees in the operator view | Can do |
+|---|---|---|
+| Developer | Their own runs, including transcripts | Read only (pause and cancel happen in the conversation) |
+| Engineering lead | All runs of their projects | Interventions and approvals for their projects |
+| Agent developer | All runs, including transcripts | Manage agent profiles below production |
+| Platform admin | Everything operational | All interventions, configuration, promotion |
+| Auditor | Everything, including the audit trail | Read only |
+
+The Temporal Web UI stays a separate, low-level tool for platform admins.
+
+#### Shared foundations
+
+- **One design system.** Catalog components and operator pages are built from the same React component library: a plan graph looks the same in both views; only who places it differs.
+- **Authorization lives in the `api`.** Every request is checked server-side; hiding a button or a page is never the security control.
+- **Accessibility and language** apply to both views (NFR-UX-01, NFR-UX-02).
 
 ## 8. Key flows
 
@@ -467,7 +540,7 @@ Two streams with different purposes:
 ### Rules
 
 - **Write path**: the `emitEvent` activity inserts the event (primary key `runId + seq`, so retries are no-ops) and updates projection tables **in the same transaction**, then `NOTIFY` with `{runId, seq}` only.
-- **Read path**: the web app and operator console read projections and subscribe via SSE; on reconnect they resume from the last `seq`.
+- **Read path**: the operator view and the user view's orchestrator cards read projections and subscribe via SSE; on reconnect they resume from the last `seq`.
 - **Teams**: milestone events update the run's card in place (NFR-PF-05).
 - **Schema evolution**: additive changes within a `schemaVersion`; breaking changes create a new version with an upcaster on read (NFR-OP-06).
 - **Mapping to AG-UI** happens in the web channel adapter; the event model does not depend on AG-UI or A2UI.
@@ -494,8 +567,8 @@ Mapped from Entra app roles (business); the owner holds all roles (personal).
 
 | Role | Can |
 |---|---|
-| Developer | Request work, follow own runs, answer questions, approve own plans |
-| Engineering lead (per project) | Approve high-risk actions and budget increases for the project; see all project runs |
+| Developer | Request work; follow, pause and cancel own runs from the conversation; answer questions; approve own plans; see the technical detail of own runs in the operator view (read-only) |
+| Engineering lead (per project) | Approve high-risk actions and budget increases for the project; see and intervene in all project runs |
 | Agent developer | See transcripts, tool calls, evaluation results; manage agent profiles below production |
 | Platform admin | Operate the system; promote profiles; manage policies and configuration; Temporal UI |
 | Auditor | Read-only access to audit history and runs |
@@ -668,7 +741,7 @@ apps/
   workspace-manager/   WorkspaceProvider adapters
   sandbox-gateway/     control channel and MCP tool endpoint
   workspace-host/      runs inside the sandbox
-  web/                 user view and operator console
+  web/                 one web app: user view and operator view
   egress-proxy/        personal deployment only
 packages/
   contracts/           schemas: work item, run events, APIs, A2UI catalog, workspace protocol
@@ -699,8 +772,8 @@ Quality gates in CI: type checks, unit tests, contract tests for adapters, Tempo
 | CAP-07 Work intake | `api` intake; Jira and GitHub adapters; reconciliation |
 | CAP-08 Identity, policy | Entra ID; account linking; Cedar; Bitbucket branch permissions |
 | CAP-09 Human in the loop | `api` approvals; signals; channel renderers |
-| CAP-10 User view | Web app; Teams channel; front-door agent; A2UI catalog |
-| CAP-11 Operator view | Web app operator console; projections; Temporal UI for platform admins |
+| CAP-10 User view | Web app user view; Teams channel; front-door agent; component catalog; orchestrator cards |
+| CAP-11 Operator view | Web app operator view (role-scoped pages); projections; Temporal UI for platform admins |
 | CAP-12 Guardrails (Tier 2) | Egress controls, secret scanning (Tier 1 essentials); injection test suite |
 | CAP-13 Observability, audit (Tier 2) | OpenTelemetry; hash-chained audit |
 | CAP-14 Evaluation (Tier 2) | Quality metrics from run events; benchmark runs on staging |
@@ -751,3 +824,4 @@ Proofs of concept come first in the build, ordered by how much of the design dep
 | Version | Change |
 |---|---|
 | 1.0 | Initial proposal |
+| 1.1 | §7.5 rewritten: one web app with a user view (conversation and generative UI only) and an operator view (conventional role-scoped pages), switched by a context-preserving toggle (AD-25); home conversation per run; roles updated |
