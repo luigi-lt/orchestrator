@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.2) |
+| **Status** | Agreed baseline (v1.3) |
 | **Date** | 2026-10-17 |
 | **Phase** | Capability definition — precedes non-functional requirements and reference architecture |
 
@@ -23,7 +23,7 @@ The capability map is shaped by these answers.
 | Models | Business: provided through Copilot, which offers multiple providers. Personal: Anthropic models through the Copilot SDK with our own API key | No separate LLM gateway; model choice per step goes through the Copilot SDK in both deployments |
 | Blast radius | Agents may write; writes are **gated by risk tier** | Action policy and human approval are Tier 1 |
 | Task duration | Hours to days | Durable execution that survives restarts and waits on people and CI |
-| Deployment | Two separate deployments of the same software: business and personal (§2.1). Business runs on a single public cloud | No shared instance; differences between deployments are configuration. Cloud provider still to be chosen (see §9) |
+| Deployment | Two separate deployments of the same software: business and personal (§2.1). Business runs on a single public cloud; personal runs locally for now | No shared instance; differences between deployments are configuration. Cloud provider still to be chosen (see §9) |
 | Compliance | Not specified | Assume an enterprise baseline; confirm with security and compliance (see §9) |
 | Existing platform | Identity/SSO, observability stack | Integrate with both; durable execution must be provided by the orchestrator |
 | Ticket tools | Jira Cloud, GitHub Issues | Two intake adapters behind one common work-item model |
@@ -44,10 +44,15 @@ The same software is deployed twice. The two deployments share nothing: no data,
 | Sign-in | Company SSO | Personal account |
 | Ticket tools | Jira Cloud, GitHub Issues | GitHub Issues |
 | Channels | Web app, Microsoft Teams | Web app |
-| Observability | Company observability stack | To be confirmed |
-| Hosting | Company public cloud | To be confirmed |
+| Observability | Company observability stack | Any OpenTelemetry-compatible tool: a free tier or a small self-hosted one (e.g., Grafana) |
+| Hosting | Company public cloud | Runs locally on the owner's machine for now; cloud hosting decided in a later stage |
 
 Bring-your-own-key needs an Anthropic API key; a Claude Pro or Max subscription can't be used for this.
+
+Running the personal deployment locally has three consequences, all handled by configuration:
+- GitHub webhooks can't reach a local machine, so intake polls GitHub Issues instead (CAP-07).
+- Agent workspaces run as local containers (CAP-04).
+- Runs pause while the machine is off or asleep and resume when it's back (CAP-03).
 
 ## 3. Architecture decisions
 
@@ -213,7 +218,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 **Purpose:** pull work from ticket tools and keep the ticket updated as the system of record for people.
 
 - **One common work-item model** (title, description, acceptance criteria, links, attachments, requester, priority), with adapters for **Jira Cloud** and **GitHub Issues**. Chat requests convert to the same model.
-- **Triggers:** webhooks plus a filtered queue (JQL or label such as `ai-ready`, or assignment to an agent user), and on demand from chat.
+- **Triggers:** webhooks plus a filtered queue (JQL or label such as `ai-ready`, or assignment to an agent user), and on demand from chat. Where webhooks can't reach the deployment (the personal one running locally), the orchestrator polls instead.
 - **Readiness check:** if the ticket is unclear, ask questions as ticket comments and wait.
 - **Context enrichment:** linked issues, comments, attachments, linked documentation.
 - **Full write-back:** plan mirrored as Jira sub-tasks or GitHub sub-issues, status transitions, progress comments, links to PRs and outputs.
@@ -376,7 +381,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 | Copilot licensing and billing for automated agents (seats, premium requests, bring-your-own-key option) | Determines cost model and agent identity setup | Platform + procurement |
 | Copilot SDK maturity and language choice | Affects stability and the worker implementation | Architecture |
 | Copilot SDK bring-your-own-key with Anthropic: feature parity and maturity | The personal deployment depends on it | Architecture |
-| Personal deployment hosting and observability | The last undecided settings of the personal deployment (§2.1) | Personal deployment owner |
+| Personal deployment cloud hosting | Runs locally for now; to be decided in a later stage (§2.1) | Personal deployment owner |
 | Cloud provider choice | Affects workspace sandboxing and managed services | Platform |
 | Build vs. adopt for durable execution | No existing workflow engine | Architecture |
 | Generative UI protocol: evaluate AG-UI, A2UI, MCP Apps vs. our own spec | Avoid inventing a protocol if a standard fits | Architecture + frontend |
@@ -398,3 +403,4 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 | 1.0 | Initial agreed baseline |
 | 1.1 | Two separate deployments, business and personal (§2.1, D8). Copilot SDK as the only runtime in both, with Anthropic models via bring-your-own-key in the personal deployment (D9). Notes added to CAP-04, CAP-15, CAP-16 and CAP-20; design rule 6; two open items |
 | 1.2 | Personal deployment: sign-in (personal account), ticket tools (GitHub Issues) and channels (web app) confirmed |
+| 1.3 | Personal deployment runs locally for now, with any OpenTelemetry-compatible observability tool; intake polls where webhooks can't reach (CAP-07) |
