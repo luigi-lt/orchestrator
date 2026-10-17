@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.1) |
+| **Status** | Agreed baseline (v1.2) |
 | **Date** | 2026-10-17 |
 | **Phase** | Non-functional requirements — follows the [capability map](capabilities.md), precedes the reference architecture |
 
@@ -84,7 +84,7 @@ Targets are 95th percentile. Model and agent thinking time is excluded unless st
 | NFR-DR-02 | Retention | Audit trail 1 year; transcripts, step logs and artifacts (diffs, test reports) 90 days | Kept until the owner deletes them | Automated purge test |
 | NFR-DR-03 | Workspaces deleted after the run step ends | Within 1 h | Same | Cleanup metric |
 | NFR-DR-04 | Deletion on request: all data of a given run or user can be purged | Within 30 days of request | On demand | Purge test |
-| NFR-DR-05 | Data location | Run data stays in the chosen Azure region; model calls go through Copilot under the company agreement | Run data stays on the laptop; model calls go to Anthropic | Architecture review |
+| NFR-DR-05 | Data location | Run data stays in the chosen Azure region; source code from on-prem Bitbucket is processed in Azure sandboxes (approved); model calls go through Copilot under the company agreement | Run data stays on the laptop; model calls go to Anthropic | Architecture review |
 
 These retention values stand as decided. Compliance confirms them before business go-live (§5).
 
@@ -93,7 +93,7 @@ These retention values stand as decided. Compliance confirms them before busines
 | ID | Requirement | Business | Personal | Verification |
 |---|---|---|---|---|
 | NFR-SE-01 | Encryption | TLS 1.2+ in transit (1.3 preferred); all stores encrypted at rest | TLS for external calls; OS disk encryption | Configuration scan |
-| NFR-SE-02 | User sign-in | Company SSO with multi-factor authentication; no local accounts | Personal account sign-in | Security review |
+| NFR-SE-02 | User sign-in | Entra ID SSO with multi-factor authentication; no local accounts | Personal GitHub account, restricted to the owner | Security review |
 | NFR-SE-03 | Secrets | In a secrets manager; never in code, Git, logs or transcripts | In the OS keychain or a local secret store; same rules | Secret scanning in CI and on transcripts |
 | NFR-SE-04 | Credentials in workspaces | Short-lived (≤ 1 h) and scoped to one repository | Same | Security review |
 | NFR-SE-05 | Workspace isolation | Isolated container, non-root, no host access, network egress allowlist, resource limits, destroyed after use | Same | Isolation tests |
@@ -123,7 +123,7 @@ These retention values stand as decided. Compliance confirms them before busines
 | NFR-OP-02 | Core building blocks are portable (e.g., OCI containers, PostgreSQL, OpenTelemetry) | Always | Same | Architecture review |
 | NFR-OP-03 | Local footprint | n/a | Runs on a typical developer laptop (16 GB RAM) with a container runtime, including 2 concurrent workspaces | Local test |
 | NFR-OP-04 | Setup | Environment fully reproducible from infrastructure-as-code | Starts with one command; one configuration file plus secrets | Fresh-install test |
-| NFR-OP-05 | Telemetry | All components emit OpenTelemetry traces, metrics and logs to the company stack; one trace ID per run across orchestrator, workers and tools | Same, to any OpenTelemetry-compatible tool | Trace completeness check |
+| NFR-OP-05 | Telemetry | All components emit OpenTelemetry traces, metrics and logs to the company stack; every record carries the run ID; one trace per interaction or step, linked by run ID (runs last too long for a single trace) | Same, to any OpenTelemetry-compatible tool | Correlation completeness check |
 | NFR-OP-06 | **Upgrades never break runs in flight.** Run state and event formats are versioned; a run started on version N completes on N+1 | Always | Same | Upgrade test with runs in flight |
 | NFR-OP-07 | Alerts | Stuck runs (no progress beyond a threshold), failure spikes, budget breaches, queue backlog; handled in working hours | Notifications to the owner | Alert tests |
 | NFR-OP-08 | Extensibility | A new ticket tool, channel or agent runtime is added as an adapter without changing the core | Same | Architecture review |
@@ -187,3 +187,4 @@ No items are open. Resolved in v1.1:
 |---|---|
 | 1.0 | Initial agreed baseline |
 | 1.1 | All open items closed: availability stays best effort; Azure chosen; budget values relative to Copilot allowance; initial agent quality targets; compliance confirmation of retention moved to the go-live checks |
+| 1.2 | Aligned with the reference architecture: Bitbucket on-prem code processed in Azure (NFR-DR-05), Entra ID and personal GitHub sign-in (NFR-SE-02), telemetry correlated by run ID instead of one trace per run (NFR-OP-05) |

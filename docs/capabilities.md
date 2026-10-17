@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.5) |
+| **Status** | Agreed baseline (v1.6) |
 | **Date** | 2026-10-17 |
 | **Phase** | Capability definition — precedes non-functional requirements and reference architecture |
 
@@ -26,7 +26,8 @@ The capability map is shaped by these answers.
 | Deployment | Two separate deployments of the same software: business and personal (§2.1). Business runs on Azure; personal runs locally for now | No shared instance; differences between deployments are configuration |
 | Compliance | No extra regulatory constraints; business model calls are covered by the company's existing Copilot agreement | Enterprise baseline; compliance signs off before business go-live |
 | Existing platform | Identity/SSO, observability stack | Integrate with both; durable execution must be provided by the orchestrator (Temporal, D12) |
-| Ticket tools | Jira Cloud, GitHub Issues | Two intake adapters behind one common work-item model |
+| Ticket tools | Business: Jira Cloud. Personal: GitHub Issues | Two intake adapters behind one common work-item model |
+| Source control and CI | Business: Bitbucket Data Center on-prem, Jenkins, on-prem package mirror; every repository builds with Gradle. Personal: GitHub | Sandboxes and workers reach on-prem systems over the existing private link |
 | Ticket write-back | Full: sub-tasks, status, comments, PR links | The ticket is where people follow progress |
 | Operators | Platform/SRE, agent developers, engineering leads, auditors | Role-based operator console |
 | Channels | User view: web app and Microsoft Teams. Operator view: web only | Generative UI must render on web and as Teams Adaptive Cards |
@@ -41,8 +42,9 @@ The same software is deployed twice. The two deployments share nothing: no data,
 | Agent runtime | Copilot SDK with the company's Copilot subscription | Copilot SDK in bring-your-own-key mode with a personal Anthropic API key |
 | Models | Those enabled in the company's Copilot | Anthropic Claude models |
 | Billing | Copilot premium requests (company) | Anthropic API, per token (personal) |
-| Sign-in | Company SSO | Personal account |
-| Ticket tools | Jira Cloud, GitHub Issues | GitHub Issues |
+| Sign-in | Entra ID | Personal GitHub account |
+| Ticket tools | Jira Cloud | GitHub Issues |
+| Source control and CI | Bitbucket Data Center (on-prem), Jenkins | GitHub |
 | Channels | Web app, Microsoft Teams | Web app |
 | Observability | Company observability stack | Any OpenTelemetry-compatible tool: a free tier or a small self-hosted one (e.g., Grafana) |
 | Hosting | Company Azure subscription | Runs locally on the owner's machine for now; cloud hosting decided in a later stage |
@@ -64,14 +66,14 @@ Running the personal deployment locally has three consequences, all handled by c
 | D4 | **Generative UI uses a component catalog.** Agents pick pre-approved components and fill them with data; each channel renders them. | Safe, consistent, testable, and it works within Teams' Adaptive Cards. |
 | D5 | **Writes are gated by risk tier**, decided by policy, not by the agent. | Autonomy where the risk is low, human approval where it is high. |
 | D6 | **Integrate, don't rebuild,** existing identity/SSO and observability. | Reuse enterprise investments; the orchestrator owns only what's missing. |
-| D7 | **One run event stream** feeds the user view, the operator view and ticket write-back. | All surfaces show the same truth (§7). |
+| D7 | **One run event stream** is the single record of what happened; the user view and the operator view read it, and ticket write-back reflects it. Write-back itself runs as durable workflow activities (architecture AD-13). | All surfaces show the same truth (§7). |
 | D8 | **Two separate deployments, business and personal, of the same software** (§2.1). Everything that differs between them is configuration, never code. | Company code and data never reach a personal account, and vice versa. The boundary is physical, not a setting someone can get wrong. |
 | D9 | **The Copilot SDK is the only agent runtime in both deployments.** The personal deployment reaches Anthropic models through bring-your-own-key. The runtime sits behind an internal interface so the Claude Agent SDK can be added later (CAP-20). | One code path to build, secure and evaluate, with a way out if Copilot's agent loop limits what Claude models can do. |
 | D10 | **Business agent runs use the requester's Copilot seat**: the Copilot SDK session gets the requesting user's token. | Usage is billed to and attributed to the person the run acts for, matching budgets relative to the requester's allowance (NFR-CO-01). |
 | D11 | **TypeScript end to end**: orchestrator, workers, web app and Teams bot. | One language; shared types for run events and UI components; strongest generative UI ecosystem. |
 | D12 | **Durable execution adopts Temporal**: self-hosted on Azure with PostgreSQL; the single-binary dev server locally. | Mature timers, signals and versioning for runs in flight (NFR-AV-02, NFR-OP-06); same build on laptop and Azure (NFR-OP-01). |
 | D13 | **Generative UI uses AG-UI for the event stream and A2UI for the component catalog.** The official A2UI React renderer on web; our own Teams renderer mapping to Adaptive Cards. | Open standards instead of an invented protocol; A2UI's declarative format matches the catalog approach (D4). |
-| D14 | **Jira ↔ GitHub linking by issue key**: branches, commits and PR titles carry the Jira key; Atlassian's GitHub for Jira app shows them on the ticket. | Traceability from ticket to PR with a standard integration, plus the orchestrator's own PR links. |
+| D14 | **Jira ↔ Bitbucket linking by issue key**: branches, commits and PR titles carry the Jira key; the existing Bitbucket Data Center → Jira Cloud link shows them on the ticket. | Traceability from ticket to PR with a standard integration, plus the orchestrator's own PR links. |
 | D15 | **The risk-tier catalog in CAP-08 is the baseline.** Projects may make tiers stricter, never looser. Reviewed at pilot week 6. | A safe default everywhere, with room for stricter projects. |
 
 ## 4. The delivery skeleton
@@ -93,7 +95,7 @@ Every software-delivery run follows this fixed flow. Agents work inside the step
 - **Plan approval:** a person approves or edits the plan. Policy may later auto-approve low-risk plans.
 - **Execute:** agents implement, test and open pull requests in sandboxed workspaces.
 - **Review:** agent review plus human pull-request review; loops back on CI failures or review comments.
-- **Integrate:** merging follows risk-tier policy and the repository's branch protection.
+- **Integrate:** merging follows risk-tier policy and the repository's branch permissions; people merge.
 - **Close:** ticket updated, outputs linked, workspace cleaned up.
 
 ## 5. Context
@@ -112,10 +114,10 @@ Every software-delivery run follows this fixed flow. Agents work inside the step
  └───────┬───────────────────┬────────────────────────┬────────────────┘
          │                   │                        │
    Ticket tools        Sandboxed workers         Enterprise platform
-   Jira Cloud,         Copilot SDK agents        Identity/SSO,
-   GitHub Issues       (models via Copilot)      observability stack
+   Jira Cloud          Copilot SDK agents        Entra ID,
+                       (models via Copilot)      observability stack
                              │
-                  GitHub repos, CI, MCP tool servers
+         Bitbucket, Jenkins, package mirror (on-prem), MCP tools
 ```
 
 The business deployment is shown. The personal deployment has the same shape with its own settings (§2.1).
@@ -192,7 +194,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 
 - An ephemeral workspace per step or run: container, repository checkout, toolchain.
 - Copilot SDK agent hosted inside the workspace, driven by the orchestrator.
-- Network egress policy: only allowed hosts (package registries, GitHub, approved tools).
+- Network egress policy: only allowed hosts (source control, package mirror, model API, approved tools).
 - Short-lived, narrowly scoped credentials injected at start, never stored by the agent.
 - CPU, memory, disk and time limits; guaranteed cleanup.
 - Transcript, file changes and test output collected as run artifacts.
@@ -212,24 +214,24 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 
 **Purpose:** controlled access to the systems agents work with.
 
-- Tool access through MCP servers: GitHub (repos, PRs, Actions/CI), Jira, internal systems.
+- Tool access through MCP servers: Bitbucket (repositories, pull requests), Jenkins (build results), Jira, internal systems; GitHub in the personal deployment.
 - Per-profile tool allowlists and parameter validation.
-- Credential broker: short-lived GitHub App tokens, Jira OAuth tokens, and the requester's Copilot token for each agent session, refreshed for long runs (D10); agents never see long-lived secrets.
+- Credential broker: short-lived source-control tokens, Jira OAuth tokens, and the requester's Copilot token for each agent session, refreshed for long runs (D10); agents never see long-lived secrets.
 - Acting on behalf of a user where the action must carry their permissions.
 
-*Notes:* Jira and GitHub appear here as **tools** (an agent reads or updates something during a step) and in CAP-07 as **sources of work**. The two roles stay separate.
+*Notes:* ticket tools and source control appear here as **tools** (an agent reads or updates something during a step) and in CAP-07 as **sources of work**. The two roles stay separate.
 
 #### CAP-07 Work intake and ticketing integration
 
 **Purpose:** pull work from ticket tools and keep the ticket updated as the system of record for people.
 
-- **One common work-item model** (title, description, acceptance criteria, links, attachments, requester, priority), with adapters for **Jira Cloud** and **GitHub Issues**. Chat requests convert to the same model.
+- **One common work-item model** (title, description, acceptance criteria, links, attachments, requester, priority), with adapters for **Jira Cloud** (business) and **GitHub Issues** (personal). Chat requests convert to the same model.
 - **Triggers:** webhooks plus a filtered queue (JQL or label such as `ai-ready`, or assignment to an agent user), and on demand from chat. Where webhooks can't reach the deployment (the personal one running locally), the orchestrator polls instead.
 - **Readiness check:** if the ticket is unclear, ask questions as ticket comments and wait.
 - **Context enrichment:** linked issues, comments, attachments, linked documentation.
-- **Full write-back:** plan mirrored as Jira sub-tasks or GitHub sub-issues, status transitions, progress comments, links to PRs and outputs.
-- **Jira ↔ GitHub linking:** branches, commits and PR titles carry the Jira issue key, so Atlassian's GitHub for Jira app shows them on the ticket (D14).
-- **Claiming:** a ticket is locked to one run. Issues assigned to GitHub's hosted Copilot coding agent are skipped to avoid double processing.
+- **Full write-back:** plan mirrored as Jira sub-tasks (business) or GitHub sub-issues (personal), status transitions, progress comments, links to PRs and outputs.
+- **Jira ↔ Bitbucket linking:** branches, commits and PR titles carry the Jira issue key, so the existing Bitbucket Data Center → Jira Cloud link shows them on the ticket (D14).
+- **Claiming:** a ticket is locked to one run. In the personal deployment, issues assigned to GitHub's hosted Copilot coding agent are skipped to avoid double processing.
 - **Edits mid-run:** default is pause and ask the requester whether to re-plan.
 - **Visibility:** the orchestrator only acts on tickets the requester can see.
 
@@ -238,7 +240,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 **Purpose:** every action is attributable and allowed.
 
 - User sign-in through the existing identity provider (SSO), for web and Teams.
-- Each agent and worker has its own service identity (e.g., a GitHub App installation), distinct from users.
+- Each agent and worker has its own service identity (e.g., a Bitbucket bot account; a GitHub App in the personal deployment), distinct from users.
 - Model usage in the business deployment runs on the requester's Copilot entitlement (D10).
 - Every action is checked against **who the run acts for** and **what the agent profile may do**, as policy-as-code.
 - **Risk tiers for actions** decide what runs autonomously and what needs approval. Baseline classification (D15); projects may make tiers stricter, never looser; reviewed at pilot week 6:
@@ -249,7 +251,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 | Medium | Open a PR, create sub-tasks, change ticket status | Autonomous with notification; a project may require approval |
 | High | Merge to a protected branch; change CI/CD, infrastructure or permissions; touch secrets; add new dependencies | Human approval required |
 
-- Repository branch protection remains an independent safety net.
+- Repository branch permissions (Bitbucket) or branch protection (GitHub) remain an independent safety net.
 
 #### CAP-09 Human in the loop
 
@@ -364,7 +366,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 
 ## 7. Cross-cutting design rules
 
-1. **One run event stream.** Plan created, step started, approval requested, step completed, run finished. The user view, the operator view and ticket write-back are all consumers of this stream. The event model is a core contract of CAP-03.
+1. **One run event stream.** Plan created, step started, approval requested, step completed, run finished. The user view and the operator view read this stream; ticket write-back is performed by the workflow from the same facts (architecture AD-13). The event model is a core contract of CAP-03.
 2. **One approval, many surfaces.** An approval is a single object, resolved once, visible everywhere (CAP-09).
 3. **Untrusted by default.** Ticket text, repository content, tool outputs and anything an agent generates are untrusted until validated (CAP-12).
 4. **The UI is never a bypass.** Every action, from any surface, goes through CAP-08 authorization.
@@ -393,7 +395,7 @@ No items are open. Resolved in v1.5:
 | Copilot SDK bring-your-own-key with Anthropic | Anthropic is a supported provider; confirmed by an early proof of concept in the personal deployment (§10) |
 | Build vs. adopt for durable execution | Adopt Temporal (D12) |
 | Generative UI protocol | AG-UI plus A2UI (D13) |
-| Jira ↔ GitHub linking | Issue key plus Atlassian's GitHub for Jira app (D14) |
+| Jira ↔ source control linking | Issue key plus the existing Bitbucket Data Center → Jira Cloud link (D14) |
 | Risk-tier catalog of actions | CAP-08 draft confirmed as baseline (D15) |
 
 Deferred by decision:
@@ -405,7 +407,7 @@ Deferred by decision:
 ## 10. Next steps
 
 1. **Non-functional requirements:** volume, latency, availability, retention, security baseline — see [non-functional-requirements.md](non-functional-requirements.md).
-2. **Reference architecture:** components mapped to capabilities, interfaces, the run event model.
+2. **Reference architecture:** components mapped to capabilities, interfaces, the run event model — see [architecture.md](architecture.md).
 3. **Build vs. adopt decisions** for the remaining components (durable execution: Temporal, D12).
 4. **Proof of concept** early in the build: Copilot SDK bring-your-own-key with Anthropic in the personal deployment (D9).
 5. **First release scope:** a thin slice through every Tier 1 capability — for example, one Jira Cloud project, one repository, web user view plus essential operator console, the full skeleton from intake to merged PR.
@@ -420,3 +422,4 @@ Deferred by decision:
 | 1.3 | Personal deployment runs locally for now, with any OpenTelemetry-compatible observability tool; intake polls where webhooks can't reach (CAP-07) |
 | 1.4 | Business deployment runs on Azure. Open items closed: cloud provider; volume, concurrency and latency targets (now in the non-functional requirements) |
 | 1.5 | All open items closed: decisions D10–D15 (requester's Copilot seat, TypeScript, Temporal, AG-UI + A2UI, Jira issue-key linking, risk-tier baseline); compliance baseline; proof of concept for bring-your-own-key; personal cloud hosting deferred |
+| 1.6 | Correction: business source control is Bitbucket Data Center on-prem with Jenkins and an on-prem package mirror; GitHub is personal only. D14 now links Jira Cloud and Bitbucket. Ticket tools split per deployment. D7 and design rule 1 refined: write-back runs as workflow activities. See the [reference architecture](architecture.md) |
