@@ -391,7 +391,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 
 ## 10. Next steps
 
-1. **Non-functional requirements:** volume, latency, availability, retention, security baseline.
+1. **Non-functional requirements:** volume, latency, availability, retention, security baseline — see [non-functional-requirements.md](non-functional-requirements.md).
 2. **Reference architecture:** components mapped to capabilities, interfaces, the run event model.
 3. **Build vs. adopt decisions** for each component.
 4. **First release scope:** a thin slice through every Tier 1 capability — for example, one Jira Cloud project, one repository, web user view plus essential operator console, the full skeleton from intake to merged PR.
