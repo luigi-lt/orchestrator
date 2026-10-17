@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.4) |
+| **Status** | Agreed baseline (v1.5) |
 | **Date** | 2026-10-17 |
 | **Phase** | Capability definition — precedes non-functional requirements and reference architecture |
 
@@ -24,8 +24,8 @@ The capability map is shaped by these answers.
 | Blast radius | Agents may write; writes are **gated by risk tier** | Action policy and human approval are Tier 1 |
 | Task duration | Hours to days | Durable execution that survives restarts and waits on people and CI |
 | Deployment | Two separate deployments of the same software: business and personal (§2.1). Business runs on Azure; personal runs locally for now | No shared instance; differences between deployments are configuration |
-| Compliance | Not specified | Assume an enterprise baseline; confirm with security and compliance (see §9) |
-| Existing platform | Identity/SSO, observability stack | Integrate with both; durable execution must be provided by the orchestrator |
+| Compliance | No extra regulatory constraints; business model calls are covered by the company's existing Copilot agreement | Enterprise baseline; compliance signs off before business go-live |
+| Existing platform | Identity/SSO, observability stack | Integrate with both; durable execution must be provided by the orchestrator (Temporal, D12) |
 | Ticket tools | Jira Cloud, GitHub Issues | Two intake adapters behind one common work-item model |
 | Ticket write-back | Full: sub-tasks, status, comments, PR links | The ticket is where people follow progress |
 | Operators | Platform/SRE, agent developers, engineering leads, auditors | Role-based operator console |
@@ -67,6 +67,12 @@ Running the personal deployment locally has three consequences, all handled by c
 | D7 | **One run event stream** feeds the user view, the operator view and ticket write-back. | All surfaces show the same truth (§7). |
 | D8 | **Two separate deployments, business and personal, of the same software** (§2.1). Everything that differs between them is configuration, never code. | Company code and data never reach a personal account, and vice versa. The boundary is physical, not a setting someone can get wrong. |
 | D9 | **The Copilot SDK is the only agent runtime in both deployments.** The personal deployment reaches Anthropic models through bring-your-own-key. The runtime sits behind an internal interface so the Claude Agent SDK can be added later (CAP-20). | One code path to build, secure and evaluate, with a way out if Copilot's agent loop limits what Claude models can do. |
+| D10 | **Business agent runs use the requester's Copilot seat**: the Copilot SDK session gets the requesting user's token. | Usage is billed to and attributed to the person the run acts for, matching budgets relative to the requester's allowance (NFR-CO-01). |
+| D11 | **TypeScript end to end**: orchestrator, workers, web app and Teams bot. | One language; shared types for run events and UI components; strongest generative UI ecosystem. |
+| D12 | **Durable execution adopts Temporal**: self-hosted on Azure with PostgreSQL; the single-binary dev server locally. | Mature timers, signals and versioning for runs in flight (NFR-AV-02, NFR-OP-06); same build on laptop and Azure (NFR-OP-01). |
+| D13 | **Generative UI uses AG-UI for the event stream and A2UI for the component catalog.** The official A2UI React renderer on web; our own Teams renderer mapping to Adaptive Cards. | Open standards instead of an invented protocol; A2UI's declarative format matches the catalog approach (D4). |
+| D14 | **Jira ↔ GitHub linking by issue key**: branches, commits and PR titles carry the Jira key; Atlassian's GitHub for Jira app shows them on the ticket. | Traceability from ticket to PR with a standard integration, plus the orchestrator's own PR links. |
+| D15 | **The risk-tier catalog in CAP-08 is the baseline.** Projects may make tiers stricter, never looser. Reviewed at pilot week 6. | A safe default everywhere, with room for stricter projects. |
 
 ## 4. The delivery skeleton
 
@@ -178,7 +184,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 - Runaway prevention: limits on steps, time, and model usage per run; loop detection.
 - Emits the **run event stream** (§7).
 
-*Notes:* no workflow engine exists in the enterprise today, so the orchestrator must provide this capability. Build vs. adopt is decided in the architecture phase.
+*Notes:* no workflow engine exists in the enterprise today, so the orchestrator must provide this capability. It adopts Temporal (D12).
 
 #### CAP-04 Agent workspaces (sandboxed workers)
 
@@ -208,7 +214,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 
 - Tool access through MCP servers: GitHub (repos, PRs, Actions/CI), Jira, internal systems.
 - Per-profile tool allowlists and parameter validation.
-- Credential broker: short-lived GitHub App tokens, Jira OAuth tokens; agents never see long-lived secrets.
+- Credential broker: short-lived GitHub App tokens, Jira OAuth tokens, and the requester's Copilot token for each agent session, refreshed for long runs (D10); agents never see long-lived secrets.
 - Acting on behalf of a user where the action must carry their permissions.
 
 *Notes:* Jira and GitHub appear here as **tools** (an agent reads or updates something during a step) and in CAP-07 as **sources of work**. The two roles stay separate.
@@ -222,6 +228,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 - **Readiness check:** if the ticket is unclear, ask questions as ticket comments and wait.
 - **Context enrichment:** linked issues, comments, attachments, linked documentation.
 - **Full write-back:** plan mirrored as Jira sub-tasks or GitHub sub-issues, status transitions, progress comments, links to PRs and outputs.
+- **Jira ↔ GitHub linking:** branches, commits and PR titles carry the Jira issue key, so Atlassian's GitHub for Jira app shows them on the ticket (D14).
 - **Claiming:** a ticket is locked to one run. Issues assigned to GitHub's hosted Copilot coding agent are skipped to avoid double processing.
 - **Edits mid-run:** default is pause and ask the requester whether to re-plan.
 - **Visibility:** the orchestrator only acts on tickets the requester can see.
@@ -232,8 +239,9 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 
 - User sign-in through the existing identity provider (SSO), for web and Teams.
 - Each agent and worker has its own service identity (e.g., a GitHub App installation), distinct from users.
+- Model usage in the business deployment runs on the requester's Copilot entitlement (D10).
 - Every action is checked against **who the run acts for** and **what the agent profile may do**, as policy-as-code.
-- **Risk tiers for actions** decide what runs autonomously and what needs approval. Initial classification, to be refined with engineering leads and security:
+- **Risk tiers for actions** decide what runs autonomously and what needs approval. Baseline classification (D15); projects may make tiers stricter, never looser; reviewed at pilot week 6:
 
 | Risk | Examples | Gate |
 |---|---|---|
@@ -259,9 +267,9 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 
 - A **front-door agent** (Copilot SDK) understands the request and submits work. It is a **client of the orchestrator**, not the orchestrator: planning and governance stay in the skeleton.
 - **Generative UI from a component catalog:** forms for missing details, editable plan, approval card, progress tracker, PR and test summary, tables.
-- A **channel-neutral component spec** with two renderers:
-  - **Web:** full catalog.
-  - **Teams:** Adaptive Cards for the components that fit (forms, approvals, progress); a deep link to the web view for the rest (plan graph, diff viewer).
+- A **channel-neutral component catalog in A2UI format**, streamed over AG-UI (D13), with two renderers:
+  - **Web:** full catalog, through the official A2UI React renderer.
+  - **Teams:** our renderer mapping to Adaptive Cards for the components that fit (forms, approvals, progress); a deep link to the web view for the rest (plan graph, diff viewer).
 - User actions return as **typed events**, validated by the orchestrator, never as text.
 - Any action from a component goes through the same authorization as an API call (CAP-08).
 - Long-running work: progress updates in the thread; notification on completion or when input is needed; the conversation resumes days later.
@@ -351,7 +359,7 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 - The Claude Agent SDK as a second agent runtime, behind the runtime interface (D9).
 - Interop with agents outside the Copilot SDK through the A2A (agent-to-agent) protocol.
 - Additional ticket adapters (e.g., Azure DevOps, ServiceNow) via the common work-item model.
-- Additional channels (e.g., Slack, IDE) via the channel-neutral component spec.
+- Additional channels (e.g., Slack, IDE) via the channel-neutral component catalog.
 - Use cases beyond software delivery through new skeletons.
 
 ## 7. Cross-cutting design rules
@@ -373,26 +381,34 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 6. One change touches the CI configuration, which is high risk. An approval card appears for the engineering lead, who approves it in Teams.
 7. Human review passes, the PR is merged, the Jira ticket moves to Done with PR links, and the developer is notified in Teams.
 
-## 9. Open items for the next phase
+## 9. Closed and deferred items
 
-| Item | Why it matters | Owner (proposed) |
-|---|---|---|
-| Compliance requirements (data residency, retention of transcripts and code sent to model providers) | Not specified yet; may constrain models, storage and the cloud region | Security / compliance |
-| Copilot licensing and billing for automated agents (seats, premium requests, bring-your-own-key option) | Determines cost model and agent identity setup | Platform + procurement |
-| Copilot SDK maturity and language choice | Affects stability and the worker implementation | Architecture |
-| Copilot SDK bring-your-own-key with Anthropic: feature parity and maturity | The personal deployment depends on it | Architecture |
-| Personal deployment cloud hosting | Runs locally for now; to be decided in a later stage (§2.1) | Personal deployment owner |
-| Build vs. adopt for durable execution | No existing workflow engine | Architecture |
-| Generative UI protocol: evaluate AG-UI, A2UI, MCP Apps vs. our own spec | Avoid inventing a protocol if a standard fits | Architecture + frontend |
-| Jira ↔ GitHub linking (tickets in Jira, code in GitHub) | Consistent traceability from ticket to PR | Architecture |
-| Final risk-tier catalog of actions | Drives autonomy vs. approval | Engineering leads + security |
+No items are open. Resolved in v1.5:
+
+| Item | Resolution |
+|---|---|
+| Compliance requirements | Enterprise baseline; model calls covered by the existing Copilot agreement; compliance signs off before business go-live |
+| Copilot licensing and billing for agent runs | Requester's Copilot seat (D10) |
+| Copilot SDK maturity and language choice | SDK generally available since June 2026; TypeScript end to end (D11) |
+| Copilot SDK bring-your-own-key with Anthropic | Anthropic is a supported provider; confirmed by an early proof of concept in the personal deployment (§10) |
+| Build vs. adopt for durable execution | Adopt Temporal (D12) |
+| Generative UI protocol | AG-UI plus A2UI (D13) |
+| Jira ↔ GitHub linking | Issue key plus Atlassian's GitHub for Jira app (D14) |
+| Risk-tier catalog of actions | CAP-08 draft confirmed as baseline (D15) |
+
+Deferred by decision:
+
+| Item | Decision point |
+|---|---|
+| Personal deployment cloud hosting | A later stage; runs locally until then (§2.1) |
 
 ## 10. Next steps
 
 1. **Non-functional requirements:** volume, latency, availability, retention, security baseline — see [non-functional-requirements.md](non-functional-requirements.md).
 2. **Reference architecture:** components mapped to capabilities, interfaces, the run event model.
-3. **Build vs. adopt decisions** for each component.
-4. **First release scope:** a thin slice through every Tier 1 capability — for example, one Jira Cloud project, one repository, web user view plus essential operator console, the full skeleton from intake to merged PR.
+3. **Build vs. adopt decisions** for the remaining components (durable execution: Temporal, D12).
+4. **Proof of concept** early in the build: Copilot SDK bring-your-own-key with Anthropic in the personal deployment (D9).
+5. **First release scope:** a thin slice through every Tier 1 capability — for example, one Jira Cloud project, one repository, web user view plus essential operator console, the full skeleton from intake to merged PR.
 
 ## Change history
 
@@ -403,3 +419,4 @@ Tier 1 capabilities are needed from the first release, each in its essential for
 | 1.2 | Personal deployment: sign-in (personal account), ticket tools (GitHub Issues) and channels (web app) confirmed |
 | 1.3 | Personal deployment runs locally for now, with any OpenTelemetry-compatible observability tool; intake polls where webhooks can't reach (CAP-07) |
 | 1.4 | Business deployment runs on Azure. Open items closed: cloud provider; volume, concurrency and latency targets (now in the non-functional requirements) |
+| 1.5 | All open items closed: decisions D10–D15 (requester's Copilot seat, TypeScript, Temporal, AG-UI + A2UI, Jira issue-key linking, risk-tier baseline); compliance baseline; proof of concept for bring-your-own-key; personal cloud hosting deferred |
