@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.0) |
+| **Status** | Agreed baseline (v1.1) |
 | **Date** | 2026-10-17 |
 | **Phase** | Non-functional requirements — follows the [capability map](capabilities.md), precedes the reference architecture |
 
@@ -18,12 +18,15 @@ Each requirement has an ID, a target for each deployment (business and personal,
 |---|---|
 | Scale | Business: pilot team at first release (~20 developers), a department (~200 developers) within 12 months |
 | Chat responsiveness | Acknowledge within 2 s; the agent's reply starts streaming within 5 s |
-| Availability | Best effort for the first release; no run or approval is ever lost |
+| Availability | Best effort, including at department scale; no run or approval is ever lost |
 | Portability | Same build everywhere: laptop and cloud |
+| Cloud (business) | Azure |
 | Retention (business) | Audit trail 1 year; transcripts and step logs 90 days |
+| Budgets (business) | Relative to the requester's Copilot allowance (NFR-CO-01, NFR-CO-02) |
 | Run over budget (business) | Pause and ask the requester or engineering lead |
 | Personal spending cap | $50 per month on Anthropic usage |
 | Disaster recovery (business) | Lose at most 1 hour of data; restore within 1 business day |
+| Agent quality | Initial targets for the pilot, reviewed at week 6 (§4) |
 
 Set as defaults, open to review:
 
@@ -66,7 +69,7 @@ Targets are 95th percentile. Model and agent thinking time is excluded unless st
 
 | ID | Requirement | Business | Personal | Verification |
 |---|---|---|---|---|
-| NFR-AV-01 | Availability | Best effort for the first release. A formal target is set before department rollout | Best effort | — |
+| NFR-AV-01 | Availability | Best effort, including at department scale; no formal target | Best effort | — |
 | NFR-AV-02 | **No lost work.** A completed step, an approval or a ticket write-back is never lost on crash, restart or deploy; runs resume automatically | Always | Same, including after the laptop sleeps or shuts down | Failure tests: kill orchestrator and workers mid-step |
 | NFR-AV-03 | **No duplicate side effects.** Retrying a step never creates a second PR, comment, sub-task or status change | Always | Same | Failure tests with forced retries |
 | NFR-AV-04 | Disaster recovery | Lose ≤ 1 h of data (point-in-time backups); restore within 1 business day | Daily backup of local data; restore best effort | Restore rehearsal before go-live, then every 6 months |
@@ -81,9 +84,9 @@ Targets are 95th percentile. Model and agent thinking time is excluded unless st
 | NFR-DR-02 | Retention | Audit trail 1 year; transcripts, step logs and artifacts (diffs, test reports) 90 days | Kept until the owner deletes them | Automated purge test |
 | NFR-DR-03 | Workspaces deleted after the run step ends | Within 1 h | Same | Cleanup metric |
 | NFR-DR-04 | Deletion on request: all data of a given run or user can be purged | Within 30 days of request | On demand | Purge test |
-| NFR-DR-05 | Data location | Run data stays in the chosen cloud region; model calls go through Copilot under the company agreement | Run data stays on the laptop; model calls go to Anthropic | Architecture review |
+| NFR-DR-05 | Data location | Run data stays in the chosen Azure region; model calls go through Copilot under the company agreement | Run data stays on the laptop; model calls go to Anthropic | Architecture review |
 
-Retention values are to be confirmed with compliance (capabilities §9).
+These retention values stand as decided. Compliance confirms them before business go-live (§5).
 
 ### 3.5 Security
 
@@ -106,8 +109,8 @@ Retention values are to be confirmed with compliance (capabilities §9).
 
 | ID | Requirement | Business | Personal | Verification |
 |---|---|---|---|---|
-| NFR-CO-01 | Every run has a budget (model usage plus workspace time), with a default per project | Notify at 80%; at 100% the run pauses and asks the requester or engineering lead to approve more or cancel | Covered by NFR-CO-03 | Budget tests |
-| NFR-CO-02 | Monthly budget per team or project | Alerts at 50%, 80%, 100%; values set after the pilot baseline | n/a | Budget tests |
+| NFR-CO-01 | Every run has a budget (model usage plus workspace time); projects can override the default | Default: up to 10% of the requester's monthly Copilot premium-request allowance and 4 h of active workspace time. Notify at 80%; at 100% the run pauses and asks the requester or engineering lead to approve more or cancel. Recalibrated at pilot week 6 | Covered by NFR-CO-03 | Budget tests |
+| NFR-CO-02 | Monthly budget per team or project | The team's combined monthly Copilot premium-request allowance; alerts at 50%, 80%, 100%. Recalibrated at pilot week 6 | n/a | Budget tests |
 | NFR-CO-03 | Monthly spending cap | n/a | $50 on Anthropic usage. Alerts at 50%, 80%, 100%; at the cap new model calls stop and runs pause until the cap is raised or the month rolls over. The same limit is also set in the Anthropic Console as an independent safety net | Budget tests |
 | NFR-CO-04 | Cost visibility | Estimated cost per run shown while it runs; reconciled with provider billing at least daily | Same | Reconciliation report |
 | NFR-CO-05 | Idle cost | Workspaces scale to zero when idle | No paid cloud resources (runs locally) | Cost report |
@@ -137,17 +140,17 @@ Retention values are to be confirmed with compliance (capabilities §9).
 
 ## 4. Agent quality metrics
 
-These measure how good the agents' work is (CAP-14). They are **not targets yet**: the pilot's first 4–6 weeks establish a baseline, then targets are set.
+These measure how good the agents' work is (CAP-14). The pilot starts with initial targets, reviewed at week 6 against the measured baseline. **Meeting them is a condition for department rollout.**
 
-| Metric | What it shows |
-|---|---|
-| Plans approved without edits | Planning quality |
-| PRs passing CI on the first attempt | Implementation quality |
-| PRs merged vs. closed without merge | Usefulness of the output |
-| Review rounds per PR | How much human correction is needed |
-| Time from ticket pickup to PR ready for review | Delivery speed |
-| Cost per merged PR | Efficiency |
-| Reverted or reopened work | Hidden defects |
+| Metric | Initial target | What it shows |
+|---|---|---|
+| Plans approved without major edits (no sub-task added, removed or substantially rewritten) | ≥ 60% | Planning quality |
+| PRs passing CI on the first attempt | ≥ 50% | Implementation quality |
+| PRs merged rather than closed without merge | ≥ 60% | Usefulness of the output |
+| Review rounds per PR | Median ≤ 2 | How much human correction is needed |
+| Reverted or reopened work | ≤ 5% | Hidden defects |
+| Time from ticket pickup to PR ready for review | Baseline only | Delivery speed |
+| Cost per merged PR | Baseline only | Efficiency |
 
 ## 5. Verification approach
 
@@ -162,19 +165,25 @@ These measure how good the agents' work is (CAP-14). They are **not targets yet*
 | Restore rehearsal | Before go-live, then every 6 months |
 | Security review and penetration test | Before business go-live |
 | Accessibility audit | Before business go-live |
+| Compliance confirmation of retention values | Before business go-live |
+| Pilot review: quality targets and budgets recalibrated | Pilot week 6 |
+| Quality targets met (§4) | Before department rollout |
 
-## 6. Open items
+## 6. Closed items
 
-| Item | Why it matters | Owner (proposed) |
-|---|---|---|
-| Formal availability target | Needed before department rollout | Platform + engineering leads |
-| Retention values | To confirm with compliance | Security / compliance |
-| Per-run and per-team budget values | Set from the pilot baseline | Engineering leads |
-| Agent quality targets | Set from the pilot baseline | Engineering leads |
-| Cloud provider | Affects how backups, recovery and scaling are implemented | Platform |
+No items are open. Resolved in v1.1:
+
+| Item | Resolution |
+|---|---|
+| Formal availability target | Best effort, including at department scale (NFR-AV-01) |
+| Retention values | Stand as decided; compliance confirms before business go-live (§5) |
+| Per-run and per-team budget values | Relative to the requester's and team's Copilot allowance; recalibrated at pilot week 6 (NFR-CO-01, NFR-CO-02) |
+| Agent quality targets | Initial pilot targets set; reviewed at week 6; a condition for department rollout (§4) |
+| Cloud provider | Azure |
 
 ## Change history
 
 | Version | Change |
 |---|---|
 | 1.0 | Initial agreed baseline |
+| 1.1 | All open items closed: availability stays best effort; Azure chosen; budget values relative to Copilot allowance; initial agent quality targets; compliance confirmation of retention moved to the go-live checks |
