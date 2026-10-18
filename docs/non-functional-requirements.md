@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.2) |
+| **Status** | Agreed baseline (v1.3) |
 | **Date** | 2026-10-17 |
 | **Phase** | Non-functional requirements — follows the [capability map](capabilities.md), precedes the reference architecture |
 
@@ -59,8 +59,8 @@ Targets are 95th percentile. Model and agent thinking time is excluded unless st
 | NFR-PF-02 | Agent reply starts streaming | < 5 s, including model time | Same | Synthetic monitoring |
 | NFR-PF-03 | Work that takes longer becomes a background run with progress in the chat; status never ambiguous | Always | Same | UX acceptance test |
 | NFR-PF-04 | Run status in the web user view and operator view reflects run events | < 5 s | Same | Event-lag metric |
-| NFR-PF-05 | Teams cards are updated in place at key milestones, not re-posted | Always | n/a (no Teams) | UX acceptance test |
-| NFR-PF-06 | New ticket picked up and run started | < 1 min after the webhook | Polling every ≤ 5 min (configurable) | Intake latency metric |
+| NFR-PF-05 | Teams cards are updated in place at key milestones, not re-posted | When Teams is added (later release) | n/a (no Teams) | UX acceptance test |
+| NFR-PF-06 | New ticket picked up and run started | Polling every 1 min; picked up ≤ 2 min after labelling. Chat requests start at once | Polling every ≤ 5 min (configurable) | Intake latency metric |
 | NFR-PF-07 | Orchestration overhead per step (scheduling, checkpoint, policy check) | < 1 s | Same | Tracing |
 | NFR-PF-08 | Agent workspace ready (container started, repo checked out) | < 60 s for repos up to 1 GB | < 2 min | Tracing |
 | NFR-PF-09 | Operator console pages load | < 2 s | Same | Synthetic monitoring |
@@ -73,7 +73,7 @@ Targets are 95th percentile. Model and agent thinking time is excluded unless st
 | NFR-AV-02 | **No lost work.** A completed step, an approval or a ticket write-back is never lost on crash, restart or deploy; runs resume automatically | Always | Same, including after the laptop sleeps or shuts down | Failure tests: kill orchestrator and workers mid-step |
 | NFR-AV-03 | **No duplicate side effects.** Retrying a step never creates a second PR, comment, sub-task or status change | Always | Same | Failure tests with forced retries |
 | NFR-AV-04 | Disaster recovery | Lose ≤ 1 h of data (point-in-time backups); restore within 1 business day | Daily backup of local data; restore best effort | Restore rehearsal before go-live, then every 6 months |
-| NFR-AV-05 | Dependency outages (Copilot or model provider, Jira, GitHub, Teams): affected runs pause and retry with backoff; users see why; nothing fails silently | Always | Same | Failure tests with stubbed outages |
+| NFR-AV-05 | Dependency outages (Copilot or model provider, Jira, Bitbucket, Jenkins, GitHub): affected runs pause and retry with backoff; users see why; nothing fails silently | Always | Same | Failure tests with stubbed outages |
 | NFR-AV-06 | Deploys may briefly interrupt service but must respect NFR-AV-02 | Outside working hours | Any time | Deploy test with runs in flight |
 
 ### 3.4 Data and retention
@@ -132,7 +132,7 @@ These retention values stand as decided. Compliance confirms them before busines
 
 | ID | Requirement | Business | Personal | Verification |
 |---|---|---|---|---|
-| NFR-UX-01 | Accessibility | Web app meets WCAG 2.2 AA; Teams cards follow Microsoft's Adaptive Cards accessibility guidance | Web app meets WCAG 2.2 AA | Accessibility audit |
+| NFR-UX-01 | Accessibility | Web app meets WCAG 2.2 AA; Teams cards (when added) follow Microsoft's Adaptive Cards accessibility guidance | Web app meets WCAG 2.2 AA | Accessibility audit |
 | NFR-UX-02 | Language | English UI at launch; all UI text externalized so translations need no code changes; agents reply in the user's language | Same | Review |
 | NFR-UX-03 | Browsers | Current Edge, Chrome, Firefox and Safari; desktop first, usable on tablet | Same | Browser test matrix |
 | NFR-UX-04 | Consistency | Generative UI components come from one design system and behave the same everywhere | Same | Design review |
@@ -188,3 +188,4 @@ No items are open. Resolved in v1.1:
 | 1.0 | Initial agreed baseline |
 | 1.1 | All open items closed: availability stays best effort; Azure chosen; budget values relative to Copilot allowance; initial agent quality targets; compliance confirmation of retention moved to the go-live checks |
 | 1.2 | Aligned with the reference architecture: Bitbucket on-prem code processed in Azure (NFR-DR-05), Entra ID and personal GitHub sign-in (NFR-SE-02), telemetry correlated by run ID instead of one trace per run (NFR-OP-05) |
+| 1.3 | Intake by polling: pickup ≤ 2 min with a 1-minute interval (NFR-PF-06); Teams deferred to a later release (NFR-PF-05, NFR-UX-01); dependency list updated (NFR-AV-05) |
