@@ -1,0 +1,22 @@
+{
+  "name": "@orch/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "fastify": "^5.4.0",
+    "@fastify/static": "^8.2.0",
+    "@temporalio/client": "1.25.0",
+    "@github/copilot-sdk": "1.0.28",
+    "zod": "^4.3.6",
+    "@orch/contracts": "*",
+    "@orch/common": "*",
+    "@orch/store": "*",
+    "@orch/github": "*",
+    "@orch/agent-profiles": "*"
+  }
+}

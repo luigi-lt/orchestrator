@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+infra/local/certs/*
+!infra/local/certs/.gitkeep
+.data/
+coverage/

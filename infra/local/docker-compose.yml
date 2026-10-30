@@ -1,0 +1,131 @@
+# Local (personal) deployment. Start it with ./bin/orchestrator up — see docs/mvp.md.
+name: orchestrator
+
+x-app: &app
+  image: orchestrator-app:local
+  build:
+    context: ../..
+    dockerfile: infra/local/Dockerfile
+    target: app
+    args:
+      NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm}
+  restart: unless-stopped
+  networks: [backend]
+  depends_on:
+    postgres:
+      condition: service_healthy
+    temporal:
+      condition: service_started
+
+x-db: &db
+  DATABASE_URL: postgres://orch:orch@postgres:5432/orch
+  TEMPORAL_ADDRESS: temporal:7233
+
+x-github: &github
+  GITHUB_TOKEN: ${GITHUB_TOKEN:?Set GITHUB_TOKEN in .env}
+  GITHUB_REPOS: ${GITHUB_REPOS:?Set GITHUB_REPOS in .env}
+  GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
+  GITHUB_GIT_URL_TEMPLATE: ${GITHUB_GIT_URL_TEMPLATE:-https://github.com/{owner}/{repo}.git}
+  ORCH_TRIGGER_LABEL: ${ORCH_TRIGGER_LABEL:-ai-ready}
+  ORCH_MODEL: ${ORCH_MODEL:-claude-opus-5-5}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: orch
+      POSTGRES_PASSWORD: orch
+      POSTGRES_DB: orch
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orch -d orch"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    networks: [backend]
+
+  temporal:
+    image: temporalio/temporal:1.5.1
+    restart: unless-stopped
+    command: ["server", "start-dev", "--ip", "0.0.0.0", "--db-filename", "/home/temporal/temporal.db", "--headless"]
+    volumes: [temporal:/home/temporal]
+    networks: [backend]
+
+  # Holds the Anthropic key; the only way out of the sandbox network.
+  egress-proxy:
+    <<: *app
+    command: ["node", "apps/egress-proxy/dist/main.js"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in .env}
+      ANTHROPIC_UPSTREAM: ${ANTHROPIC_UPSTREAM:-https://api.anthropic.com}
+      EGRESS_ALLOWLIST: ${EGRESS_ALLOWLIST:-}
+    networks: [backend, sandbox]
+    depends_on: []
+
+  sandbox-gateway:
+    <<: *app
+    command: ["node", "apps/sandbox-gateway/dist/main.js"]
+    environment:
+      <<: *db
+      WORKSPACE_TOKEN_SECRET: ${WORKSPACE_TOKEN_SECRET:?Run ./bin/orchestrator init}
+    volumes: [artifacts:/data/artifacts]
+    networks: [backend, sandbox]
+
+  workspace-manager:
+    <<: *app
+    user: root
+    command: ["node", "apps/workspace-manager/dist/main.js"]
+    environment:
+      <<: *db
+      WORKSPACE_TOKEN_SECRET: ${WORKSPACE_TOKEN_SECRET:?Run ./bin/orchestrator init}
+      WORKSPACE_MEMORY_MB: ${WORKSPACE_MEMORY_MB:-4096}
+      WORKSPACE_CPUS: ${WORKSPACE_CPUS:-2}
+      STEP_TIMEOUT_MINUTES: ${STEP_TIMEOUT_MINUTES:-60}
+    volumes:
+      - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
+
+  worker:
+    <<: *app
+    command: ["node", "apps/worker/dist/main.js"]
+    environment:
+      <<: [*db, *github]
+      POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
+      STEP_TIMEOUT_MINUTES: ${STEP_TIMEOUT_MINUTES:-60}
+    volumes: [artifacts:/data/artifacts, repos:/data/repos]
+
+  api:
+    <<: *app
+    command: ["node", "apps/api/dist/main.js"]
+    environment:
+      <<: [*db, *github]
+      ALLOWED_HOSTS: localhost:${ORCH_PORT:-3000},127.0.0.1:${ORCH_PORT:-3000}
+      COPILOT_GITHUB_TELEMETRY_DISABLED: "true"
+    volumes: [copilot:/data/copilot]
+    ports: ["127.0.0.1:${ORCH_PORT:-3000}:3000"]
+
+  # Build-only service for the agent sandbox image (started by workspace-manager, never by compose).
+  workspace-image:
+    image: orchestrator-workspace:local
+    build:
+      context: ../..
+      dockerfile: infra/local/Dockerfile
+      target: workspace
+      args:
+        WITH_JDK: ${WORKSPACE_WITH_JDK:-0}
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm}
+    profiles: [build-only]
+    entrypoint: ["true"]
+
+networks:
+  backend: {}
+  sandbox:
+    name: orch-sandbox
+    internal: true
+
+volumes:
+  pgdata: {}
+  temporal: {}
+  artifacts: {}
+  repos: {}
+  copilot: {}

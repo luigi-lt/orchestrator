@@ -1,0 +1,49 @@
+# End-to-end test overlay: replaces GitHub and the Anthropic API with local fakes.
+# Used by test/e2e/run.sh together with infra/local/docker-compose.yml.
+x-e2e-github: &e2e-github
+  GITHUB_TOKEN: fake-token
+  GITHUB_REPOS: acme/demo
+  GITHUB_API_URL: http://fake-github:8095
+  GITHUB_GIT_URL_TEMPLATE: file:///fake-git/{owner}/{repo}.git
+
+services:
+  fake-github:
+    image: orchestrator-app:local
+    user: root
+    command: ["node", "/e2e/fake-github.mjs"]
+    environment:
+      FAKE_GIT_ROOT: /fake-git
+      FAKE_REPOS: acme/demo
+    volumes: ["../../test/e2e:/e2e:ro", "fake-git:/fake-git"]
+    ports: ["127.0.0.1:8095:8095"]
+    networks: [backend]
+
+  fake-anthropic:
+    image: orchestrator-app:local
+    command: ["node", "/e2e/fake-anthropic.mjs"]
+    volumes: ["../../test/e2e:/e2e:ro"]
+    networks: [backend]
+
+  egress-proxy:
+    environment:
+      ANTHROPIC_API_KEY: fake-key
+      ANTHROPIC_UPSTREAM: http://fake-anthropic:8099
+
+  worker:
+    environment:
+      <<: *e2e-github
+      POLL_INTERVAL_SECONDS: "10"
+    volumes: ["fake-git:/fake-git"]
+    depends_on:
+      fake-github:
+        condition: service_started
+
+  api:
+    environment:
+      <<: *e2e-github
+    depends_on:
+      fake-github:
+        condition: service_started
+
+volumes:
+  fake-git: {}

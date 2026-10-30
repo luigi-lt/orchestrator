@@ -1,0 +1,16 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/contracts" },
+    { "path": "packages/common" },
+    { "path": "packages/store" },
+    { "path": "packages/github" },
+    { "path": "packages/agent-profiles" },
+    { "path": "apps/worker" },
+    { "path": "apps/workspace-manager" },
+    { "path": "apps/sandbox-gateway" },
+    { "path": "apps/workspace-host" },
+    { "path": "apps/egress-proxy" },
+    { "path": "apps/api" }
+  ]
+}

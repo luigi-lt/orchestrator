@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# Launcher for the local orchestrator MVP. Usage: ./bin/orchestrator <init|up|down|logs|status|reset>
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$ROOT/.env"
+COMPOSE_FILE="$ROOT/infra/local/docker-compose.yml"
+
+compose() {
+  docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+require_docker() {
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed. Install Docker Desktop (macOS/Windows), Docker Engine (Linux), Rancher Desktop, Colima or Podman."
+  docker info >/dev/null 2>&1 || die "Docker is installed but not running. Start Docker Desktop (or your container engine) and try again."
+  docker compose version >/dev/null 2>&1 || die "Docker Compose v2 is required (the 'docker compose' command)."
+}
+
+random_secret() {
+  if command -v openssl >/dev/null 2>&1; then openssl rand -hex 32
+  else head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; fi
+}
+
+env_value() { grep -E "^$1=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
+
+set_env_value() {
+  local key=$1 value=$2 tmp
+  tmp="$(mktemp)"
+  if grep -qE "^$key=" "$ENV_FILE"; then
+    sed "s|^$key=.*|$key=$value|" "$ENV_FILE" >"$tmp"
+  else
+    cat "$ENV_FILE" >"$tmp"; echo "$key=$value" >>"$tmp"
+  fi
+  mv "$tmp" "$ENV_FILE"
+}
+
+cmd_init() {
+  if [[ ! -f "$ENV_FILE" ]]; then
+    cp "$ROOT/.env.example" "$ENV_FILE"
+    chmod 600 "$ENV_FILE"
+    echo "Created .env from .env.example."
+  fi
+  if [[ -z "$(env_value WORKSPACE_TOKEN_SECRET)" ]]; then
+    set_env_value WORKSPACE_TOKEN_SECRET "$(random_secret)"
+    echo "Generated WORKSPACE_TOKEN_SECRET."
+  fi
+  local missing=()
+  for key in GITHUB_TOKEN GITHUB_REPOS ANTHROPIC_API_KEY; do
+    local v; v="$(env_value "$key")"
+    [[ -z "$v" || "$v" == "owner/repo" ]] && missing+=("$key")
+  done
+  if ((${#missing[@]})); then
+    echo "Edit .env and set: ${missing[*]}"
+    return 1
+  fi
+  echo ".env is ready."
+}
+
+cmd_up() {
+  require_docker
+  cmd_init || die "Fill in .env first, then run ./bin/orchestrator up again."
+  echo "Building images (the first build takes a few minutes)…"
+  compose --profile build-only build workspace-image
+  compose up -d --build --remove-orphans
+  local port; port="$(env_value ORCH_PORT)"; port="${port:-3000}"
+  echo
+  echo "Orchestrator is starting at http://localhost:${port}"
+  echo "Follow the logs with: ./bin/orchestrator logs"
+}
+
+case "${1:-help}" in
+  init) cmd_init ;;
+  up) cmd_up ;;
+  down) require_docker; compose down ;;
+  logs) require_docker; shift || true; compose logs -f --tail=100 "$@" ;;
+  status) require_docker; compose ps ;;
+  reset)
+    require_docker
+    read -r -p "This deletes all local orchestrator data (runs, conversations, Temporal history). Continue? [y/N] " answer
+    [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 0
+    compose down -v
+    docker ps -aq --filter label=orch.workspace=1 | xargs -r docker rm -f >/dev/null
+    ;;
+  *)
+    cat <<EOF
+Usage: ./bin/orchestrator <command>
+
+  init     Create .env from .env.example and generate local secrets
+  up       Build images and start everything (web app on http://localhost:3000)
+  down     Stop everything (data is kept)
+  logs     Follow logs (optionally: logs worker api …)
+  status   Show container status
+  reset    Stop everything and delete all local data
+EOF
+    ;;
+esac

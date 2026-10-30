@@ -1,0 +1,21 @@
+{
+  "name": "@orch/worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "@temporalio/client": "1.25.0",
+    "@temporalio/worker": "1.25.0",
+    "@temporalio/workflow": "1.25.0",
+    "@temporalio/activity": "1.25.0",
+    "@orch/contracts": "*",
+    "@orch/common": "*",
+    "@orch/store": "*",
+    "@orch/github": "*",
+    "@orch/agent-profiles": "*"
+  }
+}

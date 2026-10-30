@@ -1,0 +1,17 @@
+{
+  "name": "@orch/sandbox-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "fastify": "^5.4.0",
+    "@orch/contracts": "*",
+    "@orch/common": "*",
+    "@orch/store": "*",
+    "zod": "^4.3.6"
+  }
+}
