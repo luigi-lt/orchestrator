@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.0) |
+| **Status** | Agreed baseline (v1.1) |
 | **Date** | 2026-11-07 |
 | **Scope** | The next iteration after the [MVP](mvp.md): pilot-ready experience, focused on understanding the work, shaping the plan and reviewing the result |
 
@@ -23,13 +23,12 @@ The [capability map](capabilities.md) says what the orchestrator must be able to
 | Term | Meaning |
 |---|---|
 | Requester | The person who hands the work over and works with the agents in the user view (previously called "operator" in discussion; "operator view" stays the name of the technical view) |
-| Developer | A person who implements a sub-task assigned to a human |
 | Analyst agent | Studies the work with the requester, classifies it and writes the hand-off plan |
 | Implementer agent | Implements an agent sub-task in a sandbox |
 | Reviewer agent | Reviews every change before a pull request opens |
 | Front-door agent | The chat assistant in the user view |
 | Track | Fast (bugs, small changes) or guided (stories, larger features) |
-| Hand-off plan | The approved plan of a guided-track item: goal, approach, sub-tasks and who builds each one |
+| Hand-off plan | The approved plan of a guided-track item: goal, approach and sub-tasks, each built by an agent |
 
 ## 2. Product principles
 
@@ -52,27 +51,24 @@ flowchart TD
   pr1 --> human1[Human review and merge on GitHub]
 
   classify -->|guided| session[Analysis session<br/>requester + analyst agent]
-  session --> handoff[Hand-off plan<br/>sub-tasks: agent or developer]
+  session --> handoff[Hand-off plan<br/>sub-tasks]
   handoff --> approve{Requester approves}
   approve -->|changes| session
-  approve -->|approved| split{Each sub-task}
-  split -->|agent| impl[Implement<br/>implementer agent]
+  approve -->|approved| impl[Each sub-task, in order:<br/>implement, implementer agent]
   impl --> review2[AI review]
   review2 -->|findings| impl
   review2 -->|clean| check[Diff check in the app<br/>requester]
   check -->|changes| impl
   check -->|approved| pr2[Pull request opens]
   pr2 --> human2[Human review and merge]
-  split -->|developer| issue[Sub-issue assigned<br/>tracked until closed]
-  human2 --> done([Story done when all sub-tasks are done])
-  issue --> done
+  human2 --> done([Story done when all sub-task pull requests are merged])
 ```
 
 | | Fast track | Guided track |
 |---|---|---|
 | Typical work | Bugs, small changes with a clear expected behavior | Stories, larger features, anything needing design choices |
 | Analysis | Automatic; questions only if something is unclear | Interactive session with the requester |
-| Sub-tasks | None | From the analysis, each assigned to an agent or a developer |
+| Sub-tasks | None | From the analysis, each built by an agent |
 | Human stops before the pull request | None (except high-risk changes and unresolved review findings) | Plan approval; diff check of each agent sub-task |
 | Pull requests | One | One per agent sub-task |
 
@@ -85,7 +81,7 @@ flowchart TD
 | Hand-over | Label `ai-ready`, or the chat | Label `ai-ready`, or the chat |
 | Track | Label `track:fast` / `track:guided`, set by the orchestrator | Label or custom field |
 | Sub-task | Sub-issue | Sub-task |
-| Sub-task assignee | Agent (the orchestrator) or a GitHub user | Agent or a Jira user |
+| Sub-task assignee | Agent (the orchestrator); developers in a later iteration | Same |
 | Status write-back | Labels and comments | Transitions and comments |
 
 ## 5. Functional requirements
@@ -126,15 +122,15 @@ As a requester on the guided track, I can work through the analysis with the ana
 ### 5.2 Shape the plan (guided track)
 
 #### FR-P1 Hand-off plan content · Now · CAP-02
-As a requester, I get a plan complete enough to hand to an agent or a colleague.
+As a requester, I get a plan complete enough for agents to build from and for reviewers to check against.
 - **Plan level:** goal, approach, out of scope, risks and assumptions, constraints, definition of done.
-- **Per sub-task:** title, description, acceptance criteria, likely files or areas, dependencies on other sub-tasks, size (S, M, L), **assignee type** (agent or developer) with the analyst's suggestion and reason, developer (when assigned to one).
-- The analyst splits the work into sub-tasks along the chunks of activity found in the analysis; each sub-task is independently reviewable.
+- **Per sub-task:** title, description, acceptance criteria, likely files or areas, dependencies on other sub-tasks, size (S, M, L).
+- The analyst splits the work into sub-tasks along the chunks of activity found in the analysis; each sub-task is independently reviewable and is built by an agent.
 
 #### FR-P2 Edit the plan inline · Now · CAP-02, CAP-10
 As a requester, I can edit the plan directly, so that I don't have to describe small changes in words.
-- Edit any text; add, remove and reorder sub-tasks; change dependencies; set assignee type and developer; add plan-wide constraints (e.g., "do not change the public API").
-- Validation: at least one sub-task; every sub-task has acceptance criteria; dependencies have no cycles; developer sub-tasks name a developer.
+- Edit any text; add, remove and reorder sub-tasks; change dependencies; add plan-wide constraints (e.g., "do not change the public API").
+- Validation: at least one sub-task; every sub-task has acceptance criteria; dependencies have no cycles.
 - My edits create a new plan version, marked as edited by me.
 
 #### FR-P3 Ask for a revision · Now · CAP-02
@@ -145,12 +141,12 @@ As a requester, I can ask the analyst to revise the plan with feedback, so that 
 #### FR-P4 Approve the hand-off plan · Now · CAP-09
 As a requester, I approve a specific plan version, so that what gets built is exactly what I agreed.
 - Approval is bound to the version's hash (stale approvals are refused, as today).
-- On approval: sub-issues are created (FR-P5), agent sub-tasks start in dependency order, developer sub-tasks are handed off.
+- On approval: sub-issues are created (FR-P5) and sub-tasks start in dependency order.
 
 #### FR-P5 Mirror the plan on the ticket · Now · CAP-07
-As a requester and as a developer, I see the plan where I already work.
+As a requester, and for anyone following the ticket, the plan is visible where people already work.
 - The plan summary is posted on the ticket; every sub-task becomes a **sub-issue** carrying its description, acceptance criteria and a link back to the story.
-- Developer sub-issues are assigned to the developer; agent sub-issues are labelled as agent-owned.
+- Sub-issues are labelled as agent-owned and closed when their pull request is merged.
 
 #### FR-P6 Fast-track approach · Now · CAP-02
 As a requester on the fast track, I can see the intended fix before it is built, without having to approve it.
@@ -159,14 +155,10 @@ As a requester on the fast track, I can see the intended fix before it is built,
 
 ### 5.3 Build
 
-#### FR-B1 Agent sub-tasks · Now · CAP-04
-- Agent sub-tasks run in dependency order, each in its own sandbox, on its own branch.
+#### FR-B1 Sub-tasks · Now · CAP-04
+- Sub-tasks run in dependency order, each in its own sandbox, on its own branch.
 - The implementer runs the project's tests and build where they exist; results are captured for review.
-- A sub-task that depends on a developer sub-task waits until that sub-issue is closed.
-
-#### FR-B2 Developer sub-tasks · Now · CAP-07
-- The developer receives the sub-issue with the plan's context and links to related agent pull requests.
-- The orchestrator tracks the sub-issue (polling) and shows its status in the story view.
+- A sub-task that depends on another starts on top of its branch once that sub-task's change is approved.
 
 ### 5.4 Review the result
 
@@ -186,7 +178,7 @@ As a requester, every change I see has already been reviewed, so that my time go
 #### FR-R4 Diff check in the app (guided track) · Now · CAP-09, CAP-10
 As a requester on the guided track, I see and approve each agent change before its pull request opens.
 - The **change review card** shows: summary, acceptance criteria with the implementer's evidence for each, files changed with a diff viewer (unified and side-by-side), test results, and the review report.
-- Actions: **Approve** (the pull request opens), **Request changes** with feedback (the implementer iterates, the reviewer re-reviews, and the card returns), **Reassign to a developer** (the sub-task becomes a developer sub-issue with the work done so far on its branch).
+- Actions: **Approve** (the pull request opens), **Request changes** with feedback (the implementer iterates, the reviewer re-reviews, and the card returns), **Drop the sub-task** (it is closed as not done and noted on the story; sub-tasks that depend on it pause for the requester to decide).
 
 #### FR-R5 Fast-track publishing · Now · CAP-02
 - On the fast track the pull request opens right after a clean AI review; the requester is notified and reviews on GitHub.
@@ -196,8 +188,8 @@ As a requester on the guided track, I see and approve each agent change before i
 
 #### FR-R7 Story view · Now · CAP-10, CAP-11
 As a requester, I see the whole story at a glance.
-- Every sub-task with assignee (agent or developer), status (planned, in progress, AI review, awaiting my check, pull request open, merged, done) and links.
-- The story completes when all agent pull requests are merged and all developer sub-issues are closed; the ticket is updated accordingly.
+- Every sub-task with status (planned, in progress, AI review, awaiting my check, pull request open, merged, dropped) and links.
+- The story completes when the pull requests of all sub-tasks that were not dropped are merged; the ticket is updated accordingly.
 
 ### 5.5 Next and later
 
@@ -212,6 +204,7 @@ As a requester, I see the whole story at a glance.
 | FR-N7 | Run independent agent sub-tasks in parallel | Later |
 | FR-N8 | Per-repository guidance for agents (conventions, commands, areas not to touch), classification thresholds and models | Later |
 | FR-N9 | Jira and Bitbucket on the same journeys (business stack) | Later |
+| FR-N10 | Developer sub-tasks: assign a sub-task to a named developer, who builds it on a tracked sub-issue; agent sub-tasks can wait for it | Later |
 
 ## 6. Success measures
 
@@ -228,7 +221,7 @@ As a requester, I see the whole story at a glance.
 ## 7. Demo scenario
 
 1. **A bug, fast track.** Label a bug `ai-ready`. Within minutes: the analysis card says fast track, the fix is built and reviewed by the reviewer agent (one finding fixed in the loop), the pull request opens with the review report. Merge it; the ticket closes as done.
-2. **A story, guided track.** Hand over a story in the chat. The analyst proposes the guided track; in a short session the requester asks two questions and adds a constraint. The hand-off plan has three sub-tasks: two for agents, one for a named developer. The requester edits one sub-task and approves. The developer gets a sub-issue; the first agent sub-task reaches the diff check, the requester requests one change, then approves; its pull request opens. The story view shows all three sub-tasks progressing.
+2. **A story, guided track.** Hand over a story in the chat. The analyst proposes the guided track; in a short session the requester asks two questions and adds a constraint. The hand-off plan has three sub-tasks. The requester edits one sub-task and approves; three sub-issues appear on the ticket. The first sub-task reaches the diff check, the requester requests one change, then approves; its pull request opens and the second sub-task starts. The story view shows all three sub-tasks progressing.
 
 ## 8. Impact on the architecture
 
@@ -237,15 +230,16 @@ To be detailed in the architecture document when this iteration starts.
 | Area | Change |
 |---|---|
 | Agent profiles (CAP-01) | New `analyst` (replaces `readiness-analyst` and `planner`) and `reviewer` profiles in use; implementer gains fix-round input |
-| Workflow (§9) | Track-dependent skeleton; a child workflow per sub-task with implement → AI review → fix loop → diff check → pull request; developer sub-tasks tracked by polling |
+| Workflow (§9) | Track-dependent skeleton; a child workflow per sub-task with implement → AI review → fix loop → diff check → pull request |
 | Analysis session | A conversational agent bound to the run with read-only repository access across many turns: either a workspace kept alive with an idle timeout, or session state resumed in a fresh sandbox per turn (decision in the architecture) |
-| Plan model | Versioned plans with authorship (agent or requester), dependencies and assignee types; approval bound to a version |
+| Plan model | Versioned plans with authorship (agent or requester) and dependencies; approval bound to a version |
 | Pull requests | One per agent sub-task (the architecture default; the MVP used one per run) |
 | Component catalog | New cards: analysis summary, editable hand-off plan with versions, change review with diff viewer, review report, story view |
-| GitHub integration | Sub-issues, assignees, `track:` labels; Jira mapping per §4 |
+| GitHub integration | Sub-issues, `track:` labels; Jira mapping per §4 |
 
 ## Change history
 
 | Version | Change |
 |---|---|
 | 1.0 | Initial baseline: two tracks, analysis and classification, hand-off plan, AI review with fix loop, diff check, developer sub-tasks |
+| 1.1 | Agents build every sub-task in this iteration; developer sub-tasks moved to the backlog (FR-N10); dropping a sub-task replaces reassignment |
