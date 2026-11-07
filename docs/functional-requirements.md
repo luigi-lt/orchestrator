@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.1) |
+| **Status** | Agreed baseline (v1.2) |
 | **Date** | 2026-11-07 |
 | **Scope** | The next iteration after the [MVP](mvp.md): pilot-ready experience, focused on understanding the work, shaping the plan and reviewing the result |
 
@@ -23,17 +23,18 @@ The [capability map](capabilities.md) says what the orchestrator must be able to
 | Term | Meaning |
 |---|---|
 | Requester | The person who hands the work over and works with the agents in the user view (previously called "operator" in discussion; "operator view" stays the name of the technical view) |
-| Analyst agent | Studies the work with the requester, classifies it and writes the hand-off plan |
+| Analyst agent | Does the preliminary analysis of every work item: understands it, asks clarifying questions, classifies it |
+| Architect agent | On the guided track, designs the solution with the requester in the conversation and writes the hand-off plan |
 | Implementer agent | Implements an agent sub-task in a sandbox |
 | Reviewer agent | Reviews every change before a pull request opens |
 | Front-door agent | The chat assistant in the user view |
 | Track | Fast (bugs, small changes) or guided (stories, larger features) |
-| Hand-off plan | The approved plan of a guided-track item: goal, approach and sub-tasks, each built by an agent |
+| Hand-off plan | The plan of a guided-track item, written by the architect agent and approved by the requester: goal, approach and sub-tasks, each built by an agent |
 
 ## 2. Product principles
 
 1. **Autonomy follows complexity.** Small, clear work runs without stops; larger work is shaped with the requester before anyone builds.
-2. **Agents propose, people decide.** Track, plan and every guided-track change are the requester's call; nothing the agents write can approve itself.
+2. **Agents propose, people decide.** Agents write; the requester steers them in the conversation and decides with explicit actions (track, plan approval, diff check). The requester never edits a plan by hand, and nothing an agent writes can approve itself.
 3. **A second pair of eyes, always.** Every change is reviewed by the reviewer agent before a person sees it, and by a person before it is merged.
 4. **No surprises.** Before a pull request opens on the guided track, the requester has seen the diff, the tests and the review.
 5. **Ticket-native.** The ticket stays the system of record people already use; the orchestrator mirrors plans, sub-tasks and status there.
@@ -50,8 +51,8 @@ flowchart TD
   review1 -->|clean| pr1[Pull request opens]
   pr1 --> human1[Human review and merge on GitHub]
 
-  classify -->|guided| session[Analysis session<br/>requester + analyst agent]
-  session --> handoff[Hand-off plan<br/>sub-tasks]
+  classify -->|guided| session[Design session in the chat<br/>requester + architect agent]
+  session --> handoff[Hand-off plan<br/>written by the architect agent]
   handoff --> approve{Requester approves}
   approve -->|changes| session
   approve -->|approved| impl[Each sub-task, in order:<br/>implement, implementer agent]
@@ -67,8 +68,9 @@ flowchart TD
 | | Fast track | Guided track |
 |---|---|---|
 | Typical work | Bugs, small changes with a clear expected behavior | Stories, larger features, anything needing design choices |
-| Analysis | Automatic; questions only if something is unclear | Interactive session with the requester |
-| Sub-tasks | None | From the analysis, each built by an agent |
+| Analysis | Analyst agent, automatic; questions only if something is unclear | Same preliminary analysis by the analyst agent |
+| Plan | Short fix approach from the analyst; no approval | Hand-off plan written by the architect agent in a chat with the requester; requester approves |
+| Sub-tasks | None | Defined in the hand-off plan, each built by an agent |
 | Human stops before the pull request | None (except high-risk changes and unresolved review findings) | Plan approval; diff check of each agent sub-task |
 | Pull requests | One | One per agent sub-task |
 
@@ -105,42 +107,42 @@ As a requester, I get a track proposal I can trust, so that small work flows and
 
 #### FR-A3 Change the track · Now · CAP-09
 As a requester, I can switch the track at any time before a pull request opens, so that I can take control of a tricky bug or speed up a simple story.
-- Fast → guided: the work pauses and an analysis session starts from the existing analysis.
+- Fast → guided: the work pauses and a design session with the architect agent starts from the existing analysis.
 - Guided → fast: allowed until the hand-off plan is approved; the plan is collapsed into a single change.
 - The switch, who made it and why are recorded in the run's timeline; the `track:` label on the ticket follows.
 
 #### FR-A4 Clarifying questions · Now (exists) · CAP-09
 As a requester, I can answer the agent's questions in the chat or on the ticket, so that unclear work becomes clear without meetings.
 
-#### FR-A5 Analysis session · Now · CAP-10
-As a requester on the guided track, I can work through the analysis with the analyst agent in the conversation, so that the plan reflects decisions we made together.
-- I can ask about the code ("where is the retry logic?"), challenge assumptions, choose between options the agent proposes, and add constraints.
-- The analyst keeps the **analysis summary** and a **draft hand-off plan** up to date as we talk; each update is a new version.
-- The session has no fixed length; it ends when I ask for the plan for approval, or the analyst proposes it and I accept.
-- The analyst has read-only access to the repository during the session.
+### 5.2 Shape the plan (guided track, with the architect agent)
 
-### 5.2 Shape the plan (guided track)
+The requester shapes the plan only through the conversation with the architect agent; the plan card shows the result. The requester's own action is the approval.
 
-#### FR-P1 Hand-off plan content · Now · CAP-02
+#### FR-P1 Design session · Now · CAP-02, CAP-10
+As a requester on the guided track, I design the solution with the architect agent in the conversation, so that the plan reflects decisions we made together.
+- The session starts in the run's conversation once the analyst has classified the work as guided; the architect starts from the analysis summary.
+- I can ask about the code ("where is the retry logic?"), challenge assumptions, choose between options the architect proposes (with trade-offs), and state constraints ("do not change the public API").
+- The architect keeps a **draft hand-off plan** up to date as we talk, shown in the plan card.
+- The architect has read-only access to the repository during the session.
+- The session has no fixed length; it ends when I ask for the plan for approval, or the architect proposes it and I accept.
+
+#### FR-P2 Hand-off plan content · Now · CAP-02
 As a requester, I get a plan complete enough for agents to build from and for reviewers to check against.
 - **Plan level:** goal, approach, out of scope, risks and assumptions, constraints, definition of done.
 - **Per sub-task:** title, description, acceptance criteria, likely files or areas, dependencies on other sub-tasks, size (S, M, L).
-- The analyst splits the work into sub-tasks along the chunks of activity found in the analysis; each sub-task is independently reviewable and is built by an agent.
+- The architect splits the work into sub-tasks along the chunks of activity found in the analysis; each sub-task is independently reviewable and is built by an agent.
+- Checks before the plan can be approved: at least one sub-task; every sub-task has acceptance criteria; dependencies have no cycles.
 
-#### FR-P2 Edit the plan inline · Now · CAP-02, CAP-10
-As a requester, I can edit the plan directly, so that I don't have to describe small changes in words.
-- Edit any text; add, remove and reorder sub-tasks; change dependencies; add plan-wide constraints (e.g., "do not change the public API").
-- Validation: at least one sub-task; every sub-task has acceptance criteria; dependencies have no cycles.
-- My edits create a new plan version, marked as edited by me.
-
-#### FR-P3 Ask for a revision · Now · CAP-02
-As a requester, I can ask the analyst to revise the plan with feedback, so that bigger changes are reworked properly.
-- The new version shows **what changed** compared with the previous one (sub-tasks added, removed, changed).
-- Earlier versions remain viewable.
+#### FR-P3 Revise the plan in the conversation · Now · CAP-02, CAP-10
+As a requester, I change the plan by asking the architect, never by editing it myself, so that every change is thought through and explained.
+- Any change (add, remove, split, merge or reorder sub-tasks; change scope, approach or constraints) is requested in the chat; the architect makes it and explains it.
+- Each change creates a new plan version, recording the request that prompted it.
+- The plan card shows **what changed** compared with the previous version (sub-tasks added, removed, changed); earlier versions remain viewable.
+- The requester cannot edit plan fields in the user view or the operator view.
 
 #### FR-P4 Approve the hand-off plan · Now · CAP-09
-As a requester, I approve a specific plan version, so that what gets built is exactly what I agreed.
-- Approval is bound to the version's hash (stale approvals are refused, as today).
+As a requester, I approve a specific plan version with an explicit action, so that what gets built is exactly what I agreed.
+- Approval is a button on the plan card, bound to the version's hash (stale approvals are refused, as today). Typing "approve" in the chat does not approve; the architect points to the button.
 - On approval: sub-issues are created (FR-P5) and sub-tasks start in dependency order.
 
 #### FR-P5 Mirror the plan on the ticket · Now · CAP-07
@@ -200,7 +202,7 @@ As a requester, I see the whole story at a glance.
 | FR-N3 | The agent addresses pull request review comments and CI failures (bounded, with approval before each push) | Next |
 | FR-N4 | "My work" inbox (needs me / running / done), search, history per repository | Next |
 | FR-N5 | First-run setup and a settings page instead of `.env` | Next |
-| FR-N6 | Add or change not-started sub-tasks after approval (re-plan during execution) | Next |
+| FR-N6 | Re-plan during execution: ask the architect agent to add or change sub-tasks that have not started; the change needs a new approval | Next |
 | FR-N7 | Run independent agent sub-tasks in parallel | Later |
 | FR-N8 | Per-repository guidance for agents (conventions, commands, areas not to touch), classification thresholds and models | Later |
 | FR-N9 | Jira and Bitbucket on the same journeys (business stack) | Later |
@@ -213,7 +215,7 @@ As a requester, I see the whole story at a glance.
 | Classification | Requester keeps the proposed track | ≥ 80% |
 | Fast track | Bugs reaching a pull request with no human intervention | ≥ 70% |
 | Fast track | Time from hand-over to pull request | Median ≤ 30 min |
-| Guided track | Hand-off plan approved within 2 revisions | ≥ 70% |
+| Guided track | Once the architect proposes the plan for approval, it is approved with at most 2 further revisions | ≥ 70% |
 | Diff check | Agent changes approved at the first diff check | ≥ 60% |
 | AI review | Human review comments on issues the reviewer should have caught | Trending down; baseline in the pilot |
 | Overall | Agent pull requests merged | ≥ 60% (NFR §4) |
@@ -221,7 +223,7 @@ As a requester, I see the whole story at a glance.
 ## 7. Demo scenario
 
 1. **A bug, fast track.** Label a bug `ai-ready`. Within minutes: the analysis card says fast track, the fix is built and reviewed by the reviewer agent (one finding fixed in the loop), the pull request opens with the review report. Merge it; the ticket closes as done.
-2. **A story, guided track.** Hand over a story in the chat. The analyst proposes the guided track; in a short session the requester asks two questions and adds a constraint. The hand-off plan has three sub-tasks. The requester edits one sub-task and approves; three sub-issues appear on the ticket. The first sub-task reaches the diff check, the requester requests one change, then approves; its pull request opens and the second sub-task starts. The story view shows all three sub-tasks progressing.
+2. **A story, guided track.** Hand over a story in the chat. The analyst classifies it as guided and the architect agent opens a design session: the requester asks two questions, adds a constraint and asks to split one sub-task. The architect revises the plan and the card shows what changed. The requester approves; three sub-issues appear on the ticket. The first sub-task reaches the diff check, the requester requests one change, then approves; its pull request opens and the second sub-task starts. The story view shows all three sub-tasks progressing.
 
 ## 8. Impact on the architecture
 
@@ -229,12 +231,12 @@ To be detailed in the architecture document when this iteration starts.
 
 | Area | Change |
 |---|---|
-| Agent profiles (CAP-01) | New `analyst` (replaces `readiness-analyst` and `planner`) and `reviewer` profiles in use; implementer gains fix-round input |
+| Agent profiles (CAP-01) | New `analyst` (replaces `readiness-analyst` and `planner`), `architect` and `reviewer` profiles; implementer gains fix-round input |
 | Workflow (§9) | Track-dependent skeleton; a child workflow per sub-task with implement → AI review → fix loop → diff check → pull request |
-| Analysis session | A conversational agent bound to the run with read-only repository access across many turns: either a workspace kept alive with an idle timeout, or session state resumed in a fresh sandbox per turn (decision in the architecture) |
-| Plan model | Versioned plans with authorship (agent or requester) and dependencies; approval bound to a version |
+| Design session | The architect agent converses with the requester across many turns with read-only repository access: either a workspace kept alive with an idle timeout, or session state resumed in a fresh sandbox per turn (decision in the architecture). The front-door agent hands the conversation over to the architect for the run |
+| Plan model | Versioned plans written by the architect, each version recording the request that prompted it; dependencies; approval bound to a version |
 | Pull requests | One per agent sub-task (the architecture default; the MVP used one per run) |
-| Component catalog | New cards: analysis summary, editable hand-off plan with versions, change review with diff viewer, review report, story view |
+| Component catalog | New cards: analysis summary, hand-off plan with versions and what changed (read-only), change review with diff viewer, review report, story view |
 | GitHub integration | Sub-issues, `track:` labels; Jira mapping per §4 |
 
 ## Change history
@@ -243,3 +245,4 @@ To be detailed in the architecture document when this iteration starts.
 |---|---|
 | 1.0 | Initial baseline: two tracks, analysis and classification, hand-off plan, AI review with fix loop, diff check, developer sub-tasks |
 | 1.1 | Agents build every sub-task in this iteration; developer sub-tasks moved to the backlog (FR-N10); dropping a sub-task replaces reassignment |
+| 1.2 | New architect agent shapes the hand-off plan with the requester in a design session (FR-P1, was the analyst's analysis session FR-A5); the analyst does only the preliminary analysis; inline plan editing removed: plans change only through the conversation (FR-P3) |
