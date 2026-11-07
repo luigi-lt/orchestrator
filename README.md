@@ -8,7 +8,7 @@ An orchestration layer for AI agents that turns tickets into reviewed pull reque
 |---|---|
 | [Capability map](docs/capabilities.md) | What the orchestrator must do (tiers, decisions, deployment scenarios) |
 | [Non-functional requirements](docs/non-functional-requirements.md) | How well: scale, reliability, security, cost |
-| [Functional requirements](docs/functional-requirements.md) | What people can do: tracks, analysis, hand-off plans, review (iteration 2) |
+| [Functional requirements](docs/functional-requirements.md) | What people can do: tracks, analysis, hand-off plans with the architect agent, work across products, review (iteration 2) |
 | [Reference architecture](docs/architecture.md) | How it is built: components, flows, data, security, deployment |
 | [MVP guide](docs/mvp.md) | Run the local MVP, use it, and what it leaves out |
 
