@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.3) |
+| **Status** | Agreed baseline (v1.4) |
 | **Date** | 2026-10-17 |
 | **Phase** | Non-functional requirements — follows the [capability map](capabilities.md), precedes the reference architecture |
 
@@ -64,6 +64,7 @@ Targets are 95th percentile. Model and agent thinking time is excluded unless st
 | NFR-PF-07 | Orchestration overhead per step (scheduling, checkpoint, policy check) | < 1 s | Same | Tracing |
 | NFR-PF-08 | Agent workspace ready (container started, repo checked out) | < 60 s for repos up to 1 GB | < 2 min | Tracing |
 | NFR-PF-09 | Operator console pages load | < 2 s | Same | Synthetic monitoring |
+| NFR-PF-10 | Design session with the architect agent: reply starts streaming | < 5 s while the session is active (as NFR-PF-02). After a pause: a status appears within 2 s and the reply starts within the workspace-ready time (NFR-PF-08) plus 5 s | Same, with the personal workspace-ready time | Turn-latency metric |
 
 ### 3.3 Availability, reliability and recovery
 
@@ -189,3 +190,4 @@ No items are open. Resolved in v1.1:
 | 1.1 | All open items closed: availability stays best effort; Azure chosen; budget values relative to Copilot allowance; initial agent quality targets; compliance confirmation of retention moved to the go-live checks |
 | 1.2 | Aligned with the reference architecture: Bitbucket on-prem code processed in Azure (NFR-DR-05), Entra ID and personal GitHub sign-in (NFR-SE-02), telemetry correlated by run ID instead of one trace per run (NFR-OP-05) |
 | 1.3 | Intake by polling: pickup ≤ 2 min with a 1-minute interval (NFR-PF-06); Teams deferred to a later release (NFR-PF-05, NFR-UX-01); dependency list updated (NFR-AV-05) |
+| 1.4 | NFR-PF-10 added: reply time of the design session with the architect agent (iteration 2, architecture AD-34) |

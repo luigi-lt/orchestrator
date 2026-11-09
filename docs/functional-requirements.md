@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.3) |
+| **Status** | Agreed baseline (v1.4) |
 | **Date** | 2026-11-07 |
 | **Scope** | The next iteration after the [MVP](mvp.md): pilot-ready experience, focused on understanding the work, shaping the plan and reviewing the result |
 
@@ -113,6 +113,7 @@ As a requester, I get a track proposal I can trust, so that small work flows and
 - **Guided track** otherwise, when the ticket type is Story, and always when more than one product is involved.
 - The ticket type is a hint, never the deciding factor alone: a Bug that touches many modules goes guided.
 - Thresholds are configuration, tuned during the pilot.
+- The proposal is checked, not trusted: the fast-track limits are checked again on the finished change. If it turned out bigger (more files, a second repository, a contract or high-risk file), the work stops before the pull request and asks me to continue, switch to guided, or cancel.
 
 #### FR-A3 Change the track · Now · CAP-09
 As a requester, I can switch the track at any time before a pull request opens, so that I can take control of a tricky bug or speed up a simple story.
@@ -129,7 +130,9 @@ The requester shapes the plan only through the conversation with the architect a
 
 #### FR-P1 Design session · Now · CAP-02, CAP-10
 As a requester on the guided track, I design the solution with the architect agent in the conversation, so that the plan reflects decisions we made together.
-- The session starts in the run's conversation once the analyst has classified the work as guided; the architect starts from the analysis summary.
+- Every run has its own conversation; when I started the work from a general chat, that chat shows a link to it. The session starts there by itself once the analyst has classified the work as guided: the architect opens with its reading of the analysis, options and first questions.
+- While the session is open my messages in that conversation go to the architect; every message shows which agent wrote it.
+- After about 20 minutes of silence the architect's workspace is saved and shut down; my next message resumes it, with a visible "resuming" status while I wait (up to a minute or two).
 - I can ask about the code ("where is the retry logic?"), challenge assumptions, choose between options the architect proposes (with trade-offs), and state constraints ("do not change the public API").
 - The architect keeps a **draft hand-off plan** up to date as we talk, shown in the plan card.
 - The architect has read-only access to the repositories of every product involved (FR-M3).
@@ -193,10 +196,10 @@ As a requester on the guided track, I see and approve each agent change before i
 - Actions: **Approve** (the pull request opens), **Request changes** with feedback (the implementer iterates, the reviewer re-reviews, and the card returns), **Drop the sub-task** (it is closed as not done and noted on the story; sub-tasks that depend on it pause for the requester to decide).
 
 #### FR-R5 Fast-track publishing · Now · CAP-02
-- On the fast track the pull request opens right after a clean AI review; the requester is notified and reviews on GitHub.
+- On the fast track the pull request opens right after a clean AI review, when the change is within the fast-track limits (FR-A2); the requester is notified and reviews on GitHub.
 
 #### FR-R6 High-risk changes · Now (exists) · CAP-08
-- Changes to CI/CD, infrastructure, dependencies or ownership files need the requester's approval before pushing, on both tracks.
+- Changes to CI/CD, infrastructure, dependencies, ownership files or agent guidance files (FR-M6) need an approval before pushing, on both tracks: by the requester in this iteration's single-user setup, by a lead of the product being changed in the business deployment.
 
 #### FR-R7 Story view · Now · CAP-10, CAP-11
 As a requester, I see the whole story at a glance.
@@ -207,7 +210,7 @@ As a requester, I see the whole story at a glance.
 
 #### FR-M1 Product catalog · Now · CAP-01, CAP-05, CAP-07
 As the person who sets up the orchestrator, I describe the products once, so that agents know what each product owns and how to work on it.
-- Per product: name; what it owns and what it does not (used by the analyst to place the work); repositories, each with its role (for example service, web client, library); owners; where its tickets live (GitHub repository, or Jira project later); toolchain (sandbox image, for example with a JDK); build and test commands; extra high-risk paths; package registries agents may reach.
+- Per product: name; what it owns and what it does not (used by the analyst to place the work); repositories, each with its role (for example service, web client, library); owners; where its tickets live (GitHub repository, or Jira project later); toolchain (sandbox image, for example with a JDK); build and test commands; extra high-risk paths; contract paths (where its interfaces live: a change there is never fast track); package registries agents may reach.
 - In this iteration the catalog is a configuration file (a settings page is FR-N5). It replaces the plain repository list of the MVP.
 - Agents never change a repository that is not in the catalog.
 
@@ -278,7 +281,7 @@ As a product owner, I keep the guidance for agents in my own repository, so that
 
 ## 8. Impact on the architecture
 
-To be detailed in the architecture document when this iteration starts.
+Detailed in the [reference architecture](architecture.md) v2.0: decisions AD-30 to AD-42, and the build scope and order in its §24.
 
 | Area | Change |
 |---|---|
@@ -286,7 +289,7 @@ To be detailed in the architecture document when this iteration starts.
 | Product catalog | New configuration, read by the API and the worker; replaces `GITHUB_REPOS`; the token must cover every catalog repository |
 | Workflow (§9) | Track-dependent skeleton; a run belongs to the story ticket, not to a repository; a child workflow per sub-task, carrying its product and repository, with implement → AI review → fix loop → diff check → pull request |
 | Workspaces (CAP-04) | Analyst and architect sandboxes get read-only copies of several repositories; implementer sandboxes get one repository, the image of its product's toolchain, and read-only copies of approved changes they depend on |
-| Design session | The architect agent converses with the requester across many turns with read-only access to the repositories of every product involved: either a workspace kept alive with an idle timeout, or session state resumed in a fresh sandbox per turn (decision in the architecture). The front-door agent hands the conversation over to the architect for the run |
+| Design session | The architect agent converses with the requester across many turns with read-only access to the repositories of every product involved: a session workspace kept warm while the conversation is active, saved and shut down when idle, and restored on the next message (AD-34, AD-35). Each run has its own conversation, routed to the architect while the session is open (AD-38) |
 | Plan model | Versioned plans written by the architect, each version recording the request that prompted it; dependencies; approval bound to a version |
 | Pull requests | One per agent sub-task, in its product's repository (the architecture default; the MVP used one per run) |
 | Component catalog | New cards: analysis summary, hand-off plan with versions and what changed (read-only), change review with diff viewer, review report, story view |
@@ -306,3 +309,4 @@ To be detailed in the architecture document when this iteration starts.
 | 1.1 | Agents build every sub-task in this iteration; developer sub-tasks moved to the backlog (FR-N10); dropping a sub-task replaces reassignment |
 | 1.2 | New architect agent shapes the hand-off plan with the requester in a design session (FR-P1, was the analyst's analysis session FR-A5); the analyst does only the preliminary analysis; inline plan editing removed: plans change only through the conversation (FR-P3) |
 | 1.3 | Work across products: product catalog, product identification by the analyst, cross-product design with contracts, one implementer setup per product, pull requests in each product's repository, guidance kept in each product's repository (§5.5); Jira mapping open item |
+| 1.4 | Aligned with the architecture v2.0: fast-track limits re-checked on the finished change (FR-A2, FR-R5); one conversation per run and session resume behavior (FR-P1); guidance files are high-risk and who approves high-risk changes (FR-R6); contract paths in the catalog (FR-M1); §8 points to the architecture decisions |
