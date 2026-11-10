@@ -196,3 +196,28 @@ table.grid { background: var(--surface); border: 1px solid var(--border); border
   .view-toggle { margin: 0; }
   .brand { display: none; }
 }
+
+/* Iteration 2: analysis card, tracks, run conversations, products */
+.badges { display: inline-flex; gap: 6px; align-items: center; }
+.badge.track.fast { background: color-mix(in srgb, var(--success) 15%, transparent); color: var(--success); }
+.badge.track.guided { background: color-mix(in srgb, var(--orch) 16%, transparent); color: var(--orch); }
+.badge.size { background: var(--surface-2); color: var(--muted); }
+.badge.analysing { background: var(--accent-soft); color: var(--accent); }
+.card-title.plain { font-weight: 500; }
+.section-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; margin-top: 10px; }
+.card.analysis .products { list-style: none; padding-left: 0; }
+.card.analysis .products li { padding: 6px 0; border-top: 1px solid var(--border); }
+.card.analysis .products li:first-child { border-top: 0; }
+.card.analysis details { margin-top: 8px; }
+.agent-origin { color: var(--muted); margin-bottom: 2px; }
+.blocked-image, .link-target { color: var(--muted); font-size: 12px; word-break: break-all; }
+.conversation-kind {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--orch);
+  border: 1px solid color-mix(in srgb, var(--orch) 40%, transparent); border-radius: 4px; padding: 0 4px; margin-right: 6px; flex: none;
+}
+.ops-nav { display: flex; gap: 14px; font-size: 13px; }
+.ops-nav a { color: var(--muted); padding-bottom: 2px; border-bottom: 2px solid transparent; }
+.ops-nav a.active { color: var(--text); border-bottom-color: var(--accent); }
+.panel.product { margin-bottom: 14px; }
+.panel.product h2 code { text-transform: none; letter-spacing: 0; }
+.panel.product td code { margin-right: 4px; }

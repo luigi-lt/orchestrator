@@ -2,7 +2,6 @@
 # Used by test/e2e/run.sh together with infra/local/docker-compose.yml.
 x-e2e-github: &e2e-github
   GITHUB_TOKEN: fake-token
-  GITHUB_REPOS: acme/demo
   GITHUB_API_URL: http://fake-github:8095
   GITHUB_GIT_URL_TEMPLATE: file:///fake-git/{owner}/{repo}.git
 
@@ -13,7 +12,7 @@ services:
     command: ["node", "/e2e/fake-github.mjs"]
     environment:
       FAKE_GIT_ROOT: /fake-git
-      FAKE_REPOS: acme/demo
+      FAKE_REPOS: acme/demo,acme/web
     volumes: ["../../test/e2e:/e2e:ro", "fake-git:/fake-git"]
     ports: ["127.0.0.1:8095:8095"]
     networks: [backend]
@@ -22,6 +21,7 @@ services:
     image: orchestrator-app:local
     command: ["node", "/e2e/fake-anthropic.mjs"]
     volumes: ["../../test/e2e:/e2e:ro"]
+    ports: ["127.0.0.1:8099:8099"]
     networks: [backend]
 
   egress-proxy:

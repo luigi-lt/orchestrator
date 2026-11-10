@@ -1,9 +1,12 @@
-import Markdown from "react-markdown";
-import type { Component, MessageDto } from "@orch/contracts";
+import type { Component, MessageAuthor, MessageDto } from "@orch/contracts";
 import { FormBlock, TableBlock } from "./AgentBlocks";
 import { OrchestratorCardView } from "./Cards";
+import { SafeMarkdown } from "./SafeMarkdown";
 
-const SYSTEM = new Set(["work_item", "progress", "plan", "questions", "risk", "pull_request", "notice"]);
+const SYSTEM = new Set(["work_item", "run_link", "analysis", "progress", "plan", "questions", "risk", "pull_request", "notice"]);
+
+/** Every agent message says which agent wrote it (AD-38). */
+const AGENT_NAMES: Record<MessageAuthor, string> = { "front-door": "Assistant", architect: "Architect agent" };
 
 export function MessageView({ message, onSubmitForm }: { message: MessageDto; onSubmitForm: (title: string | undefined, values: Record<string, string>) => void }) {
   if (message.role === "user") {
@@ -25,8 +28,9 @@ export function MessageView({ message, onSubmitForm }: { message: MessageDto; on
   }
   return (
     <div className="message agent">
+      <div className="origin agent-origin">{AGENT_NAMES[message.author ?? "front-door"]}</div>
       <div className="bubble">
-        {message.text && <Markdown>{message.text}</Markdown>}
+        {message.text && <SafeMarkdown>{message.text}</SafeMarkdown>}
         {message.components.map((c, i) => (
           <AgentComponentView key={i} component={c} onSubmitForm={onSubmitForm} />
         ))}
@@ -38,7 +42,7 @@ export function MessageView({ message, onSubmitForm }: { message: MessageDto; on
 function AgentComponentView({ component, onSubmitForm }: { component: Component; onSubmitForm: (title: string | undefined, values: Record<string, string>) => void }) {
   switch (component.type) {
     case "text":
-      return <Markdown>{component.markdown}</Markdown>;
+      return <SafeMarkdown>{component.markdown}</SafeMarkdown>;
     case "table":
       return <TableBlock table={component} />;
     case "form":

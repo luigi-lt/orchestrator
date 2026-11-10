@@ -17,6 +17,7 @@ WORKDIR /app
 COPY package.json package-lock.json tsconfig.base.json tsconfig.json ./
 COPY packages/contracts/package.json packages/contracts/
 COPY packages/common/package.json packages/common/
+COPY packages/catalog/package.json packages/catalog/
 COPY packages/store/package.json packages/store/
 COPY packages/github/package.json packages/github/
 COPY packages/agent-profiles/package.json packages/agent-profiles/

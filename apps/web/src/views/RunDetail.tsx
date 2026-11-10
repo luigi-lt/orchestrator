@@ -71,6 +71,7 @@ export function RunDetail() {
           </h1>
           <div className="meta">
             <span className={`badge ${run.state}`}>{run.state.replace(/_/g, " ")}</span>
+            {run.track && <span className={`badge track ${run.track}`}>{run.track} track</span>}
             <span>Run {run.id}</span>
             <span>Requested by @{run.requester}</span>
             {run.branch && <code>{run.branch}</code>}
@@ -100,6 +101,31 @@ export function RunDetail() {
 
       <div className="detail-grid">
         <section className="panel">
+          <h2>Analysis</h2>
+          {run.analysis ? (
+            <>
+              <p>{run.analysis.understanding}</p>
+              <p className="muted small">
+                Size {run.analysis.size} · products: {run.products.join(", ") || "—"} · ticket filed in product {run.homeProduct ?? "—"} · catalog{" "}
+                <code>{run.catalogHash ?? "—"}</code>
+              </p>
+              <ul>
+                {run.analysis.products.map((p) => (
+                  <li key={p.product}>
+                    <strong>{p.product}</strong> <span className="muted small">{p.repositories.join(", ")}</span>: {p.changes}
+                  </li>
+                ))}
+              </ul>
+              {run.track && (
+                <p className="small">
+                  <strong>{run.track} track</strong>
+                  {run.analysis.proposedTrack !== run.track && ` (the analyst proposed ${run.analysis.proposedTrack})`}: {run.trackReasons.join("; ")}
+                </p>
+              )}
+            </>
+          ) : (
+            <p className="muted">Not analysed yet.</p>
+          )}
           <h2>Plan</h2>
           {run.plan ? (
             <>
@@ -111,7 +137,7 @@ export function RunDetail() {
               </ol>
             </>
           ) : (
-            <p className="muted">No approved plan yet.</p>
+            <p className="muted">No plan yet.</p>
           )}
           <h2>Steps</h2>
           <ul className="step-list">
@@ -197,6 +223,8 @@ function duration(start: string, end: string | null): string {
 function describe(e: RunEventDto): string {
   const p = e.payload as Record<string, unknown>;
   if (typeof p.title === "string") return ` — ${p.title}`;
+  if (typeof p.track === "string") return ` — ${p.track}${Array.isArray(p.reasons) ? `: ${p.reasons.join("; ")}` : ""}`;
+  if (Array.isArray(p.products)) return ` — ${p.products.join(", ")}`;
   if (typeof p.state === "string") return ` — ${p.state}`;
   if (typeof p.text === "string") return ` — ${p.text}`;
   if (typeof p.url === "string") return ` — ${p.url}`;

@@ -1190,7 +1190,7 @@ Proofs of concept come first in the build, ordered by how much of the design dep
 | R-17 | Stacked pull requests: changing a pull request's target through the Bitbucket API, and what happens when the target branch is deleted on merge | Stack two pull requests, merge the first, retarget the second | Open the dependent pull request only after the first merges |
 | R-18 | The analyst places work in the wrong products when catalog descriptions are thin | Replay real past tickets against the catalog; compare with where the work really landed | The requester corrects the list (FR-M2); improve descriptions; ticket component or label as an extra hint |
 | R-19 | Warm session workspaces use sandbox capacity while people think | Measure concurrent sessions in the pilot | Shorter idle timeout; lower caps (§19) |
-| R-20 | The Copilot runtime may not load guidance files by itself in every mode, or may load them from the change under review | Check which instruction files the runtime reads and from where | `workspace-host` lists guidance files in the brief and takes them from the base commit; turn off the runtime's own loading |
+| R-20 | The Copilot runtime may not load guidance files by itself in every mode, or may load them from the change under review | **Done (increment 1).** The runtime loads `AGENTS.md` and `.github/copilot-instructions.md` from the working directory by default, so it would read them from a checkout an agent can change | **Adopted:** the runtime's own loading is turned off (`skipCustomInstructions`); `workspace-host` reads the files at the base commit and shows them to the agent as content. Verified end to end |
 
 ## 23. Open items
 
@@ -1226,6 +1226,8 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 | Not in this iteration | — | Sign-in, audit trail, observability stack, budgets, Web Push (as agreed for the MVP) |
 
 **Build order.** Each increment ends with something that can be shown, and the end-to-end test with the fake GitHub and the fake model grows with it.
+
+**Status:** increment 1 is built and verified (see the [MVP guide](mvp.md) §9). Until increments 2 to 4 replace them, two bridges keep the product usable end to end: the fast track opens its pull request without an AI review, and the guided track uses a planning agent with approval on a card instead of the design session. Work that spans several repositories is analysed and classified but not built.
 
 | # | Increment | Shows | Proofs done first |
 |---|---|---|---|

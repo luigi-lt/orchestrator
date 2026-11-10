@@ -13,12 +13,14 @@ import {
   sleep,
 } from "@temporalio/workflow";
 import type {
+  Analysis,
   AnswerSignal,
   ApprovalSignal,
   CancelSignal,
   DeliveryRunInput,
   Plan,
   QuestionRound,
+  RepoRef,
   RunState,
   StepKind,
   StepResult,
@@ -90,11 +92,14 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
 
   // Progress card model --------------------------------------------------------
   const progress: { title: string; status: ProgressStatus }[] = [
-    { title: "Plan", status: "pending" },
-    { title: "Plan approval", status: "pending" },
+    { title: "Analysis", status: "pending" },
     { title: "Pull request", status: "pending" },
     { title: "Review and merge", status: "pending" },
   ];
+  const insertProgressBefore = (before: string, titles: string[]) => {
+    const at = progress.findIndex((p) => p.title === before);
+    progress.splice(at < 0 ? progress.length : at, 0, ...titles.map((title) => ({ title, status: "pending" as ProgressStatus })));
+  };
   const setProgress = (title: string, status: ProgressStatus) => {
     const item = progress.find((p) => p.title === title);
     if (item) item.status = status;
@@ -114,12 +119,12 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
   const expired = () => Date.now() - startedAt > MAX_RUN_MS;
 
   // Steps ---------------------------------------------------------------------
-  let ctxInfo: { defaultBranch: string; branch: string; commitAuthor: { name: string; email: string } };
+  let ctxInfo: { defaultBranch: string; branch: string; commitAuthor: { name: string; email: string } } | undefined;
 
   const runStep = async (
     kind: StepKind,
     title: string,
-    extra: { questionRounds?: QuestionRound[]; feedback?: string; plan?: Plan; subtaskIndex?: number },
+    extra: { primaryRepo: RepoRef; analysis?: Analysis; questionRounds?: QuestionRound[]; feedback?: string; plan?: Plan; subtaskIndex?: number },
   ): Promise<{ stepId: string; result: StepResult }> => {
     const stepId = `${runId}-s${++stepCounter}`;
     await steps.prepareStep({
@@ -127,9 +132,9 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
       stepId,
       kind,
       title,
-      branch: ctxInfo.branch,
+      branch: ctxInfo?.branch ?? "",
       workItem,
-      commitAuthor: ctxInfo.commitAuthor,
+      commitAuthor: ctxInfo?.commitAuthor ?? { name: workItem.requester.login, email: `${workItem.requester.login}@users.noreply.github.com` },
       ...extra,
     });
     await emit("step.started", { stepId, kind, title });
@@ -198,98 +203,204 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
     }
   };
 
+  /** Posts questions in the conversation and on the ticket, and waits for the requester's answer from either. */
+  const askRequester = async (questions: string[], intro: string, eventPrefix: "analysis" | "planning"): Promise<AnswerSignal> => {
+    const askedAt = new Date().toISOString();
+    const { approvalId } = await orch.askQuestions({ runId, conversationId, questions });
+    await integ.commentOnIssue({
+      repo,
+      number: workItem.number,
+      key: `run=${runId}:questions=${approvalId}`,
+      body: `🤖 ${intro} Reply here or in the orchestrator web app:\n\n${questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}`,
+    });
+    await emit(`${eventPrefix}.question_asked`, { approvalId, questions });
+    await setState("awaiting_answers", "Waiting for your answers");
+    const answer = await waitForAnswer(approvalId, askedAt);
+    await emit(`${eventPrefix}.answered`, { approvalId, source: answer.source });
+    return answer;
+  };
+
+  const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`);
+  const slug = (r: RepoRef) => `${r.owner}/${r.name}`;
+
   // The delivery skeleton ------------------------------------------------------
   const deliver = async (): Promise<void> => {
-    const init = await orch.initRun({ runId, workItem, conversationId: input.conversationId });
+    const init = await orch.initRun({ runId, workItem, originConversationId: input.conversationId });
     conversationId = init.conversationId;
-    await emit("run.created", { repo: `${repo.owner}/${repo.name}`, issue: workItem.number }, { state: "intake", conversationId });
+    await emit(
+      "run.created",
+      { repo: slug(repo), issue: workItem.number, homeProduct: init.homeProduct, catalog: init.catalogHash },
+      { state: "intake", conversationId },
+    );
     await pushProgress("Picked up");
-
-    ctxInfo = await integ.lookupContext({ runId, workItem });
     await integ.claimIssue({ repo, number: workItem.number, runId });
-    await emit("intake.claimed", { branch: ctxInfo.branch }, { branch: ctxInfo.branch });
-    await steps.prepareRunRepo({ runId, repo, defaultBranch: ctxInfo.defaultBranch, branch: ctxInfo.branch });
+    await emit("intake.claimed", {});
 
-    // Readiness check and planning, with clarifying questions and plan feedback.
+    // Preliminary analysis by the analyst agent (FR-A1), with clarifying questions (FR-A4).
     let questionRounds: QuestionRound[] = [];
-    let feedback: string | undefined;
-    let plan: Plan | undefined;
-    for (let attempt = 1; !plan; attempt++) {
-      if (attempt > 6) throw ApplicationFailure.nonRetryable("Planning did not converge after 6 attempts");
-      setProgress("Plan", "running");
-      await setState("planning", attempt === 1 ? "Planning" : "Re-planning");
-      const { result } = await runStep("plan", attempt === 1 ? "Plan" : `Re-plan (attempt ${attempt})`, { questionRounds, feedback });
-      if (result.status !== "succeeded" || !result.assessment) {
-        setProgress("Plan", "failed");
-        throw ApplicationFailure.nonRetryable(`Planning failed: ${result.error ?? result.summary}`);
+    let analysis: Analysis | undefined;
+    for (let attempt = 1; !analysis; attempt++) {
+      if (attempt > 5) throw ApplicationFailure.nonRetryable("The analysis did not converge after 5 attempts");
+      setProgress("Analysis", "running");
+      await setState("analysing", attempt === 1 ? "Analysing the work item" : "Analysing again with your answers");
+      const { result } = await runStep("analyse", attempt === 1 ? "Analysis" : `Analysis (round ${attempt})`, { primaryRepo: repo, questionRounds });
+      if (result.status !== "succeeded" || !result.analysis) {
+        setProgress("Analysis", "failed");
+        throw ApplicationFailure.nonRetryable(`The analysis failed: ${result.error ?? result.summary}`);
       }
-      const assessment = result.assessment;
-      if (!assessment.ready || !assessment.plan) {
-        if (!assessment.questions.length) throw ApplicationFailure.nonRetryable("The planner returned neither a plan nor questions");
-        if (questionRounds.length >= 3) throw ApplicationFailure.nonRetryable("The issue is still unclear after three rounds of questions");
-        const askedAt = new Date().toISOString();
-        const { approvalId } = await orch.askQuestions({ runId, conversationId, questions: assessment.questions });
+      if (!result.analysis.ready) {
+        const questions = result.analysis.questions;
+        if (!questions.length) throw ApplicationFailure.nonRetryable("The analyst returned neither an analysis nor questions");
+        if (questionRounds.length >= 3) throw ApplicationFailure.nonRetryable("The work item is still unclear after three rounds of questions");
+        const answer = await askRequester(questions, "Before the work can start, the analyst agent needs a few answers.", "analysis");
+        questionRounds = [...questionRounds, { questions, answer: answer.answer }];
+        continue;
+      }
+      analysis = result.analysis;
+    }
+    setProgress("Analysis", "done");
+
+    // The analyst proposes a track; the rules decide which one is allowed (AD-32).
+    const { decision, products, repositories } = await orch.recordAnalysis({ runId, conversationId, analysis, labels: workItem.labels ?? [] });
+    const track = decision.track;
+    await emit("analysis.completed", { size: analysis.size, proposedTrack: decision.proposed }, { analysis });
+    await emit("products.identified", { products, repositories }, { products });
+    await emit("track.set", { track, proposed: decision.proposed, reasons: decision.reasons }, { track, trackReasons: decision.reasons });
+    await integ.setTrackLabel({ repo, number: workItem.number, track });
+    await integ.commentOnIssue({
+      repo,
+      number: workItem.number,
+      key: `run=${runId}:analysis`,
+      body: [
+        `🤖 **Analysis** — track: **${track}**`,
+        "",
+        analysis.understanding,
+        "",
+        "**Products involved**",
+        ...analysis.products.map((p) => `- **${p.product}** (${p.repositories.join(", ")}): ${p.changes}`),
+        "",
+        `**Size:** ${analysis.size}`,
+        "",
+        "**Why this track**",
+        ...decision.reasons.map((r) => `- ${r}`),
+        ...(track === "fast" && analysis.approach ? ["", `**Approach:** ${analysis.approach}`] : []),
+      ].join("\n"),
+    });
+
+    // Until the design session and per-repository sub-tasks arrive (increments 3 and 4), work across repositories stops here.
+    if (repositories.length !== 1) {
+      await finish(
+        "closed",
+        `This work needs changes in ${repositories.length} repositories (${repositories.join(", ")}). ` +
+          "Designing and building across products arrive with the next increments of iteration 2; nothing was changed.",
+        "info",
+      );
+      return;
+    }
+    const [buildOwner, buildName] = repositories[0]!.split("/") as [string, string];
+    const buildRepo: RepoRef = { owner: buildOwner, name: buildName };
+    const context = await integ.lookupContext({ runId, workItem, repo: buildRepo });
+    ctxInfo = context;
+    await emit("build.prepared", { repository: slug(buildRepo), branch: context.branch }, { branch: context.branch });
+
+    let plan: Plan | undefined;
+    if (track === "fast") {
+      // Fast track (FR-P6): the analyst's approach is the plan; nobody has to approve it.
+      plan = {
+        summary: clip(analysis.approach || analysis.understanding, 2000),
+        subtasks: [
+          {
+            title: clip(workItem.title.length >= 3 ? workItem.title : `Change for #${workItem.number}`, 200),
+            description: [analysis.understanding, analysis.approach ? `Approach: ${analysis.approach}` : ""].filter(Boolean).join("\n\n"),
+            acceptanceCriteria: analysis.acceptanceCriteria,
+          },
+        ],
+      };
+      await emit("plan.derived", { subtasks: 1 }, { plan });
+    } else {
+      // Guided track. Bridge until the design session with the architect agent exists (increment 3):
+      // a planning agent proposes the plan and the requester approves it, as in the MVP.
+      insertProgressBefore("Pull request", ["Plan", "Plan approval"]);
+      await orch.postNotice({
+        runId,
+        conversationId,
+        noticeKey: "guided-bridge",
+        level: "info",
+        text: "Guided track: the design session with the architect agent arrives in a later increment. Until then a planning agent proposes the plan for your approval.",
+      });
+      let feedback: string | undefined;
+      for (let attempt = 1; !plan; attempt++) {
+        if (attempt > 6) throw ApplicationFailure.nonRetryable("Planning did not converge after 6 attempts");
+        setProgress("Plan", "running");
+        await setState("planning", attempt === 1 ? "Planning" : "Re-planning");
+        const { result } = await runStep("plan", attempt === 1 ? "Plan" : `Re-plan (attempt ${attempt})`, {
+          primaryRepo: buildRepo,
+          analysis,
+          questionRounds,
+          feedback,
+        });
+        if (result.status !== "succeeded" || !result.assessment) {
+          setProgress("Plan", "failed");
+          throw ApplicationFailure.nonRetryable(`Planning failed: ${result.error ?? result.summary}`);
+        }
+        const assessment = result.assessment;
+        if (!assessment.ready || !assessment.plan) {
+          if (!assessment.questions.length) throw ApplicationFailure.nonRetryable("The planner returned neither a plan nor questions");
+          if (questionRounds.length >= 3) throw ApplicationFailure.nonRetryable("The work item is still unclear after three rounds of questions");
+          const answer = await askRequester(assessment.questions, "Before planning, the agent needs a few answers.", "planning");
+          questionRounds = [...questionRounds, { questions: assessment.questions, answer: answer.answer }];
+          feedback = undefined;
+          continue;
+        }
+
+        setProgress("Plan", "done");
+        setProgress("Plan approval", "running");
+        const { approvalId } = await orch.requestPlanApproval({ runId, conversationId, plan: assessment.plan });
         await integ.commentOnIssue({
           repo,
           number: workItem.number,
-          key: `run=${runId}:questions=${approvalId}`,
-          body: `🤖 Before planning, the agent needs a few answers. Reply here or in the orchestrator web app:\n\n${assessment.questions.map((q, i) => `${i + 1}. ${q}`).join("\n")}`,
+          key: `run=${runId}:plan=${approvalId}`,
+          body: `🤖 Proposed plan (waiting for approval in the orchestrator web app):\n\n${assessment.plan.summary}\n\n${assessment.plan.subtasks.map((s) => `- [ ] ${s.title}`).join("\n")}`,
         });
-        await emit("readiness.question_asked", { approvalId, questions: assessment.questions });
-        await setState("awaiting_answers", "Waiting for your answers");
-        const answer = await waitForAnswer(approvalId, askedAt);
-        questionRounds = [...questionRounds, { questions: assessment.questions, answer: answer.answer }];
-        await emit("readiness.answered", { approvalId, source: answer.source });
-        feedback = undefined;
-        continue;
+        await emit("plan.proposed", { approvalId, subtasks: assessment.plan.subtasks.length }, { plan: assessment.plan });
+        await setState("awaiting_approval", "Waiting for plan approval");
+        const planDecision = await waitForApproval(approvalId);
+        if (planDecision.decision === "approve") {
+          plan = assessment.plan;
+          await emit("plan.approved", { approvalId });
+        } else if (planDecision.decision === "changes") {
+          feedback = planDecision.feedback ?? "";
+          await emit("plan.changes_requested", { approvalId, feedback });
+          setProgress("Plan approval", "pending");
+        } else {
+          await emit("plan.rejected", { approvalId });
+          setProgress("Plan approval", "failed");
+          await finish("cancelled", "Plan rejected; nothing was changed.", "warning");
+          return;
+        }
       }
-
-      setProgress("Plan", "done");
-      setProgress("Plan approval", "running");
-      const { approvalId } = await orch.requestPlanApproval({ runId, conversationId, plan: assessment.plan });
-      await integ.commentOnIssue({
-        repo,
-        number: workItem.number,
-        key: `run=${runId}:plan=${approvalId}`,
-        body: `🤖 Proposed plan (waiting for approval in the orchestrator web app):\n\n${assessment.plan.summary}\n\n${assessment.plan.subtasks.map((s) => `- [ ] ${s.title}`).join("\n")}`,
-      });
-      await emit("plan.proposed", { approvalId, subtasks: assessment.plan.subtasks.length }, { plan: assessment.plan });
-      await setState("awaiting_approval", "Waiting for plan approval");
-      const decision = await waitForApproval(approvalId);
-      if (decision.decision === "approve") {
-        plan = assessment.plan;
-        await emit("plan.approved", { approvalId });
-      } else if (decision.decision === "changes") {
-        feedback = decision.feedback ?? "";
-        await emit("plan.changes_requested", { approvalId, feedback });
-        setProgress("Plan approval", "pending");
-      } else {
-        await emit("plan.rejected", { approvalId });
-        setProgress("Plan approval", "failed");
-        await finish("cancelled", "Plan rejected; nothing was changed.", "warning");
-        return;
-      }
+      setProgress("Plan approval", "done");
     }
-    setProgress("Plan approval", "done");
 
-    // Implementation, one sandboxed step per sub-task.
+    // Implementation, one sandboxed step per sub-task, in the one repository this run changes.
+    await steps.prepareRunRepo({ runId, repo: buildRepo, defaultBranch: context.defaultBranch, branch: context.branch });
     const subtaskTitles = plan.subtasks.map((s, i) => `${i + 1}. ${s.title}`);
-    progress.splice(2, 0, ...subtaskTitles.map((title) => ({ title, status: "pending" as ProgressStatus })));
+    insertProgressBefore("Pull request", subtaskTitles);
     await setState("executing", "Implementing");
     for (let i = 0; i < plan.subtasks.length; i++) {
       const title = subtaskTitles[i]!;
       setProgress(title, "running");
       await pushProgress(`Implementing sub-task ${i + 1} of ${plan.subtasks.length}`);
-      let attempt = await runStep("implement", `Sub-task ${title}`, { plan, subtaskIndex: i });
+      let attempt = await runStep("implement", `Sub-task ${title}`, { primaryRepo: buildRepo, plan, subtaskIndex: i });
       if (attempt.result.status !== "succeeded") {
         await pushProgress(`Retrying sub-task ${i + 1}`);
-        attempt = await runStep("implement", `Sub-task ${title} (retry)`, { plan, subtaskIndex: i });
+        attempt = await runStep("implement", `Sub-task ${title} (retry)`, { primaryRepo: buildRepo, plan, subtaskIndex: i });
       }
       if (attempt.result.status !== "succeeded") {
         setProgress(title, "failed");
         throw ApplicationFailure.nonRetryable(`Sub-task ${i + 1} failed: ${attempt.result.error ?? attempt.result.summary}`);
       }
-      const applied = await steps.applyStepResult({ runId, stepId: attempt.stepId, branch: ctxInfo.branch });
+      const applied = await steps.applyStepResult({ runId, stepId: attempt.stepId, branch: context.branch });
       await emit("subtask.completed", { index: i, commits: applied.commits });
       setProgress(title, "done");
     }
@@ -297,7 +408,7 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
     // Checks before anything leaves the orchestrator.
     setProgress("Pull request", "running");
     await setState("publishing", "Checking and publishing the changes");
-    const inspection = await steps.inspectChanges({ runId, branch: ctxInfo.branch, defaultBranch: ctxInfo.defaultBranch });
+    const inspection = await steps.inspectChanges({ runId, repo: buildRepo, branch: context.branch, defaultBranch: context.defaultBranch });
     if (inspection.changedFiles.length === 0) throw ApplicationFailure.nonRetryable("The agents produced no changes");
     if (inspection.secrets.length) {
       const where = inspection.secrets.map((s) => `${s.kind} in ${s.file}:${s.line}`).join("; ");
@@ -307,8 +418,8 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
       const { approvalId } = await orch.requestRiskApproval({ runId, conversationId, reasons: inspection.risk.reasons, files: inspection.risk.files });
       await emit("approval.requested", { kind: "risk", approvalId, reasons: inspection.risk.reasons });
       await setState("awaiting_approval", "Waiting for approval of a high-risk change");
-      const decision = await waitForApproval(approvalId);
-      if (decision.decision !== "approve") {
+      const riskDecision = await waitForApproval(approvalId);
+      if (riskDecision.decision !== "approve") {
         await emit("risk.rejected", { approvalId });
         setProgress("Pull request", "failed");
         await finish("cancelled", "High-risk change rejected; nothing was pushed.", "warning");
@@ -318,26 +429,27 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
       await setState("publishing", "Publishing the changes");
     }
 
+    const sameRepo = slug(buildRepo).toLowerCase() === slug(repo).toLowerCase();
     const body = [
       plan.summary,
       "",
       "### Sub-tasks",
       ...plan.subtasks.map((s) => `- ${s.title}`),
       "",
-      `Closes #${workItem.number}`,
+      `Closes ${sameRepo ? "" : slug(repo)}#${workItem.number}`,
       "",
       `---`,
-      `🤖 Generated by the orchestrator (run \`${runId}\`) on behalf of @${workItem.requester.login}.`,
+      `🤖 Generated by the orchestrator (run \`${runId}\`, ${track} track) on behalf of @${workItem.requester.login}.`,
     ].join("\n");
     const pr = await integ.publishBranch({
       runId,
-      repo,
-      branch: ctxInfo.branch,
-      defaultBranch: ctxInfo.defaultBranch,
+      repo: buildRepo,
+      branch: context.branch,
+      defaultBranch: context.defaultBranch,
       title: `[agent] ${workItem.title}`,
       body,
     });
-    await emit("scm.pr_opened", { number: pr.number, url: pr.url }, { prNumber: pr.number, prUrl: pr.url });
+    await emit("scm.pr_opened", { number: pr.number, url: pr.url, repository: slug(buildRepo) }, { prNumber: pr.number, prUrl: pr.url });
     await orch.postPullRequestCard({ runId, conversationId, number: pr.number, url: pr.url, title: pr.title, state: "open" });
     await integ.commentOnIssue({ repo, number: workItem.number, key: `run=${runId}:pr`, body: `🤖 Pull request opened: ${pr.url}` });
     setProgress("Pull request", "done");
@@ -347,7 +459,7 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
     // Human review and merge happen on GitHub; poll until the pull request is merged or closed.
     for (;;) {
       await sleep(PR_POLL);
-      const prState = await integ.getPullRequestState({ repo, number: pr.number });
+      const prState = await integ.getPullRequestState({ repo: buildRepo, number: pr.number });
       if (prState === "open") {
         if (expired()) throw ApplicationFailure.nonRetryable("The pull request was not merged within 30 days");
         continue;

@@ -56,6 +56,11 @@ export function ChatView() {
         <nav className="conversation-list">
           {conversations.map((c) => (
             <button key={c.id} className={`conversation-item ${c.id === conversationId ? "active" : ""}`} onClick={() => navigate(`/chat/${c.id}`)}>
+              {c.kind === "run" && (
+                <span className="conversation-kind" title="The conversation of one run">
+                  run
+                </span>
+              )}
               <span className="title">{c.title}</span>
               {c.pending > 0 && <span className="dot" title={`${c.pending} waiting for you`} />}
             </button>
@@ -63,7 +68,11 @@ export function ChatView() {
           {conversations.length === 0 && <p className="muted small pad">No conversations yet.</p>}
         </nav>
       </aside>
-      {conversationId ? <Conversation key={conversationId} id={conversationId} /> : <EmptyState onStart={() => void newConversation()} />}
+      {conversationId ? (
+        <Conversation key={conversationId} id={conversationId} kind={current?.kind ?? "general"} />
+      ) : (
+        <EmptyState onStart={() => void newConversation()} />
+      )}
     </div>
   );
 }
@@ -84,7 +93,7 @@ function EmptyState({ onStart }: { onStart: () => void }) {
   );
 }
 
-function Conversation({ id }: { id: string }) {
+function Conversation({ id, kind }: { id: string; kind: "general" | "run" }) {
   const [messages, setMessages] = useState<MessageDto[]>([]);
   const [streaming, setStreaming] = useState("");
   const [typing, setTyping] = useState(false);
@@ -173,7 +182,7 @@ function Conversation({ id }: { id: string }) {
       >
         <textarea
           value={draft}
-          placeholder="Ask about runs, or start work on an issue…"
+          placeholder={kind === "run" ? "Ask about this run…" : "Ask about runs, or start work on an issue…"}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {

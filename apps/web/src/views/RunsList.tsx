@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import type { RunDto } from "@orch/contracts";
 import { api, post, subscribe } from "../api";
 import { useApp } from "../App";
+import { OpsNav } from "./Products";
 
 export function RunsList() {
   const { me, setToggleTarget } = useApp();
@@ -47,7 +48,10 @@ export function RunsList() {
   return (
     <div className="page">
       <div className="page-head">
-        <h1>Runs</h1>
+        <div>
+          <h1>Runs</h1>
+          <OpsNav />
+        </div>
         <form
           className="inline-form"
           onSubmit={(e) => {
@@ -71,6 +75,7 @@ export function RunsList() {
         <thead>
           <tr>
             <th>Issue</th>
+            <th>Track</th>
             <th>State</th>
             <th>Requester</th>
             <th>Pull request</th>
@@ -85,6 +90,7 @@ export function RunsList() {
                   {r.repo}#{r.issueNumber} · {r.title}
                 </Link>
               </td>
+              <td>{r.track ? <span className={`badge track ${r.track}`}>{r.track}</span> : <span className="muted">—</span>}</td>
               <td>
                 <span className={`badge ${r.state}`}>{r.state.replace(/_/g, " ")}</span>
               </td>
@@ -95,7 +101,7 @@ export function RunsList() {
           ))}
           {runs.length === 0 && (
             <tr>
-              <td colSpan={5} className="muted pad">
+              <td colSpan={6} className="muted pad">
                 No runs yet. Label an issue <code>{me?.triggerLabel ?? "ai-ready"}</code> or start one above.
               </td>
             </tr>

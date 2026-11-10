@@ -17,6 +17,7 @@
     "@orch/common": "*",
     "@orch/store": "*",
     "@orch/github": "*",
-    "@orch/agent-profiles": "*"
+    "@orch/agent-profiles": "*",
+    "@orch/catalog": "*"
   }
 }

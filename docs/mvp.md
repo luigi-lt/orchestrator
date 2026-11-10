@@ -2,7 +2,14 @@
 
 The MVP is a thin, working slice of the [reference architecture](architecture.md) for the **personal deployment**, running on your machine with Docker. No audit trail and no observability stack, as agreed.
 
-**What it does:** you label a GitHub issue `ai-ready` (or ask in the chat). The orchestrator picks it up, an agent studies the repository and either asks clarifying questions or proposes a plan. You approve the plan in the web app. Agents implement each sub-task in isolated Docker sandboxes, the orchestrator checks the changes and opens a pull request. You review and merge on GitHub, and the run completes.
+It now includes **increment 1 of iteration 2** (architecture §24): the product catalog, the analyst agent, the two tracks and one conversation per run. §5 lists what of iteration 2 is still to come.
+
+**What it does:** you label a GitHub issue `ai-ready` (or ask in the chat). The orchestrator picks it up and an **analyst agent** studies the ticket and the code: what the work is, which products it touches, how big it is. The orchestrator's rules then choose a track:
+
+- **Fast track** (small, clear change in one place): an agent implements it in an isolated Docker sandbox and a pull request opens, with no stops.
+- **Guided track** (stories, larger or unclear work): an agent proposes a plan, you approve it in the web app, then agents implement each sub-task.
+
+You review and merge on GitHub, and the run completes.
 
 ## 1. What you need
 
@@ -18,19 +25,50 @@ The MVP is a thin, working slice of the [reference architecture](architecture.md
 GitHub → Settings → Developer settings → Fine-grained tokens → Generate new token:
 
 - **Resource owner:** your account. **Expiration:** your choice (90 days is reasonable).
-- **Repository access:** *Only select repositories* — the ones you will list in `GITHUB_REPOS`.
+- **Repository access:** *Only select repositories* — every repository you list in `products.yaml`.
 - **Repository permissions:** Contents: *Read and write*; Issues: *Read and write*; Pull requests: *Read and write*; Metadata: *Read-only* (automatic).
 
 ## 2. Start it
 
 ```bash
 git clone <this repository> && cd orchestrator
-./bin/orchestrator init        # creates .env and a local signing secret
-# edit .env: GITHUB_TOKEN, GITHUB_REPOS (owner/name, comma-separated), ANTHROPIC_API_KEY
+./bin/orchestrator init        # creates .env, products.yaml and a local signing secret
+# edit .env: GITHUB_TOKEN, ANTHROPIC_API_KEY
+# edit products.yaml: your products and their repositories (see below)
 ./bin/orchestrator up          # builds the images (first time: several minutes) and starts everything
 ```
 
 Open **http://localhost:3000**.
+
+### The product catalog (`products.yaml`)
+
+The catalog says what each product owns and where its code lives. It replaces the `GITHUB_REPOS` list: the orchestrator watches and works on the repositories in it, and nowhere else.
+
+```yaml
+products:
+  - id: calc                      # lowercase letters, digits, dashes
+    name: Calculator library
+    description: >                # what it owns AND what it does not: the analyst uses this to place work
+      Owns the arithmetic functions. Does not own any web page.
+    owners: [your-github-login]
+    repositories:
+      - id: your-account/calc     # a repository belongs to exactly one product
+        role: library
+        contractPaths: ["index.d.ts"]   # where its interfaces live: work touching them is never fast track
+  - id: shop
+    name: Web shop
+    description: Owns the shop's pages, which call the calculator library.
+    repositories:
+      - id: your-account/shop
+        role: web client
+```
+
+- [`products.example.yaml`](../products.example.yaml) shows every setting. `products.yaml` is git-ignored.
+- **Coming from the MVP?** If your `.env` still has `GITHUB_REPOS`, `init` creates `products.yaml` with one product per repository. Improve the descriptions when you can.
+- A run keeps the catalog version it started with; edits apply to new runs. An invalid file stops new runs and shows a banner in the web app; the *Products* page of the operator view shows what was loaded.
+- Product teams keep their guidance for agents in their own repository, in `AGENTS.md` or `.github/copilot-instructions.md`. Agents get it as information about conventions; it cannot change their tools or any approval, and changing those files is a high-risk change.
+
+**Upgrading from the MVP:** runs that were in flight cannot continue on the new workflow. At start-up they are stopped and marked as failed with an explanation; label the issue again to restart the work.
 
 | Command | Does |
 |---|---|
@@ -43,23 +81,30 @@ Open **http://localhost:3000**.
 
 **Start work** in either way:
 
-- **Label an issue `ai-ready`** in one of your configured repositories. Only labels you add yourself count (the orchestrator checks who added it). It is picked up within about a minute.
+- **Label an issue `ai-ready`** in a repository of the catalog. Only labels you add yourself count (the orchestrator checks who added it). It is picked up within about a minute. Labels such as `bug` or `story` are a hint for the analysis; a `story` always takes the guided track.
 - **Ask in the chat:** "work on owner/repo#12", or "create an issue in owner/repo to add input validation to the signup form".
 
-**Follow and steer it** in the *user view* (the conversation):
+**Every run has its own conversation.** It appears in the side panel, marked *run*. When you start a run from a chat, that chat shows a link card to it.
 
-1. A **work item** and a **progress** card appear in the run's conversation.
-2. If the issue is unclear, a **questions** card appears. Answer there, or reply on the GitHub issue.
-3. A **plan** card asks for your approval: *Approve*, *Request changes* (the agent re-plans with your feedback) or *Reject*.
-4. Agents implement each sub-task in a sandbox; the progress card updates live.
-5. If the changes touch CI/CD, infrastructure, dependency manifests or ownership files, a **high-risk** card asks for approval before anything is pushed.
-6. A **pull request** card links the PR. Review and merge it on GitHub; the run completes when it is merged.
+**Follow and steer it** in the run's conversation:
+
+1. A **work item** and a **progress** card appear.
+2. The analyst agent studies the ticket and the code. If the ticket is unclear, a **questions** card appears. Answer there, or reply on the GitHub issue.
+3. An **analysis** card shows what the analyst understood, the products involved and why, the size, and the **track** with the reasons for it. The track is decided by the orchestrator's rules: the analyst only proposes. The analysis is also posted on the issue, which gets the label `track:fast` or `track:guided`.
+4. **Fast track:** the card shows the intended approach; the change is built right away. **Guided track:** a **plan** card asks for your approval: *Approve*, *Request changes* (the agent re-plans with your feedback) or *Reject*.
+5. Agents implement each sub-task in a sandbox; the progress card updates live.
+6. If the changes touch CI/CD, infrastructure, dependency manifests, ownership files or agent guidance files, a **high-risk** card asks for approval before anything is pushed — on both tracks.
+7. A **pull request** card links the PR. Review and merge it on GitHub; the run completes when it is merged.
+
+**When is work fast track?** Only when all of this holds: the expected behavior is clear, the change stays in one area of one product, the size is S (at most `FAST_TRACK_MAX_FILES` files, 5 by default), no interface (contract path) or high-risk file is expected to change, and the ticket is not a story. Anything else is guided.
+
+**Work across several repositories** is recognised (the analyst opens other products' repositories read-only when it needs to), shown on the analysis card and put on the guided track — but it cannot be built yet: the run stops there and says so. Building across products arrives with increments 3 and 4.
 
 Orchestrator cards are marked **◆ Orchestrator**: they come from the orchestrator's records, never from the agent's text, so you can trust what an approval card says. Decisions go straight to the orchestrator and never pass through the agent.
 
-**See everything** in the *operator view* (toggle in the header): all runs, and for each run its plan, steps, a live transcript of what the agent is doing (messages, tool calls, results), the event timeline and a cancel button. The toggle keeps context: from a conversation it opens that run; from a run it opens its conversation.
+**See everything** in the *operator view* (toggle in the header): all runs with their track, and for each run its analysis, track and reasons, plan, steps, a live transcript of what the agent is doing (messages, tool calls, results), the event timeline and a cancel button. The *Products* page shows the catalog. The toggle keeps context: from a run's conversation it opens that run; from a run it opens its conversation.
 
-GitHub stays in sync: the issue gets comments (picked up, questions, plan, pull request) and labels (`ai-in-progress`, then `ai-done`).
+GitHub stays in sync: the issue gets comments (picked up, questions, analysis, plan, pull request) and labels (`ai-in-progress`, the track, then `ai-done`).
 
 Allow **browser notifications** (button in the header) to be told when a decision is needed or a run finishes; they work while the app is open in a tab.
 
@@ -86,11 +131,18 @@ Security properties implemented as designed: sandboxes run as non-root with a re
 | Sign-in | None: single user, bound to `127.0.0.1`, Host-header and CSRF-header checks | GitHub sign-in for the owner (personal), Entra ID (business) |
 | Secrets | `.env` file (git-ignored), each secret passed only to the service that needs it | OS keychain injected by the launcher (personal), Key Vault (business) |
 | Temporal persistence | Temporal dev server with a SQLite file on a volume | Temporal on PostgreSQL |
-| Pull requests | One branch and pull request per run, one commit per sub-task | One branch/pull request per sub-task |
+| Guided track | A planning agent proposes the plan in one go; you approve, ask for changes or reject on the card | Design session with the architect agent in the chat, versioned plans (increment 3) |
+| AI review | None yet: the pull request opens after the orchestrator's own checks (secrets, risk) | Reviewer agent and fix loop before every pull request; fast-track limits re-checked on the real diff (increment 2) |
+| Diff check | None yet | You approve each sub-task's change in the app before its pull request opens (increment 4) |
+| Work across repositories | Analysed and classified, not built | One sub-task and pull request per repository, in dependency order (increments 3 and 4) |
+| Changing the track | Not yet: the rules decide | The requester can switch any time before the pull request (increment 5) |
+| Product commands and images | In the catalog, not used yet: agents choose how to build and test; one sandbox image | Run from the catalog; image per product (increment 2) |
+| Pull requests | One branch and pull request per run, one commit per sub-task | One branch/pull request per sub-task (increment 2) |
 | Fix loops | None: humans handle CI failures and review comments on GitHub | CI fix and review fix loops (bounded) |
+| Workflow upgrades | Runs in flight are retired at start-up | Workflow versioning with patching (AD-18) |
 | Budgets, compensation | Not implemented | NFR-CO-01..03; compensation on cancel |
 | Policy | Risk rules and approval checks in code | Cedar policies (AD-16) |
-| Agent tools | Built-in Copilot tools in the sandbox; no MCP tool gateway | Read tools through the sandbox gateway (§7.4) |
+| Agent tools | Built-in Copilot tools in the sandbox; the gateway serves `request_repository` and checks analyses against the catalog | All read tools through the sandbox gateway (§7.4) |
 | Generative UI transport | Own SSE notices plus REST, rendering our catalog directly | AG-UI events and A2UI renderers (D13) |
 | Notifications | Browser notifications while the app is open | Web Push, Jira mentions |
 | Stack | GitHub and Claude only | Jira, Bitbucket, Jenkins, Copilot seats, Azure |
@@ -98,7 +150,7 @@ Security properties implemented as designed: sandboxes run as non-root with a re
 
 ## 6. Costs
 
-Every planning and implementation step calls the model. `ORCH_MODEL` defaults to `claude-opus-5-5` (most capable); `claude-sonnet-5-5` is cheaper and usually enough for small issues. Keep a spend limit in the Anthropic Console as a hard backstop.
+Every analysis, planning and implementation step calls the model. `ORCH_MODEL` defaults to `claude-opus-5-5` (most capable); `claude-sonnet-5-5` is cheaper and usually enough for small issues. Keep a spend limit in the Anthropic Console as a hard backstop.
 
 ## 7. Troubleshooting
 
@@ -112,7 +164,10 @@ Every planning and implementation step calls the model. `ORCH_MODEL` defaults to
 | Podman | Set `DOCKER_SOCKET_PATH` in `.env` to your Podman socket |
 | Agents cannot install dependencies | Add the registry host to `EGRESS_ALLOWLIST` in `.env` |
 | Java/Gradle repositories | Set `WORKSPACE_WITH_JDK=1` and run `./bin/orchestrator up` |
-| Nothing happens after labelling | Check `./bin/orchestrator logs worker`: the label must be added by the token's owner, and the repository must be in `GITHUB_REPOS` |
+| Nothing happens after labelling | Check `./bin/orchestrator logs worker`: the label must be added by the token's owner, and the repository must be in `products.yaml` |
+| Banner "Product catalog problem" | `products.yaml` is invalid; the message names each problem. Fix the file; no restart is needed |
+| A run fails with "not in the product catalog" | The issue's repository, or one the analysis named, is missing from `products.yaml` |
+| Runs show "Stopped by an upgrade" | They were started by the previous version; label the issue `ai-ready` again |
 
 ## 8. Development
 
@@ -130,8 +185,9 @@ The web app can run with hot reload against a running stack: `npm run dev -w @or
 
 | Check | Result |
 |---|---|
-| Unit tests: secret scanning, risk rules, egress allowlist, workspace tokens, hashing, catalog sanitizing | Pass (16) |
-| Workflow tests on Temporal: happy path, questions, plan rejected, high-risk rejected, cancel, planning failure | Pass (6) |
-| End-to-end in Docker with fake GitHub and fake Anthropic API: chat with generative UI, label pickup, questions answered in chat, plan approval (stale hash refused), implementation by the real Copilot runtime in a sandbox through the egress proxy, push, pull request, merge detection, labels and comments | Pass (16 checks) |
+| Unit tests: secret scanning, risk rules and product risk paths, path globs, egress allowlist, workspace tokens, hashing, component sanitizing, product catalog validation, track rules, analysis checks against the catalog | Pass (25) |
+| Workflow tests on Temporal: fast track without approval, analyst questions, guided track with plan approval, plan rejected, high-risk rejected, cancel, analysis failure, work across repositories stops, building in another repository than the ticket's | Pass (9) |
+| End-to-end in Docker with a fake GitHub (two repositories of two products) and a fake Anthropic API, agents run by the real Copilot runtime in sandboxes: catalog loaded and enforced; chat with generative UI; fast track from label to merged pull request with no approval, including the analyst's questions; analysis card, track label and analysis comment on the ticket; one conversation per run and the link card in the chat; a second repository opened on demand and the rules choosing the guided track over the analyst's proposal; an analysis naming an unknown product sent back and corrected; guided track with plan approval (stale hash refused); product guidance (`AGENTS.md`) reaching the agent as content and not loaded by the runtime itself | Pass (41 checks) |
+| Browser check of the web app against that stack: pages load under the content security policy with no console errors; agent text with an image and raw HTML makes no request to another host | Pass |
 
-Not verified in the build environment: calls to the real GitHub API and the real Anthropic API (no credentials there; the fakes follow their documented formats). The first real run is the remaining check.
+Not verified in the build environment: calls to the real GitHub API and the real Anthropic API (no credentials there; the fakes follow their documented formats), and therefore the quality of a real analysis: how well the analyst places work in products and proposes a track on your repositories. The first real run is the remaining check.

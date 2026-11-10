@@ -9,6 +9,10 @@ export function OrchestratorCardView({ card }: { card: OrchestratorCard }) {
   switch (card.type) {
     case "work_item":
       return <WorkItemCard card={card} />;
+    case "run_link":
+      return <RunLinkCard card={card} />;
+    case "analysis":
+      return <AnalysisCard card={card} />;
     case "progress":
       return <ProgressCard card={card} />;
     case "plan":
@@ -58,6 +62,97 @@ function WorkItemCard({ card }: { card: CardOf<"work_item"> }) {
         {card.repo}#{card.number} · {card.title}
       </a>
     </div>
+  );
+}
+
+function RunLinkCard({ card }: { card: CardOf<"run_link"> }) {
+  return (
+    <div className="card">
+      <div className="card-head">
+        <span className="kicker">Run started · it has its own conversation</span>
+        <Link className="small" to={`/ops/runs/${card.runId}`}>
+          Run details
+        </Link>
+      </div>
+      <Link to={`/chat/${card.conversationId}`} className="card-title">
+        Open the conversation of {card.repo}#{card.number} · {card.title}
+      </Link>
+      <p className="muted small">The analysis, questions and approvals for this work appear there.</p>
+    </div>
+  );
+}
+
+const TRACK_HELP = {
+  fast: "Fast track: the change is built and a pull request opens, with no stops before it.",
+  guided: "Guided track: the plan is agreed with you before anything is built.",
+} as const;
+
+/** Text in this card was written by the analyst agent and validated by the orchestrator; the track was decided by the orchestrator's rules. */
+function AnalysisCard({ card }: { card: CardOf<"analysis"> }) {
+  const overruled = card.proposedTrack !== card.track;
+  return (
+    <div className="card analysis">
+      <div className="card-head">
+        <span className="kicker">Analysis · written by the analyst agent</span>
+        <span className="badges">
+          <span className="badge size">Size {card.size}</span>
+          <span className={`badge track ${card.track}`}>{card.track} track</span>
+        </span>
+      </div>
+      <p className="card-title plain">{card.understanding}</p>
+      <div className="section-label">Products involved</div>
+      <ul className="products">
+        {card.products.map((p) => (
+          <li key={p.id}>
+            <strong>{p.name}</strong> <span className="muted small">{p.repositories.join(", ")}</span>
+            <div>{p.changes}</div>
+            <div className="muted small">Why: {p.reason}</div>
+          </li>
+        ))}
+      </ul>
+      <div className="section-label">Why the {card.track} track</div>
+      <p className="muted small">
+        {TRACK_HELP[card.track]}
+        {overruled && ` The analyst proposed ${card.proposedTrack}; the orchestrator's rules chose ${card.track}.`}
+      </p>
+      <ul>
+        {card.trackReasons.map((r, i) => (
+          <li key={i}>{r}</li>
+        ))}
+      </ul>
+      {card.track === "fast" && card.approach && (
+        <>
+          <div className="section-label">Intended approach</div>
+          <p>{card.approach}</p>
+        </>
+      )}
+      <details>
+        <summary className="muted small">Acceptance criteria, risks and assumptions</summary>
+        <ListBlock title="Acceptance criteria" items={card.acceptanceCriteria} />
+        <ListBlock title="Risks" items={card.risks} />
+        <ListBlock title="Assumptions" items={card.assumptions} />
+        {card.track === "guided" && card.approach && (
+          <>
+            <div className="section-label">Analyst's suggested approach</div>
+            <p>{card.approach}</p>
+          </>
+        )}
+      </details>
+    </div>
+  );
+}
+
+function ListBlock({ title, items }: { title: string; items: string[] }) {
+  if (!items.length) return null;
+  return (
+    <>
+      <div className="section-label">{title}</div>
+      <ul>
+        {items.map((item, i) => (
+          <li key={i}>{item}</li>
+        ))}
+      </ul>
+    </>
   );
 }
 
@@ -155,7 +250,7 @@ function QuestionsCard({ card }: { card: CardOf<"questions"> }) {
   return (
     <div className={`card ${pending ? "needs-action" : ""}`}>
       <div className="card-head">
-        <span className="kicker">Questions from the planning agent</span>
+        <span className="kicker">Questions from the agent</span>
         <StatusBadge status={card.status} />
       </div>
       <ol>

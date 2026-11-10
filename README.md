@@ -10,25 +10,25 @@ An orchestration layer for AI agents that turns tickets into reviewed pull reque
 | [Non-functional requirements](docs/non-functional-requirements.md) | How well: scale, reliability, security, cost |
 | [Functional requirements](docs/functional-requirements.md) | What people can do: tracks, analysis, hand-off plans with the architect agent, work across products, review (iteration 2) |
 | [Reference architecture](docs/architecture.md) | How it is built: components, flows, data, security, deployment |
-| [MVP guide](docs/mvp.md) | Run the local MVP, use it, and what it leaves out |
+| [MVP guide](docs/mvp.md) | Run it locally, use it, what is built so far of iteration 2 and what is still to come |
 
 ## Quick start (local MVP)
 
 Requires Docker, a GitHub fine-grained token and an Anthropic API key — details in the [MVP guide](docs/mvp.md).
 
 ```bash
-./bin/orchestrator init     # create .env, then fill in GITHUB_TOKEN, GITHUB_REPOS, ANTHROPIC_API_KEY
+./bin/orchestrator init     # create .env and products.yaml, then fill in GITHUB_TOKEN, ANTHROPIC_API_KEY and your products
 ./bin/orchestrator up       # build and start
 open http://localhost:3000
 ```
 
-Label an issue `ai-ready` in a configured repository, or ask in the chat: "work on owner/repo#12".
+Label an issue `ai-ready` in a repository of your product catalog, or ask in the chat: "work on owner/repo#12". An analyst agent studies it and the orchestrator picks the fast or the guided track.
 
 ## Repository layout
 
 ```
 apps/        api, worker, workspace-manager, sandbox-gateway, workspace-host, egress-proxy, web
-packages/    contracts, common, store, github, agent-profiles
+packages/    contracts, common, catalog, store, github, agent-profiles
 infra/local/ Dockerfile, docker-compose.yml
 bin/         launcher
 test/e2e/    end-to-end test with fake GitHub and fake Anthropic API

@@ -23,7 +23,9 @@ x-db: &db
 
 x-github: &github
   GITHUB_TOKEN: ${GITHUB_TOKEN:?Set GITHUB_TOKEN in .env}
-  GITHUB_REPOS: ${GITHUB_REPOS:?Set GITHUB_REPOS in .env}
+  # Legacy repository list; the product catalog (products.yaml) replaces it.
+  GITHUB_REPOS: ${GITHUB_REPOS:-}
+  PRODUCTS_FILE: /config/products.yaml
   GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
   GITHUB_GIT_URL_TEMPLATE: ${GITHUB_GIT_URL_TEMPLATE:-https://github.com/{owner}/{repo}.git}
   ORCH_TRIGGER_LABEL: ${ORCH_TRIGGER_LABEL:-ai-ready}
@@ -92,7 +94,12 @@ services:
       <<: [*db, *github]
       POLL_INTERVAL_SECONDS: ${POLL_INTERVAL_SECONDS:-60}
       STEP_TIMEOUT_MINUTES: ${STEP_TIMEOUT_MINUTES:-60}
-    volumes: [artifacts:/data/artifacts, repos:/data/repos]
+      MAX_STEP_REPOSITORIES: ${MAX_STEP_REPOSITORIES:-8}
+      FAST_TRACK_MAX_FILES: ${FAST_TRACK_MAX_FILES:-5}
+    volumes:
+      - artifacts:/data/artifacts
+      - repos:/data/repos
+      - ${ORCH_PRODUCTS_FILE:-../../products.yaml}:/config/products.yaml:ro
 
   api:
     <<: *app
@@ -101,7 +108,9 @@ services:
       <<: [*db, *github]
       ALLOWED_HOSTS: localhost:${ORCH_PORT:-3000},127.0.0.1:${ORCH_PORT:-3000}
       COPILOT_GITHUB_TELEMETRY_DISABLED: "true"
-    volumes: [copilot:/data/copilot]
+    volumes:
+      - copilot:/data/copilot
+      - ${ORCH_PRODUCTS_FILE:-../../products.yaml}:/config/products.yaml:ro
     ports: ["127.0.0.1:${ORCH_PORT:-3000}:3000"]
 
   # Build-only service for the agent sandbox image (started by workspace-manager, never by compose).

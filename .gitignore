@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.tsbuildinfo
 .env
+/products.yaml
 infra/local/certs/*
 !infra/local/certs/.gitkeep
 .data/

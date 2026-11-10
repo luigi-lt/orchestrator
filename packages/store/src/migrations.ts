@@ -112,4 +112,43 @@ create table poll_state (
 );
 `,
   },
+  {
+    // Iteration 2, increment 1: product catalog, analysis and track, one conversation per run, repositories on demand.
+    version: 2,
+    sql: `
+create table catalog_versions (
+  hash text primary key,
+  content jsonb not null,
+  created_at timestamptz not null default now()
+);
+
+alter table runs
+  add column labels jsonb not null default '[]',
+  add column track text,
+  add column track_reasons jsonb not null default '[]',
+  add column home_product text,
+  add column products jsonb not null default '[]',
+  add column analysis jsonb,
+  add column catalog_hash text;
+
+alter table conversations add column kind text not null default 'general';
+update conversations set kind = 'run' where focused_run_id is not null and id in (select conversation_id from runs);
+
+alter table messages add column author text;
+update messages set author = 'front-door' where role = 'agent';
+
+create table repository_requests (
+  id text primary key,
+  step_id text not null references steps(id) on delete cascade,
+  repository text not null,
+  reason text,
+  state text not null,
+  entry jsonb,
+  error text,
+  created_at timestamptz not null default now(),
+  unique (step_id, repository)
+);
+create index repository_requests_pending_idx on repository_requests (step_id) where state = 'pending';
+`,
+  },
 ];

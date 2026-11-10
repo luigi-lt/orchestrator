@@ -12,6 +12,7 @@
     "@orch/contracts": "*",
     "@orch/common": "*",
     "@orch/store": "*",
-    "zod": "^4.3.6"
+    "zod": "^4.3.6",
+    "@orch/catalog": "*"
   }
 }

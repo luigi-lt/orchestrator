@@ -4,12 +4,15 @@ import type { ApprovalDto, RunDto } from "@orch/contracts";
 import { api, put, subscribe } from "./api";
 import { ChatView } from "./views/ChatView";
 import { RunDetail } from "./views/RunDetail";
+import { Products } from "./views/Products";
 import { RunsList } from "./views/RunsList";
 
 export interface Me {
   login: string;
   name: string | null;
   repos: string[];
+  /** Set when the product catalog on disk cannot be used; no new work starts until it is fixed. */
+  catalogError: string | null;
   triggerLabel: string;
   model: string;
   landingView: "user" | "operator";
@@ -112,6 +115,7 @@ export function App() {
             <span className="me">@{me?.login ?? "…"}</span>
           </div>
         </header>
+        {me?.catalogError && <div className="error-banner">Product catalog problem: {me.catalogError}</div>}
         <main className="content">
           <Routes>
             <Route path="/" element={me ? <Navigate to={me.landingView === "operator" ? "/ops/runs" : "/chat"} replace /> : null} />
@@ -119,6 +123,7 @@ export function App() {
             <Route path="/chat/:conversationId" element={<ChatView />} />
             <Route path="/ops/runs" element={<RunsList />} />
             <Route path="/ops/runs/:runId" element={<RunDetail />} />
+            <Route path="/ops/products" element={<Products />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
         </main>

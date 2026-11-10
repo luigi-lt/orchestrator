@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyRisk, isHostAllowed, scanDiffForSecrets } from "./safety.js";
+import { classifyRisk, globToRegExp, isHostAllowed, matchesAnyGlob, scanDiffForSecrets } from "./safety.js";
 import { signWorkspaceToken, verifyWorkspaceToken } from "./tokens.js";
 import { canonicalJson, hashOf, slugify } from "./util.js";
 
@@ -84,5 +84,33 @@ describe("hashing and slugs", () => {
   it("builds branch-safe slugs", () => {
     expect(slugify("Fix: Crash on Ünicode input!!")).toBe("fix-crash-on-unicode-input");
     expect(slugify("***")).toBe("change");
+  });
+});
+
+describe("catalog path globs", () => {
+  it("matches across and within directories", () => {
+    expect(matchesAnyGlob("deploy/prod/app.yaml", ["deploy/**"])).toBe(true);
+    expect(matchesAnyGlob("deploy", ["deploy/**"])).toBe(false);
+    expect(matchesAnyGlob("src/api/openapi.yaml", ["**/openapi.yaml"])).toBe(true);
+    expect(matchesAnyGlob("openapi.yaml", ["**/openapi.yaml"])).toBe(true);
+    expect(matchesAnyGlob("src/main/proto/a/b.proto", ["src/main/proto/**/*.proto"])).toBe(true);
+    expect(matchesAnyGlob("src/a.ts", ["src/*.js"])).toBe(false);
+    expect(matchesAnyGlob("docs/a/b.md", ["docs/*.md"])).toBe(false);
+  });
+
+  it("matches a bare file name at any depth and a trailing slash as a directory", () => {
+    expect(globToRegExp("schema.sql").test("db/schema.sql")).toBe(true);
+    expect(globToRegExp("schema.sql").test("db/schema.sql.bak")).toBe(false);
+    expect(globToRegExp("api/").test("api/v1/users.yaml")).toBe(true);
+    expect(globToRegExp("a.b").test("axb")).toBe(false);
+  });
+});
+
+describe("product risk paths and guidance", () => {
+  it("adds catalog paths to the baseline and treats agent guidance as high risk", () => {
+    expect(classifyRisk(["src/a.ts"], ["src/**"]).reasons).toEqual(["Changes a path the product marks as high risk"]);
+    expect(classifyRisk(["AGENTS.md"]).reasons).toEqual(["Changes agent guidance files"]);
+    expect(classifyRisk(["docs/AGENTS.md", ".github/copilot-instructions.md"]).files).toHaveLength(2);
+    expect(classifyRisk(["src/agents.md.ts"]).files).toEqual([]);
   });
 });

@@ -1,6 +1,18 @@
 import { Client, Connection, WorkflowExecutionAlreadyStartedError } from "@temporalio/client";
+import { CatalogError, currentCatalog } from "@orch/catalog";
 import { config, log, newId, sleep } from "@orch/common";
-import { TASK_QUEUES, parseRepoSlug, repoSlug, workflowIdForIssue, type DeliveryRunInput, type RepoRef } from "@orch/contracts";
+import {
+  RUN_WORKFLOW_GENERATION,
+  TASK_QUEUES,
+  catalogRepositories,
+  findCatalogRepository,
+  parseRepoSlug,
+  repoSlug,
+  workflowIdForIssue,
+  type Catalog,
+  type DeliveryRunInput,
+  type RepoRef,
+} from "@orch/contracts";
 import { GitHubClient, type GitHubUser } from "@orch/github";
 import { findLatestRunByWorkflowId, type Db } from "@orch/store";
 import type { StreamHub } from "./hub.js";
@@ -35,18 +47,33 @@ export function temporal(): Promise<Client> {
   return temporalClient;
 }
 
-export function allowedRepo(slug: string): RepoRef {
-  const repo = parseRepoSlug(slug);
-  const allowed = config.githubRepos().map((s) => s.toLowerCase());
-  if (!allowed.includes(repoSlug(repo).toLowerCase())) {
-    throw new UserError(`Repository ${repoSlug(repo)} is not configured. Configured: ${config.githubRepos().join(", ") || "none"}`);
-  }
-  return repo;
-}
-
 export class UserError extends Error {}
 
-/** Starts a delivery run for an issue (or returns the run already working on it). */
+/** The product catalog as it is on disk now; an invalid catalog is reported to the person, not thrown as a server error. */
+export function catalog(): Catalog {
+  try {
+    return currentCatalog();
+  } catch (err) {
+    if (err instanceof CatalogError) throw new UserError(`The product catalog is invalid, so no work can start: ${err.message}`);
+    throw err;
+  }
+}
+
+/** Work can only start from a repository of the product catalog (FR-M1). */
+export function allowedRepo(slug: string): RepoRef {
+  const repo = parseRepoSlug(slug);
+  const c = catalog();
+  const entry = findCatalogRepository(c, repoSlug(repo));
+  if (!entry) {
+    throw new UserError(`Repository ${repoSlug(repo)} is not in the product catalog. Repositories: ${catalogRepositories(c).map((r) => r.id).join(", ")}`);
+  }
+  return { owner: entry.owner, name: entry.name };
+}
+
+/**
+ * Starts a delivery run for an issue (or returns the run already working on it).
+ * `conversationId` is the chat the request came from: it gets a link to the run's own conversation.
+ */
 export async function startRunForIssue(
   s: Services,
   repoSlugText: string,
@@ -66,6 +93,7 @@ export async function startRunForIssue(
       title: issue.title,
       body: issue.body,
       url: issue.url,
+      labels: issue.labels.filter((l) => l !== config.triggerLabel()),
       requester: { login: s.owner.login, id: s.owner.id },
     },
   };
@@ -76,6 +104,7 @@ export async function startRunForIssue(
       taskQueue: TASK_QUEUES.orchestration,
       workflowId,
       args: [input],
+      memo: { generation: RUN_WORKFLOW_GENERATION },
       workflowIdConflictPolicy: "FAIL",
       workflowIdReusePolicy: "ALLOW_DUPLICATE",
     });

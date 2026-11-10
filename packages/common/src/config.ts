@@ -30,7 +30,9 @@ export const config = {
   temporalNamespace: () => str("TEMPORAL_NAMESPACE", "default"),
 
   githubToken: () => str("GITHUB_TOKEN"),
+  /** Legacy: used only to build a one-product-per-repository catalog when no products file exists. */
   githubRepos: () => list("GITHUB_REPOS"),
+  productsFile: () => str("PRODUCTS_FILE", "/config/products.yaml"),
   githubApiUrl: () => str("GITHUB_API_URL", "https://api.github.com"),
   githubGitUrlTemplate: () => str("GITHUB_GIT_URL_TEMPLATE", "https://github.com/{owner}/{repo}.git"),
   ownerLogin: () => process.env.ORCH_OWNER_LOGIN?.trim() || undefined,
@@ -39,6 +41,10 @@ export const config = {
   model: () => str("ORCH_MODEL", "claude-opus-5-5"),
   pollIntervalSeconds: () => int("POLL_INTERVAL_SECONDS", 60),
   stepTimeoutMinutes: () => int("STEP_TIMEOUT_MINUTES", 60),
+  /** Repositories one read-only step may hold, including those it asks for on demand (AD-37). */
+  maxStepRepositories: () => int("MAX_STEP_REPOSITORIES", 8),
+  /** Fast-track limit on the number of files the analysis expects to change (FR-A2). */
+  fastTrackMaxFiles: () => int("FAST_TRACK_MAX_FILES", 5),
 
   workspaceTokenSecret: () => str("WORKSPACE_TOKEN_SECRET"),
   artifactsDir: () => str("ARTIFACTS_DIR", "/data/artifacts"),

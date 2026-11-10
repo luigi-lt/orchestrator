@@ -72,22 +72,64 @@ const RISK_RULES: { reason: string; test: (path: string) => boolean }[] = [
     reason: "Changes ownership or permission files",
     test: (p) => /(^|\/)CODEOWNERS$/.test(p) || p.startsWith(".github/settings"),
   },
+  {
+    // Guidance shapes how every agent works on the product, so changing it needs a person's approval (FR-M6).
+    reason: "Changes agent guidance files",
+    test: (p) => isGuidanceFile(p),
+  },
 ];
+
+/** Files a product team keeps in its repository to guide agents (FR-M6); changing them is high risk. */
+export function isGuidanceFile(path: string): boolean {
+  return /(^|\/)AGENTS\.md$/.test(path) || path === ".github/copilot-instructions.md" || path.startsWith(".github/instructions/");
+}
+
+/**
+ * Minimal glob for catalog paths: `**` matches across directories, `*` within one, `?` one character.
+ * A pattern without a slash matches the file name at any depth; a trailing slash matches everything below.
+ */
+export function globToRegExp(pattern: string): RegExp {
+  let glob = pattern.trim().replace(/^\.?\//, "");
+  if (glob.endsWith("/")) glob += "**";
+  const anyDepth = !glob.includes("/");
+  let re = "";
+  for (let i = 0; i < glob.length; i++) {
+    const ch = glob[i]!;
+    if (ch === "*") {
+      if (glob[i + 1] === "*") {
+        i++;
+        if (glob[i + 1] === "/") {
+          i++;
+          re += "(?:.*/)?";
+        } else re += ".*";
+      } else re += "[^/]*";
+    } else if (ch === "?") re += "[^/]";
+    else re += ch.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp(`^${anyDepth ? "(?:.*/)?" : ""}${re}$`);
+}
+
+export const matchesAnyGlob = (path: string, patterns: readonly string[]): boolean => patterns.some((p) => globToRegExp(p).test(path));
 
 export interface RiskAssessment {
   reasons: string[];
   files: string[];
 }
 
-/** High-risk paths need a human approval before they are pushed (risk tier "high"). */
-export function classifyRisk(changedFiles: string[]): RiskAssessment {
+/**
+ * High-risk paths need a human approval before they are pushed (risk tier "high").
+ * `extraPaths` are the product's own high-risk globs from the catalog: they can add to the baseline, never remove (D15).
+ */
+export function classifyRisk(changedFiles: string[], extraPaths: readonly string[] = []): RiskAssessment {
   const reasons = new Set<string>();
   const files: string[] = [];
+  const extra = extraPaths.map(globToRegExp);
   for (const f of changedFiles) {
-    const hits = RISK_RULES.filter((r) => r.test(f));
+    const hits = RISK_RULES.filter((r) => r.test(f)).map((r) => r.reason);
+    if (extra.some((re) => re.test(f))) hits.push("Changes a path the product marks as high risk");
     if (hits.length) {
       files.push(f);
-      hits.forEach((h) => reasons.add(h.reason));
+      hits.forEach((h) => reasons.add(h));
     }
   }
   return { reasons: [...reasons], files };

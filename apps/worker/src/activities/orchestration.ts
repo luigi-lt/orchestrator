@@ -1,6 +1,17 @@
-import { Context } from "@temporalio/activity";
-import { hashOf, newId } from "@orch/common";
-import type { OrchestratorCard, Plan, RunState, WorkItem } from "@orch/contracts";
+import { ApplicationFailure, Context } from "@temporalio/activity";
+import { CatalogError, currentCatalog, decideTrack, validateAnalysis } from "@orch/catalog";
+import { config, hashOf, newId } from "@orch/common";
+import {
+  findCatalogProduct,
+  findCatalogRepository,
+  repoSlug,
+  type Analysis,
+  type OrchestratorCard,
+  type Plan,
+  type RunState,
+  type TrackDecision,
+  type WorkItem,
+} from "@orch/contracts";
 import {
   appendRunEvent,
   createApproval,
@@ -10,12 +21,12 @@ import {
   getRun,
   insertRun,
   resolveApproval,
-  setFocusedRun,
+  saveCatalogVersion,
   updateRun,
   upsertCard,
   type NewRunEvent,
 } from "@orch/store";
-import { ctx } from "../context.js";
+import { ctx, runCatalog } from "../context.js";
 
 const key = (runId: string, ...parts: string[]) => ["run", runId, ...parts].join(":");
 
@@ -24,10 +35,18 @@ export async function recordEvent(e: NewRunEvent): Promise<void> {
   await appendRunEvent(ctx().db, e);
 }
 
-/** Creates the run record and its home conversation, and posts the work item card. */
-export async function initRun(input: { runId: string; workItem: WorkItem; conversationId: string | null }): Promise<{ conversationId: string }> {
+/**
+ * Creates the run record, pins the product catalog, and opens the run's own conversation (AD-30, AD-38).
+ * A chat that started the run gets a link to that conversation.
+ */
+export async function initRun(input: {
+  runId: string;
+  workItem: WorkItem;
+  originConversationId: string | null;
+}): Promise<{ conversationId: string; homeProduct: string; catalogHash: string }> {
   const { db } = ctx();
   const { runId, workItem } = input;
+  const slug = repoSlug(workItem.repo);
   const workflowId = Context.current().info.workflowExecution?.workflowId ?? runId;
   await insertRun(db, {
     id: runId,
@@ -38,22 +57,98 @@ export async function initRun(input: { runId: string; workItem: WorkItem; conver
     title: workItem.title,
     url: workItem.url,
     requester: workItem.requester.login,
-    conversationId: input.conversationId,
+    labels: workItem.labels ?? [],
   });
-  const run = await getRun(db, runId);
-  let conversationId = run?.conversationId ?? input.conversationId;
-  if (!conversationId) conversationId = await createConversation(db, `#${workItem.number} ${workItem.title}`, runId);
-  await updateRun(db, runId, { conversationId });
-  await setFocusedRun(db, conversationId, runId);
+
+  let run = await getRun(db, runId);
+  let catalogHash = run?.catalogHash ?? null;
+  let homeProduct = run?.homeProduct ?? null;
+  if (!catalogHash || !homeProduct) {
+    let catalog;
+    try {
+      catalog = currentCatalog();
+    } catch (err) {
+      if (err instanceof CatalogError) throw ApplicationFailure.nonRetryable(err.message, "CatalogError");
+      throw err;
+    }
+    const home = findCatalogRepository(catalog, slug);
+    if (!home) throw ApplicationFailure.nonRetryable(`Repository ${slug} is not in the product catalog`, "CatalogError");
+    await saveCatalogVersion(db, catalog);
+    catalogHash = catalog.hash;
+    homeProduct = home.product;
+    await updateRun(db, runId, { catalogHash, homeProduct });
+  }
+
+  run = await getRun(db, runId);
+  let conversationId = run?.conversationId ?? null;
+  if (!conversationId) {
+    conversationId = await createConversation(db, `#${workItem.number} ${workItem.title}`.slice(0, 120), runId);
+    await updateRun(db, runId, { conversationId });
+  }
   await upsertCard(db, conversationId, key(runId, "work_item"), {
     type: "work_item",
     runId,
-    repo: `${workItem.repo.owner}/${workItem.repo.name}`,
+    repo: slug,
     number: workItem.number,
     title: workItem.title,
     url: workItem.url,
   });
-  return { conversationId };
+  if (input.originConversationId && input.originConversationId !== conversationId) {
+    await upsertCard(db, input.originConversationId, key(runId, "link"), {
+      type: "run_link",
+      runId,
+      conversationId,
+      repo: slug,
+      number: workItem.number,
+      title: workItem.title,
+    });
+  }
+  return { conversationId, homeProduct, catalogHash };
+}
+
+/**
+ * Applies the track rules to a validated analysis and posts the analysis card (FR-A1, FR-A2, AD-32).
+ * The analyst proposes a track; the rules decide which one is allowed.
+ */
+export async function recordAnalysis(input: {
+  runId: string;
+  conversationId: string;
+  analysis: Analysis;
+  labels: string[];
+}): Promise<{ decision: TrackDecision; products: string[]; repositories: string[] }> {
+  const { db } = ctx();
+  const catalog = await runCatalog(input.runId);
+  const problems = validateAnalysis(input.analysis, catalog);
+  if (problems.length) throw ApplicationFailure.nonRetryable(`The analysis does not match the product catalog: ${problems.join(" ")}`);
+  const decision = decideTrack({ analysis: input.analysis, labels: input.labels, catalog, maxFiles: config.fastTrackMaxFiles() });
+  const products = input.analysis.products.map((p) => findCatalogProduct(catalog, p.product)!.id);
+  const repositories = [
+    ...new Set(input.analysis.products.flatMap((p) => p.repositories.map((slug) => findCatalogRepository(catalog, slug)!.id))),
+  ];
+  await upsertCard(db, input.conversationId, key(input.runId, "analysis"), {
+    type: "analysis",
+    runId: input.runId,
+    understanding: input.analysis.understanding,
+    products: input.analysis.products.map((p) => {
+      const product = findCatalogProduct(catalog, p.product)!;
+      return {
+        id: product.id,
+        name: product.name,
+        repositories: p.repositories.map((slug) => findCatalogRepository(catalog, slug)!.id),
+        reason: p.reason,
+        changes: p.changes,
+      };
+    }),
+    size: input.analysis.size,
+    track: decision.track,
+    proposedTrack: decision.proposed,
+    trackReasons: decision.reasons,
+    approach: input.analysis.approach,
+    acceptanceCriteria: input.analysis.acceptanceCriteria,
+    risks: input.analysis.risks,
+    assumptions: input.analysis.assumptions,
+  });
+  return { decision, products, repositories };
 }
 
 export async function updateProgress(input: {

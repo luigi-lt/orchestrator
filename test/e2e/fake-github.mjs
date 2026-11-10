@@ -10,7 +10,20 @@ import { tmpdir } from "node:os";
 const PORT = Number(process.env.PORT ?? 8095);
 const GIT_ROOT = process.env.FAKE_GIT_ROOT ?? "/fake-git";
 const USER = { login: "tester", id: 4242, name: "Test User" };
-const REPOS = (process.env.FAKE_REPOS ?? "acme/demo").split(",");
+const REPOS = (process.env.FAKE_REPOS ?? "acme/demo,acme/web").split(",");
+
+// Seed content per repository. acme/demo carries guidance from its product team (FR-M6).
+const SEED = {
+  "acme/demo": {
+    "README.md": "# Demo\n\nA tiny calculator library.\n",
+    "math.js": "export function add(a, b) {\n  return a + b;\n}\n",
+    "AGENTS.md": "# Guidance for agents\n\nE2E-GUIDANCE-MARKER: one exported function per file, two-space indentation.\n",
+  },
+  "acme/web": {
+    "README.md": "# Web shop\n\nPages that use the calculator library.\n",
+    "page.js": "import { add } from 'demo/math.js';\n\nexport const total = (a, b) => add(a, b);\n",
+  },
+};
 
 const state = { issues: new Map(), comments: new Map(), events: new Map(), labels: new Map(), pulls: [], nextIssue: 1, nextComment: 1 };
 
@@ -23,8 +36,7 @@ function initRepo(slug) {
   git(["init", "--bare", "--initial-branch=main", bare]);
   const work = mkdtempSync(join(tmpdir(), "seed-"));
   git(["init", "--initial-branch=main", work]);
-  writeFileSync(join(work, "README.md"), "# Demo\n\nA tiny demo project.\n");
-  writeFileSync(join(work, "math.js"), "export function add(a, b) {\n  return a + b;\n}\n");
+  for (const [file, content] of Object.entries(SEED[slug] ?? SEED["acme/demo"])) writeFileSync(join(work, file), content);
   git(["add", "."], work);
   git(["-c", "user.name=Seed", "-c", "user.email=seed@example.com", "commit", "-m", "Initial commit"], work);
   git(["push", bare, "main"], work);
@@ -59,14 +71,14 @@ const touch = (o, r, n) => {
   if (i) i.updatedAt = new Date().toISOString();
 };
 
-function createIssue(o, r, title, body, label) {
+function createIssue(o, r, title, body, labels = []) {
   const number = state.nextIssue++;
   const key = issueKey(o, r, number);
   state.issues.set(key, { number, title, body, state: "open", updatedAt: new Date().toISOString() });
   state.labels.set(key, new Set());
   state.comments.set(key, []);
   state.events.set(key, []);
-  if (label) {
+  for (const label of labels) {
     state.labels.get(key).add(label);
     state.events.get(key).push({ event: "labeled", label: { name: label }, actor: { login: USER.login } });
   }
@@ -83,7 +95,7 @@ const server = http.createServer(async (req, res) => {
       if (m === "POST" && p[1] === "issues") {
         const b = await readBody(req);
         const [o, r] = (b.repo ?? REPOS[0]).split("/");
-        return send(res, 201, { number: createIssue(o, r, b.title, b.body ?? "", b.label) });
+        return send(res, 201, { number: createIssue(o, r, b.title, b.body ?? "", b.labels ?? (b.label ? [b.label] : [])) });
       }
       if (m === "POST" && p[1] === "pulls" && p[3] === "merge") {
         const pr = state.pulls.find((x) => x.number === Number(p[2]));
@@ -161,18 +173,19 @@ const server = http.createServer(async (req, res) => {
     }
     if (kind === "pulls" && !n && m === "GET") {
       const head = url.searchParams.get("head")?.split(":")[1];
-      return send(res, 200, state.pulls.filter((x) => !head || x.head === head).map((x) => ({ ...x, merged_at: x.merged ? new Date().toISOString() : null })));
+      const list = state.pulls.filter((x) => x.repo === `${o}/${r}` && (!head || x.head === head));
+      return send(res, 200, list.map((x) => ({ ...x, merged_at: x.merged ? new Date().toISOString() : null })));
     }
     if (kind === "pulls" && !n && m === "POST") {
       const b = await readBody(req);
       const bare = join(GIT_ROOT, `${o}/${r}.git`);
       git(["rev-parse", "--verify", `refs/heads/${b.head}`], bare); // fails if the branch was not pushed
-      const pr = { number: state.pulls.length + 1, html_url: `https://github.example/${o}/${r}/pull/${state.pulls.length + 1}`, title: b.title, body: b.body, head: b.head, base: b.base, state: "open", merged: false };
+      const pr = { repo: `${o}/${r}`, number: state.pulls.length + 1, html_url: `https://github.example/${o}/${r}/pull/${state.pulls.length + 1}`, title: b.title, body: b.body, head: b.head, base: b.base, state: "open", merged: false };
       state.pulls.push(pr);
       return send(res, 201, pr);
     }
     if (kind === "pulls" && n && m === "GET") {
-      const pr = state.pulls.find((x) => x.number === Number(n));
+      const pr = state.pulls.find((x) => x.repo === `${o}/${r}` && x.number === Number(n));
       return pr ? send(res, 200, pr) : send(res, 404, { message: "no pr" });
     }
     return send(res, 404, { message: `not implemented: ${m} ${url.pathname}` });

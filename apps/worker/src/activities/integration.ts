@@ -1,7 +1,17 @@
 import { ApplicationFailure, Context } from "@temporalio/activity";
 import { WorkflowExecutionAlreadyStartedError } from "@temporalio/client";
+import { CatalogError, currentCatalog } from "@orch/catalog";
 import { config, log, newId, slugify } from "@orch/common";
-import { TASK_QUEUES, workflowIdForIssue, type DeliveryRunInput, type RepoRef, type WorkItem } from "@orch/contracts";
+import {
+  RUN_WORKFLOW_GENERATION,
+  TASK_QUEUES,
+  catalogRepositories,
+  workflowIdForIssue,
+  type DeliveryRunInput,
+  type RepoRef,
+  type Track,
+  type WorkItem,
+} from "@orch/contracts";
 import { GitHubError, type GitHubClient } from "@orch/github";
 import { getPollEtag, setPollEtag } from "@orch/store";
 import { ctx } from "../context.js";
@@ -22,14 +32,14 @@ async function gh<T>(fn: (client: GitHubClient) => Promise<T>): Promise<T> {
   }
 }
 
-/** Branch, base branch and commit identity for a run. */
-export async function lookupContext(input: { runId: string; workItem: WorkItem }): Promise<{
+/** Branch, base branch and commit identity for the repository a run changes (not always the ticket's own). */
+export async function lookupContext(input: { runId: string; workItem: WorkItem; repo: RepoRef }): Promise<{
   defaultBranch: string;
   branch: string;
   commitAuthor: { name: string; email: string };
 }> {
   const { owner } = ctx();
-  const defaultBranch = await gh((c) => c.getDefaultBranch(input.workItem.repo));
+  const defaultBranch = await gh((c) => c.getDefaultBranch(input.repo));
   const branch = `agent/${input.workItem.number}-${slugify(input.workItem.title, 32)}-${input.runId.slice(-6)}`;
   const requester = input.workItem.requester;
   const id = requester.id ?? (requester.login === owner.login ? owner.id : undefined);
@@ -70,6 +80,19 @@ export async function findRequesterReply(input: { repo: RepoRef; number: number;
   return replies.length ? replies.map((r) => r.body.trim()).join("\n\n") : null;
 }
 
+const TRACK_LABELS: Record<Track, { name: string; color: string; description: string }> = {
+  fast: { name: "track:fast", color: "1d76db", description: "Small change: straight to a reviewed pull request" },
+  guided: { name: "track:guided", color: "5319e7", description: "Designed with the requester before it is built" },
+};
+
+/** Mirrors the track on the ticket; the label follows when the track changes (FR-A3, work model §4). */
+export async function setTrackLabel(input: { repo: RepoRef; number: number; track: Track }): Promise<void> {
+  const other: Track = input.track === "fast" ? "guided" : "fast";
+  for (const t of Object.values(TRACK_LABELS)) await gh((c) => c.ensureLabel(input.repo, t.name, t.color, t.description));
+  await gh((c) => c.removeLabel(input.repo, input.number, TRACK_LABELS[other].name));
+  await gh((c) => c.addLabels(input.repo, input.number, [TRACK_LABELS[input.track].name]));
+}
+
 export async function finalizeIssue(input: { repo: RepoRef; number: number; outcome: "completed" | "closed" | "cancelled" | "failed" }): Promise<void> {
   await gh((c) => c.removeLabel(input.repo, input.number, LABEL_IN_PROGRESS));
   // Never leave the trigger label behind, or the issue would be picked up again in a loop.
@@ -101,15 +124,25 @@ export async function getPullRequestState(input: { repo: RepoRef; number: number
   return pr.merged ? "merged" : pr.state;
 }
 
-/** Discovery poller: finds issues labelled by the owner and starts a run for each (claiming via workflow ID). */
+/** Discovery poller: finds issues labelled by the owner in every catalog repository and starts a run for each. */
 export async function discoverAndStart(): Promise<number> {
   const { db, github, temporal, owner } = ctx();
   const label = config.triggerLabel();
+  let catalog;
+  try {
+    catalog = currentCatalog();
+  } catch (err) {
+    // An invalid catalog stops new runs; runs in flight keep the version they pinned (AD-30).
+    if (err instanceof CatalogError) {
+      log("worker", `discovery skipped, the product catalog is invalid: ${err.message}`);
+      return 0;
+    }
+    throw err;
+  }
   let started = 0;
-  for (const slug of config.githubRepos()) {
-    const [repoOwner, repoName] = slug.split("/");
-    if (!repoOwner || !repoName) continue;
-    const repo = { owner: repoOwner, name: repoName };
+  for (const entry of catalogRepositories(catalog)) {
+    const slug = entry.id;
+    const repo = { owner: entry.owner, name: entry.name };
     const pollKey = `github:${slug}:${label}`;
     let listing;
     try {
@@ -136,6 +169,7 @@ export async function discoverAndStart(): Promise<number> {
           title: issue.title,
           body: issue.body,
           url: issue.url,
+          labels: issue.labels.filter((l) => l !== label),
           requester: { login: owner.login, id: owner.id },
         },
       };
@@ -144,6 +178,7 @@ export async function discoverAndStart(): Promise<number> {
           taskQueue: TASK_QUEUES.orchestration,
           workflowId: workflowIdForIssue(repo, issue.number),
           args: [input],
+          memo: { generation: RUN_WORKFLOW_GENERATION },
           workflowIdConflictPolicy: "FAIL",
           workflowIdReusePolicy: "ALLOW_DUPLICATE",
         });

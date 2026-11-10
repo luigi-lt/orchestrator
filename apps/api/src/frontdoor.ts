@@ -8,16 +8,16 @@ import { config, errorMessage, log, newId } from "@orch/common";
 import { AgentComponent, FINAL_RUN_STATES, sanitizeAgentComponents } from "@orch/contracts";
 import {
   findLatestCardByPrefix,
+  getConversation,
   getRun,
   insertMessage,
   listMessages,
   listRuns,
   listSteps,
   renameConversation,
-  setFocusedRun,
 } from "@orch/store";
 import { z } from "zod";
-import { allowedRepo, startRunForIssue, UserError, type Services } from "./services.js";
+import { allowedRepo, catalog, startRunForIssue, UserError, type Services } from "./services.js";
 
 interface Turn {
   components: AgentComponent[];
@@ -57,13 +57,28 @@ export class FrontDoor {
     }
   }
 
-  private systemPrompt(): string {
+  /** In a run's own conversation the assistant is scoped to that run (AD-38). */
+  private async systemPrompt(conversationId: string): Promise<string> {
+    let products: string[];
+    try {
+      products = catalog().products.map((p) => `  - ${p.id} (${p.name}): ${p.repositories.map((r) => r.id).join(", ")}`);
+    } catch (err) {
+      products = [`  (the product catalog cannot be read: ${errorMessage(err)})`];
+    }
+    const conversation = await getConversation(this.s.db, conversationId);
+    const run = conversation?.kind === "run" && conversation.focusedRunId ? await getRun(this.s.db, conversation.focusedRunId) : null;
     return [
       frontDoor.instructions.replace("{label}", config.triggerLabel()),
       "",
       "## Context",
       `- The person you talk to is the owner, GitHub user @${this.s.owner.login}.`,
-      `- Configured repositories: ${config.githubRepos().join(", ") || "none"}.`,
+      "- Products and their repositories:",
+      ...products,
+      ...(run
+        ? [
+            `- This is the conversation of run ${run.id} for ${run.repo}#${run.issueNumber} ("${run.title}"). Questions here are about this run unless the person says otherwise.`,
+          ]
+        : []),
       `- Today is ${new Date().toISOString().slice(0, 10)}.`,
     ].join("\n");
   }
@@ -80,9 +95,8 @@ export class FrontDoor {
         handler: async ({ repo, issueNumber }: { repo: string; issueNumber: number }) => {
           try {
             const r = await startRunForIssue(s, repo, issueNumber, conversationId);
-            await setFocusedRun(s.db, conversationId, r.runId);
             return r.started
-              ? { runId: r.runId, status: "started", note: "Progress, questions and the plan will appear as cards in this conversation." }
+              ? { runId: r.runId, status: "started", note: "The run has its own conversation; a link card to it appears here. Analysis, questions and approvals show up there." }
               : { runId: r.runId, status: "already running" };
           } catch (err) {
             return { error: errorMessage(err) };
@@ -102,8 +116,7 @@ export class FrontDoor {
             const ref = allowedRepo(repo);
             const issue = await s.github.createIssue(ref, title, description);
             const r = await startRunForIssue(s, repo, issue.number, conversationId);
-            await setFocusedRun(s.db, conversationId, r.runId);
-            return { issue: issue.number, url: issue.url, runId: r.runId, status: "started" };
+            return { issue: issue.number, url: issue.url, runId: r.runId, status: "started", note: "A link card to the run's own conversation appears here." };
           } catch (err) {
             return { error: errorMessage(err) };
           }
@@ -117,7 +130,7 @@ export class FrontDoor {
           const runs = await listRuns(s.db, 30);
           return runs
             .filter((r) => !activeOnly || !FINAL_RUN_STATES.includes(r.state))
-            .map((r) => ({ runId: r.id, issue: `${r.repo}#${r.issueNumber}`, title: r.title, state: r.state, pr: r.prUrl, updatedAt: r.updatedAt }));
+            .map((r) => ({ runId: r.id, issue: `${r.repo}#${r.issueNumber}`, title: r.title, state: r.state, track: r.track, pr: r.prUrl, updatedAt: r.updatedAt }));
         },
       }),
       defineTool("get_run_status", {
@@ -127,7 +140,6 @@ export class FrontDoor {
         handler: async ({ runId }: { runId: string }) => {
           const run = await getRun(s.db, runId);
           if (!run) return { error: `No run ${runId}` };
-          await setFocusedRun(s.db, conversationId, runId);
           const steps = await listSteps(s.db, runId);
           return {
             runId,
@@ -135,6 +147,10 @@ export class FrontDoor {
             title: run.title,
             state: run.state,
             error: run.error,
+            track: run.track,
+            trackReasons: run.trackReasons,
+            products: run.products,
+            analysis: run.analysis ? { understanding: run.analysis.understanding, size: run.analysis.size, approach: run.analysis.approach } : null,
             plan: run.plan,
             pullRequest: run.prUrl,
             steps: steps.map((st) => ({ title: st.title, state: st.state, summary: st.summary })),
@@ -142,15 +158,20 @@ export class FrontDoor {
         },
       }),
       defineTool("show_card", {
-        description: "Show a run's card in this conversation: its plan, progress, pull request or work item.",
-        parameters: z.object({ runId: z.string(), card: z.enum(["plan", "progress", "pull_request", "work_item"]) }),
+        description: "Show a run's card in this conversation: its analysis, plan, progress, pull request or work item.",
+        parameters: z.object({ runId: z.string(), card: z.enum(["analysis", "plan", "progress", "pull_request", "work_item"]) }),
         skipPermission: true,
-        handler: async ({ runId, card }: { runId: string; card: "plan" | "progress" | "pull_request" | "work_item" }) => {
-          const prefix = { plan: `run:${runId}:plan:`, progress: `run:${runId}:progress`, pull_request: `run:${runId}:pr`, work_item: `run:${runId}:work_item` }[card];
+        handler: async ({ runId, card }: { runId: string; card: "analysis" | "plan" | "progress" | "pull_request" | "work_item" }) => {
+          const prefix = {
+            analysis: `run:${runId}:analysis`,
+            plan: `run:${runId}:plan:`,
+            progress: `run:${runId}:progress`,
+            pull_request: `run:${runId}:pr`,
+            work_item: `run:${runId}:work_item`,
+          }[card];
           const found = await findLatestCardByPrefix(s.db, prefix);
           if (!found) return { error: `Run ${runId} has no ${card} card yet` };
           await insertMessage(s.db, { conversationId, role: "orchestrator", components: [found] });
-          await setFocusedRun(s.db, conversationId, runId);
           return { shown: true };
         },
       }),
@@ -174,7 +195,7 @@ export class FrontDoor {
     const session = await client.createSession({
       model: config.model(),
       provider: { type: "anthropic", baseUrl: config.egressAnthropicUrl(), apiKey: "injected-by-egress-proxy" },
-      systemMessage: { mode: "replace", content: this.systemPrompt() },
+      systemMessage: { mode: "replace", content: await this.systemPrompt(conversationId) },
       tools: this.tools(conversationId),
       availableTools: ["custom:*"],
       streaming: true,
@@ -211,13 +232,14 @@ export class FrontDoor {
       const final = await session.sendAndWait({ prompt }, 5 * 60 * 1000);
       const reply = final?.data.content?.trim() ?? "";
       const components = this.turns.get(conversationId)?.components ?? [];
-      if (reply || components.length) await insertMessage(this.s.db, { conversationId, role: "agent", text: reply || null, components });
+      if (reply || components.length) await insertMessage(this.s.db, { conversationId, role: "agent", author: "front-door", text: reply || null, components });
     } catch (err) {
       log("api", `front-door turn failed: ${errorMessage(err)}`);
       this.sessions.delete(conversationId);
       await insertMessage(this.s.db, {
         conversationId,
         role: "agent",
+        author: "front-door",
         text: `Sorry, I could not reply: ${errorMessage(err)}`,
       });
     } finally {

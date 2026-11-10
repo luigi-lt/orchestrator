@@ -1,14 +1,20 @@
 import { newId } from "@orch/common";
 import type {
+  Analysis,
   ApprovalDto,
+  BriefRepository,
+  Catalog,
   Component,
   ConversationDto,
+  MessageAuthor,
   MessageDto,
   MessageRole,
   OrchestratorCard,
   Plan,
   ProgressDto,
   ProgressEvent,
+  RepositoryRequestDto,
+  RepositoryRequestState,
   RunDto,
   RunEventDto,
   RunState,
@@ -16,6 +22,7 @@ import type {
   StepKind,
   StepResult,
   StepState,
+  Track,
 } from "@orch/contracts";
 import { type Db, type Queryable, notify, withTx } from "./db.js";
 
@@ -40,6 +47,12 @@ interface RunRow {
   pr_number: number | null;
   pr_url: string | null;
   plan: Plan | null;
+  track: Track | null;
+  track_reasons: string[];
+  home_product: string | null;
+  products: string[];
+  analysis: Analysis | null;
+  catalog_hash: string | null;
   error: string | null;
   created_at: Date;
   updated_at: Date;
@@ -58,6 +71,12 @@ const toRun = (r: RunRow): RunDto => ({
   prNumber: r.pr_number,
   prUrl: r.pr_url,
   plan: r.plan,
+  track: r.track,
+  trackReasons: r.track_reasons ?? [],
+  homeProduct: r.home_product,
+  products: r.products ?? [],
+  analysis: r.analysis,
+  catalogHash: r.catalog_hash,
   error: r.error,
   createdAt: iso(r.created_at)!,
   updatedAt: iso(r.updated_at)!,
@@ -72,14 +91,14 @@ export interface NewRun {
   title: string;
   url: string;
   requester: string;
-  conversationId: string | null;
+  labels: string[];
 }
 
 export async function insertRun(db: Queryable, run: NewRun): Promise<void> {
   await db.query(
-    `insert into runs (id, workflow_id, repo_owner, repo_name, issue_number, title, url, requester, state, conversation_id)
+    `insert into runs (id, workflow_id, repo_owner, repo_name, issue_number, title, url, requester, state, labels)
      values ($1,$2,$3,$4,$5,$6,$7,$8,'intake',$9) on conflict (id) do nothing`,
-    [run.id, run.workflowId, run.repoOwner, run.repoName, run.issueNumber, run.title, run.url, run.requester, run.conversationId],
+    [run.id, run.workflowId, run.repoOwner, run.repoName, run.issueNumber, run.title, run.url, run.requester, JSON.stringify(run.labels)],
   );
 }
 
@@ -119,8 +138,16 @@ export interface RunPatch {
   prNumber?: number;
   prUrl?: string;
   plan?: Plan;
+  track?: Track;
+  trackReasons?: string[];
+  homeProduct?: string;
+  products?: string[];
+  analysis?: Analysis;
+  catalogHash?: string;
   error?: string | null;
 }
+
+const JSON_RUN_COLUMNS = new Set<keyof RunPatch>(["plan", "trackReasons", "products", "analysis"]);
 
 const RUN_PATCH_COLUMNS: Record<keyof RunPatch, string> = {
   state: "state",
@@ -129,6 +156,12 @@ const RUN_PATCH_COLUMNS: Record<keyof RunPatch, string> = {
   prNumber: "pr_number",
   prUrl: "pr_url",
   plan: "plan",
+  track: "track",
+  trackReasons: "track_reasons",
+  homeProduct: "home_product",
+  products: "products",
+  analysis: "analysis",
+  catalogHash: "catalog_hash",
   error: "error",
 };
 
@@ -137,11 +170,44 @@ export async function updateRun(db: Queryable, id: string, patch: RunPatch): Pro
   const values: unknown[] = [id];
   for (const [key, column] of Object.entries(RUN_PATCH_COLUMNS) as [keyof RunPatch, string][]) {
     if (patch[key] === undefined) continue;
-    values.push(key === "plan" ? JSON.stringify(patch[key]) : patch[key]);
+    values.push(JSON_RUN_COLUMNS.has(key) ? JSON.stringify(patch[key]) : patch[key]);
     sets.push(`${column} = $${values.length}`);
   }
   if (!sets.length) return;
   await db.query(`update runs set ${sets.join(", ")}, updated_at = now() where id = $1`, values);
+}
+
+/** Marks runs of a workflow that can no longer continue (e.g. after an upgrade) as failed. Returns the affected runs. */
+export async function failActiveRunsOfWorkflow(db: Queryable, workflowId: string, error: string): Promise<RunDto[]> {
+  const { rows } = await db.query<RunRow>(
+    `update runs set state = 'failed', error = $2, updated_at = now()
+     where workflow_id = $1 and state not in ('completed','closed','cancelled','failed') returning *`,
+    [workflowId, error],
+  );
+  for (const r of rows) await notify(db, { t: "run", r: r.id });
+  return rows.map(toRun);
+}
+
+// ---------------------------------------------------------------------------
+// Product catalog versions (a run pins the version it started with, AD-30)
+// ---------------------------------------------------------------------------
+
+export async function saveCatalogVersion(db: Queryable, catalog: Catalog): Promise<void> {
+  await db.query("insert into catalog_versions (hash, content) values ($1,$2) on conflict (hash) do nothing", [catalog.hash, JSON.stringify(catalog)]);
+}
+
+export async function getCatalogVersion(db: Queryable, hash: string): Promise<Catalog | null> {
+  const { rows } = await db.query<{ content: Catalog }>("select content from catalog_versions where hash = $1", [hash]);
+  return rows[0]?.content ?? null;
+}
+
+/** The catalog a run pinned at start. */
+export async function getCatalogForRun(db: Queryable, runId: string): Promise<Catalog | null> {
+  const { rows } = await db.query<{ content: Catalog }>(
+    "select c.content from runs r join catalog_versions c on c.hash = r.catalog_hash where r.id = $1",
+    [runId],
+  );
+  return rows[0]?.content ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +364,68 @@ export async function listProgress(db: Queryable, stepId: string, afterSeq = 0, 
 }
 
 // ---------------------------------------------------------------------------
+// Repositories requested by an agent during a step (AD-37)
+// ---------------------------------------------------------------------------
+
+interface RepositoryRequestRow {
+  id: string;
+  step_id: string;
+  repository: string;
+  state: RepositoryRequestState;
+  entry: BriefRepository | null;
+  error: string | null;
+}
+
+const toRepositoryRequest = (r: RepositoryRequestRow): RepositoryRequestDto => ({
+  id: r.id,
+  stepId: r.step_id,
+  repository: r.repository,
+  state: r.state,
+  entry: r.entry,
+  error: r.error,
+});
+
+/** Records a request once per step and repository; asking again returns the existing request. */
+export async function createRepositoryRequest(
+  db: Queryable,
+  req: { stepId: string; repository: string; reason: string | null; state?: RepositoryRequestState; error?: string },
+): Promise<RepositoryRequestDto> {
+  await db.query(
+    `insert into repository_requests (id, step_id, repository, reason, state, error) values ($1,$2,$3,$4,$5,$6)
+     on conflict (step_id, repository) do nothing`,
+    [newId("rrq"), req.stepId, req.repository, req.reason, req.state ?? "pending", req.error ?? null],
+  );
+  const { rows } = await db.query<RepositoryRequestRow>("select * from repository_requests where step_id = $1 and repository = $2", [req.stepId, req.repository]);
+  return toRepositoryRequest(rows[0]!);
+}
+
+export async function getRepositoryRequest(db: Queryable, id: string): Promise<RepositoryRequestDto | null> {
+  const { rows } = await db.query<RepositoryRequestRow>("select * from repository_requests where id = $1", [id]);
+  return rows[0] ? toRepositoryRequest(rows[0]) : null;
+}
+
+export async function listRepositoryRequests(db: Queryable, stepId: string, state?: RepositoryRequestState): Promise<RepositoryRequestDto[]> {
+  const { rows } = await db.query<RepositoryRequestRow>(
+    `select * from repository_requests where step_id = $1 ${state ? "and state = $2" : ""} order by created_at`,
+    state ? [stepId, state] : [stepId],
+  );
+  return rows.map(toRepositoryRequest);
+}
+
+export async function resolveRepositoryRequest(
+  db: Queryable,
+  id: string,
+  outcome: { state: "ready"; entry: BriefRepository } | { state: "denied" | "failed"; error: string },
+): Promise<void> {
+  await db.query("update repository_requests set state = $2, entry = $3, error = $4 where id = $1 and state = 'pending'", [
+    id,
+    outcome.state,
+    outcome.state === "ready" ? JSON.stringify(outcome.entry) : null,
+    outcome.state === "ready" ? null : outcome.error,
+  ]);
+}
+
+// ---------------------------------------------------------------------------
 // Approvals (plan approvals, clarifying questions, high-risk changes)
 // ---------------------------------------------------------------------------
 
@@ -378,9 +506,10 @@ export async function listPendingApprovals(db: Queryable): Promise<ApprovalDto[]
 // Conversations and messages
 // ---------------------------------------------------------------------------
 
-export async function createConversation(db: Queryable, title: string, focusedRunId: string | null = null): Promise<string> {
+/** A general chat, or (with a run) the conversation of that run: every run has its own (AD-38). */
+export async function createConversation(db: Queryable, title: string, runId: string | null = null): Promise<string> {
   const id = newId("conv");
-  await db.query("insert into conversations (id, title, focused_run_id) values ($1,$2,$3)", [id, title, focusedRunId]);
+  await db.query("insert into conversations (id, title, focused_run_id, kind) values ($1,$2,$3,$4)", [id, title, runId, runId ? "run" : "general"]);
   return id;
 }
 
@@ -390,17 +519,13 @@ export async function getConversation(db: Queryable, id: string): Promise<Conver
 }
 
 export async function listConversations(db: Queryable, onlyId?: string): Promise<ConversationDto[]> {
-  const { rows } = await db.query<{ id: string; title: string; focused_run_id: string | null; updated_at: Date; pending: string }>(
-    `select c.id, c.title, c.focused_run_id, c.updated_at,
+  const { rows } = await db.query<{ id: string; title: string; kind: "general" | "run"; focused_run_id: string | null; updated_at: Date; pending: string }>(
+    `select c.id, c.title, c.kind, c.focused_run_id, c.updated_at,
        (select count(*) from approvals a join runs r on r.id = a.run_id where r.conversation_id = c.id and a.state = 'pending') as pending
      from conversations c ${onlyId ? "where c.id = $1" : ""} order by c.updated_at desc limit 200`,
     onlyId ? [onlyId] : [],
   );
-  return rows.map((r) => ({ id: r.id, title: r.title, focusedRunId: r.focused_run_id, updatedAt: iso(r.updated_at)!, pending: Number(r.pending) }));
-}
-
-export async function setFocusedRun(db: Queryable, conversationId: string, runId: string): Promise<void> {
-  await db.query("update conversations set focused_run_id = $2, updated_at = now() where id = $1", [conversationId, runId]);
+  return rows.map((r) => ({ id: r.id, title: r.title, kind: r.kind, focusedRunId: r.focused_run_id, updatedAt: iso(r.updated_at)!, pending: Number(r.pending) }));
 }
 
 export async function renameConversation(db: Queryable, conversationId: string, title: string): Promise<void> {
@@ -411,6 +536,7 @@ interface MessageRow {
   id: string;
   conversation_id: string;
   role: MessageRole;
+  author: MessageAuthor | null;
   text: string | null;
   components: Component[];
   version: string;
@@ -422,6 +548,7 @@ const toMessage = (r: MessageRow): MessageDto => ({
   id: r.id,
   conversationId: r.conversation_id,
   role: r.role,
+  author: r.author,
   text: r.text,
   components: r.components,
   version: Number(r.version),
@@ -431,11 +558,11 @@ const toMessage = (r: MessageRow): MessageDto => ({
 
 export async function insertMessage(
   db: Queryable,
-  m: { conversationId: string; role: MessageRole; text?: string | null; components?: Component[] },
+  m: { conversationId: string; role: MessageRole; author?: MessageAuthor; text?: string | null; components?: Component[] },
 ): Promise<MessageDto> {
   const { rows } = await db.query<MessageRow>(
-    `insert into messages (id, conversation_id, role, text, components) values ($1,$2,$3,$4,$5) returning *`,
-    [newId("msg"), m.conversationId, m.role, m.text ?? null, JSON.stringify(m.components ?? [])],
+    `insert into messages (id, conversation_id, role, author, text, components) values ($1,$2,$3,$4,$5,$6) returning *`,
+    [newId("msg"), m.conversationId, m.role, m.author ?? null, m.text ?? null, JSON.stringify(m.components ?? [])],
   );
   await db.query("update conversations set updated_at = now() where id = $1", [m.conversationId]);
   const msg = toMessage(rows[0]!);

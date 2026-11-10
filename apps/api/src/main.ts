@@ -8,7 +8,7 @@ import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyReply } from "fastify";
 import { z } from "zod";
 import { config, errorMessage, log } from "@orch/common";
-import { PlanDecision, QuestionAnswer, RiskDecision, type OrchestratorCard } from "@orch/contracts";
+import { PlanDecision, QuestionAnswer, RiskDecision, catalogRepositories, type Catalog, type OrchestratorCard } from "@orch/contracts";
 import { GitHubClient } from "@orch/github";
 import {
   connectStore,
@@ -33,7 +33,7 @@ import {
 } from "@orch/store";
 import { FrontDoor, newConversationTitle } from "./frontdoor.js";
 import { StreamHub } from "./hub.js";
-import { signalRun, startRunForIssue, temporal, UserError, type Services } from "./services.js";
+import { catalog, signalRun, startRunForIssue, temporal, UserError, type Services } from "./services.js";
 
 const ALLOWED_HOSTS = (process.env.ALLOWED_HOSTS ?? `localhost:${config.apiPort()},127.0.0.1:${config.apiPort()}`)
   .split(",")
@@ -49,6 +49,26 @@ async function main(): Promise<void> {
   listen((notice) => hub.broadcast(notice));
 
   const app = Fastify({ logger: false, bodyLimit: 1024 * 1024 });
+
+  // Agents read untrusted code and tickets, and their text is shown in this app. The policy below keeps a
+  // browser from loading or sending anything outside this origin, whatever that text contains (architecture §7.5, §13).
+  const CONTENT_SECURITY_POLICY = [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "connect-src 'self'",
+    "font-src 'self'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'self'",
+    "frame-ancestors 'none'",
+  ].join("; ");
+  app.addHook("onSend", async (_req, reply) => {
+    reply.header("content-security-policy", CONTENT_SECURITY_POLICY);
+    reply.header("x-content-type-options", "nosniff");
+    reply.header("referrer-policy", "no-referrer");
+  });
 
   // Local single-user mode: protect against DNS rebinding and cross-site requests.
   app.addHook("onRequest", async (req, reply) => {
@@ -70,11 +90,27 @@ async function main(): Promise<void> {
 
   // --- Session and preferences ------------------------------------------------
   app.get("/api/health", async () => ({ ok: true }));
+  // The catalog on disk, or the reason it cannot be used (shown in the app instead of failing every page).
+  const catalogOrError = (): { catalog: Catalog | null; error: string | null } => {
+    try {
+      return { catalog: catalog(), error: null };
+    } catch (err) {
+      return { catalog: null, error: errorMessage(err) };
+    }
+  };
+  app.get("/api/products", async () => {
+    const c = catalogOrError();
+    return { hash: c.catalog?.hash ?? null, products: c.catalog?.products ?? [], error: c.error };
+  });
   app.get("/api/me", async () => ({
     login: me.login,
     name: me.name,
     roles: ["developer", "engineering-lead", "agent-developer", "platform-admin", "auditor"],
-    repos: config.githubRepos(),
+    repos: (() => {
+      const c = catalogOrError().catalog;
+      return c ? catalogRepositories(c).map((r) => r.id) : [];
+    })(),
+    catalogError: catalogOrError().error,
     triggerLabel: config.triggerLabel(),
     model: config.model(),
     landingView: (await getPreference<string>(db, "landingView")) ?? "user",
