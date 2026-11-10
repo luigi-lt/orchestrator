@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Proposed (v2.0) — for review |
-| **Date** | 2026-11-09 |
+| **Status** | Proposed (v2.1) — for review |
+| **Date** | 2026-11-10 |
 | **Phase** | Reference architecture — follows the [capability map](capabilities.md), the [non-functional requirements](non-functional-requirements.md) and the [functional requirements](functional-requirements.md) of iteration 2 |
 
 ## 1. Purpose and scope
@@ -33,6 +33,7 @@ Out of scope for this document: detailed API specifications, database DDL and UI
 | Step | One agent invocation with a result (e.g., analyse, implement, review, fix) |
 | Review report | The reviewer agent's structured result for one change: verdict and findings |
 | Diff check | The requester's approval of one sub-task's change in the web app, before its pull request opens |
+| Conversation hierarchy | Ticket → run → sub-task: how conversations are grouped. The ticket is the grouping, the run and each sub-task have a conversation (AD-43) |
 | Workspace | The isolated sandbox in which an agent reads, changes and builds code. A **step workspace** lives for one step; a **session workspace** lives for a design session and is saved when idle (AD-34) |
 | Requester | The person a run acts for: who sent the chat request, or who added the `ai-ready` label (AD-05) |
 | Agent profile | A versioned agent definition: instructions, tools, model, limits (CAP-01) |
@@ -50,7 +51,7 @@ Out of scope for this document: detailed API specifications, database DDL and UI
 
 The capability map (v1.8) and the non-functional requirements (v1.3) are updated accordingly.
 
-**Iteration 2** (this version) takes the [functional requirements](functional-requirements.md) v1.3 as input:
+**Iteration 2** (this version) takes the [functional requirements](functional-requirements.md) v1.5 as input:
 
 | Change | Effect |
 |---|---|
@@ -59,6 +60,7 @@ The capability map (v1.8) and the non-functional requirements (v1.3) are updated
 | **AI review of every change, fix loop, diff check** (FR-R1 to FR-R4) | `reviewer` step and review report (AD-39); change review bound to a commit (AD-40); `SubTaskWorkflow` reshaped (§9) |
 | **Work across products** (FR-M1 to FR-M6) | Product catalog (AD-30); a run belongs to the ticket (AD-31); agents specialized per product by composition (AD-33); workspaces with several repositories (AD-37); dependencies across repositories (AD-41). The tenant is now the product |
 | **One conversation per run** (decided for this iteration) | Refines AD-25: a run started from a chat no longer lives in that chat (AD-38) |
+| **Conversations in a hierarchy: ticket → run → sub-task** (FR-C1, FR-C2) | Grouping by ticket in both views; a conversation per sub-task under its run (AD-43) |
 | **Write access across products is broad at work** (confirmed) | The requester's own token stays the only write credential (AD-06); access is still checked before a plan can be approved (AD-42) |
 | Capability map wording: "readiness check", "planner", "edit plan" | Read as: preliminary analysis, architect, and re-plan through the architect. The capability map itself is unchanged |
 | Non-functional requirements | NFR-PF-10 added for design-session replies (v1.4) |
@@ -124,6 +126,7 @@ New decisions of this phase. They complement D1–D15 in the capability map.
 | AD-40 | **The diff check approves a commit.** The worker computes the diff from the result commit; the change review card is rendered from it; the approval carries the commit hash, and exactly that commit is pushed | What the requester saw is what is published | Approving a description of the change |
 | AD-41 | **Dependent sub-tasks: stacked in one repository, referenced across repositories.** In the same repository the dependent branch starts from the approved commit of the one it depends on, and its pull request targets that branch until it merges. Across repositories the dependent implementer gets a read-only copy of the approved change and the contract; pull requests state the merge order and the orchestrator flags violations | Work continues without waiting for merges; reviewers see only each sub-task's own diff | Waiting for each merge: days of idle time. One long-lived branch per story: one huge review |
 | AD-42 | **Access is checked before commitment.** Analysis needs the requester's read access to each repository it opens; a plan can be approved only when the requester can push to every repository in it and (business) create issues in every Jira project involved | No story is left half-built because a credential cannot reach one product | Finding out at push time |
+| AD-43 | **Conversations form a hierarchy: ticket → run → sub-task.** A ticket groups the conversations of all its runs; in a guided run, each sub-task has its own conversation under the run, which keeps what concerns the whole work (analysis, design session, plan, story view). The ticket is not a conversation and needs no new state: it is the identity runs already share (the workflow ID that claims the ticket). Waiting decisions roll up from sub-task to run to ticket | Everything about a ticket in one place, in the shape people know from story → sub-issues; a diff check and its discussion stay with their sub-task | A flat list of conversations: runs of the same ticket scattered. One conversation per run for everything: several diff checks and review reports in one long thread |
 
 ## 5. System context
 
@@ -371,7 +374,7 @@ Two listeners: **sandbox-facing** (workspace control channel, bundles, MCP) and 
 
 | From | To | Opens |
 |---|---|---|
-| A run's conversation | Operator view | That run's detail page |
+| A run's conversation, or one of its sub-tasks' | Operator view | That run's detail page |
 | A general chat | Operator view | The runs list (developers: their own runs) |
 | A run detail page | User view | That run's conversation for the person |
 | Any other operator page | User view | The last conversation |
@@ -381,9 +384,11 @@ Two listeners: **sandbox-facing** (workspace control channel, bundles, MCP) and 
 
 #### User view
 
-**Layout.** The conversation fills the center. A **thin frame** around it holds a side panel with past conversations and a **pending-actions badge** (approvals, questions waiting for the person). Selecting a conversation or a pending action opens it in its conversation.
+**Layout.** The conversation fills the center. A **thin frame** around it holds a side panel and a **pending-actions badge** (approvals, questions waiting for the person). The side panel shows the **conversation hierarchy** (AD-43): tickets, under each ticket its runs (newest first), under a guided run its sub-tasks; general chats are listed below. A ticket opens by itself while its newest run is active, something waits for the person, or it holds the open conversation. Selecting a ticket opens its newest run; selecting a pending action opens the conversation it belongs to.
 
 **Conversations and runs (AD-38).** Every run has **its own conversation** for its requester, created when the run starts. When the run was started from a chat, that chat shows a link card to the run's conversation and stays a general chat with the front-door agent. Other people involved in a run (e.g., an engineering lead asked to approve) get a conversation for that run the first time they are involved. The toggle uses the run of the open conversation.
+
+**Conversations and sub-tasks (AD-43).** In a guided run every sub-task gets its own conversation, created by its `SubTaskWorkflow` when the sub-task starts. Cards about one sub-task (its progress, review report, change review, pull request) are posted there; cards about the whole work (analysis, plan, story view) stay in the run's conversation, and the story view links to each sub-task's conversation. The fast track has a single change and no sub-task level.
 
 **Who answers.** The `api` routes each message by the run's state, never by asking a model:
 
@@ -391,6 +396,7 @@ Two listeners: **sandbox-facing** (workspace control channel, bundles, MCP) and 
 |---|---|---|
 | Design session open (designing, or plan proposed and not yet approved) | The **architect agent** | A header strip: "Design session with the architect", with the session state (active, resuming) |
 | Any other state | The **front-door agent**, scoped to this run (status, showing cards) | Nothing extra |
+| A sub-task's conversation, in any state | The **front-door agent**, scoped to that sub-task. What should change in the sub-task is said on its change review card, never to an agent | Nothing extra |
 
 Every agent message carries the name of the agent that wrote it. While a session workspace is starting or resuming, a status line appears within the acknowledgement time (NFR-PF-01), so the wait is never silent (NFR-PF-10).
 
@@ -428,7 +434,7 @@ Until Teams arrives, people need the corporate network or VPN to act on runs; no
 
 | Page | What it shows | Who |
 |---|---|---|
-| Runs | List and search by state, project, requester, date | Everyone within scope |
+| Runs | Runs grouped by ticket, as in the side panel of the user view (AD-43); search by state, product, requester, date | Everyone within scope |
 | Run detail | Track and its history; products involved; analysis; plan versions with what changed; plan graph with sub-task status by product; design session (state, turns, live transcript, workspace); review reports and diffs; event timeline; step detail (brief, result, live transcript, tool calls, usage, cost); linked ticket, sub-issues, pull requests and builds; approvals | Everyone within scope |
 | Interventions | Pause, resume, cancel, retry, change track, take over. Plans are never edited here either (FR-P3) | Engineering leads (their products), platform admins |
 | Approvals inbox | Pending approvals the person may decide | Approvers |
@@ -590,6 +596,7 @@ sequenceDiagram
 
 - **The reviewer starts clean (AD-39):** it gets the diff, the sub-task with its acceptance criteria, the plan's scope, constraints and contracts, the product's guidance at the base commit, and the test results — not the implementer's transcript.
 - **Fast track:** the same workflow runs once, without the diff check. Before the push the worker re-checks the fast-track limits against the real diff (files changed, one repository, no high-risk or contract paths). When they are exceeded, the run stops and asks the requester: continue, switch to guided, or cancel.
+- **The cards of a sub-task** (progress, review report, change review, pull request) are posted in the sub-task's own conversation; the run's conversation shows the story view (AD-43).
 - **Request changes** at the diff check starts another implement and review round with the requester's feedback; the card returns with a new commit.
 - **Drop the sub-task** closes it as not done; sub-tasks that depend on it wait for the requester's decision.
 - **The pull request description** carries the review summary, resolved and unresolved findings, test results, the story link and, across products, the related pull requests and the merge order (FR-R3, FR-M5).
@@ -799,7 +806,7 @@ Key entities (logical); new or changed in iteration 2 in **bold**:
 | **`review_report`** | Sub-task, round, head commit, verdict, findings (severity, file, line, explanation, suggestion) |
 | **`change_review`** | Sub-task, head commit, diff reference, state, the requester's feedback |
 | `approval` | Subject (plan version, change, unresolved findings, high-risk action), hash, required principal, state |
-| **`conversation`**, **`message`** | Conversation: kind (general or run), run. Message: author (requester, front-door, architect, orchestrator), text, components |
+| **`conversation`**, **`message`** | Conversation: kind (general, run or sub-task), run, sub-task. The ticket level is not stored: it is derived from the runs that share a ticket identity (AD-43). Message: author (requester, front-door, architect, orchestrator), text, components |
 | `run_event`, `usage_record`, `poll_checkpoint`, `push_subscription`, `audit_record` | As before; usage is recorded per step and per design turn, with the product it served |
 
 - **Retention jobs** enforce NFR-DR-02: run events and audit 1 year; transcripts, progress and artifacts (including bundles and diffs) 90 days; design-session checkpoints until the run closes plus 7 days; deletion on request (NFR-DR-04).
@@ -1148,6 +1155,8 @@ Quality gates in CI: type checks, unit tests, contract tests for adapters (recor
 | FR-M4 Product implementers | Specialization by composition (AD-33); product image and commands; reference copies of approved changes |
 | FR-M5 Pull requests across products | Pull request per repository; merge order in descriptions; `scm.merge_order_violated` (§8.4) |
 | FR-M6 Guidance kept by the product team | Guidance read at the base commit as untrusted content; high-risk path by default (§13, §15) |
+| FR-C1 Conversations grouped by ticket | Tickets derived from runs that share a ticket identity; pending decisions rolled up; the same grouping in the side panel and on the Runs page (AD-43, §7.5) |
+| FR-C2 A conversation for each sub-task | Conversation of kind sub-task created by the `SubTaskWorkflow`; sub-task cards posted there (AD-43, §8.3) |
 
 ### Key non-functional requirements
 
@@ -1219,7 +1228,7 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 | Workspaces | Several repositories per workspace; session workspace as a Docker container with idle checkpoint and restore; product image choice (`general`, optional JDK) | ACA Sandboxes; warm pools |
 | Control channel | Long-polling over HTTP between `workspace-host` and `sandbox-gateway` | WebSocket |
 | Workflows | Track rules; `DesignSessionWorkflow`; `SubTaskWorkflow` with AI review, fix loop, diff check, stacked and referenced dependencies; one sub-task at a time | Parallel sub-tasks (FR-N7); CI and review-comment fix loops (FR-N3); re-plan during execution (FR-N6) |
-| Conversation | One conversation per run; routing to the architect; agent labels; defensive rendering of agent text | AG-UI and A2UI transport (own SSE as in the MVP) |
+| Conversation | One conversation per run; conversations grouped by ticket in both views, and a conversation per sub-task (AD-43); routing to the architect; agent labels; defensive rendering of agent text | AG-UI and A2UI transport (own SSE as in the MVP) |
 | Cards | Analysis, plan (versions, what changed), change review with diff viewer, review report, story view | Teams renderers |
 | Source control and tickets | One branch and pull request per sub-task, in its repository; sub-issues; `track:` labels; merge-order notes and warnings | Jira, Bitbucket, Jenkins |
 | Policy | Track rules, access checks, approvals bound to hashes — in code | Cedar (AD-16); engineering-lead approvals (the owner holds every role locally) |
@@ -1227,12 +1236,12 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 
 **Build order.** Each increment ends with something that can be shown, and the end-to-end test with the fake GitHub and the fake model grows with it.
 
-**Status:** increment 1 is built and verified (see the [MVP guide](mvp.md) §9). Until increments 2 to 4 replace them, two bridges keep the product usable end to end: the fast track opens its pull request without an AI review, and the guided track uses a planning agent with approval on a card instead of the design session. Work that spans several repositories is analysed and classified but not built.
+**Status:** increment 1 is built and verified (see the [MVP guide](mvp.md) §9), including the grouping of conversations by ticket; the sub-task level of the hierarchy arrives with increment 2. Until increments 2 to 4 replace them, two bridges keep the product usable end to end: the fast track opens its pull request without an AI review, and the guided track uses a planning agent with approval on a card instead of the design session. Work that spans several repositories is analysed and classified but not built.
 
 | # | Increment | Shows | Proofs done first |
 |---|---|---|---|
 | 1 | Catalog; workspaces with several repositories; `analyst`; track rules; analysis card; one conversation per run | A ticket is analysed, placed in its products and given a track | R-20 |
-| 2 | `SubTaskWorkflow`: branch and pull request per sub-task; `reviewer`; fix loop; fast-track limits; review report on the pull request | **Demo scenario 1**: a bug from label to reviewed pull request with no stops | R-16 (first measurement) |
+| 2 | `SubTaskWorkflow`: branch and pull request per sub-task; a conversation per sub-task; `reviewer`; fix loop; fast-track limits; review report on the pull request | **Demo scenario 1**: a bug from label to reviewed pull request with no stops | R-16 (first measurement) |
 | 3 | Session workspace; `DesignSessionWorkflow`; routing; plan versions and plan card; approval; sub-issues | A story is designed in the chat and its plan approved | R-13, R-15 |
 | 4 | Change review card and diff viewer; dependencies (stacked, referenced); story view; merge-order warnings | **Demo scenario 2**: a story across two products | R-17 (GitHub side) |
 | 5 | Hardening: checkpoint restore paths, track switching, dropped sub-tasks, failure cases of §18; documentation | Pilot-ready | R-14 |
@@ -1245,3 +1254,4 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 | 1.1 | §7.5 rewritten: one web app with a user view (conversation and generative UI only) and an operator view (conventional role-scoped pages), switched by a context-preserving toggle (AD-25); home conversation per run; roles updated |
 | 1.2 | Limited admin rights: polling everywhere instead of webhooks (AD-26, §14.1); Jira through Atlassian's MCP server with user OAuth (AD-27); user-linked credentials including a Copilot-only fine-grained token and personal Bitbucket tokens (AD-04, AD-06, AD-28); no public ingress (AD-07); sandbox gets code as a bundle and has no route to source control (AD-24); Teams deferred (AD-17); notifications through badge, browser push and Jira mentions (AD-29, §7.6); risks R-09 to R-12 |
 | 2.0 | **Iteration 2**: product catalog and product as tenant (AD-30); runs belong to the ticket (AD-31); two tracks decided by rules (AD-32); `analyst`, `architect`, `reviewer` profiles specialized per product (AD-33); design session in a warm session workspace with durable turns (AD-34, AD-35); immutable plan versions, plan editor removed (AD-36); workspaces with several repositories (AD-37); one conversation per run (AD-38); AI review and diff check (AD-39, AD-40); dependencies across sub-tasks and products (AD-41); access checks (AD-42); flows §8 and lifecycle §9 rewritten; events, data, threats, traceability to functional requirements, risks R-13 to R-20; build scope and order (§24) |
+| 2.1 | Conversation hierarchy ticket → run → sub-task (AD-43): conversations grouped by ticket in both views, a conversation per sub-task under its run; §7.5, §8.3, data model, traceability to FR-C1 and FR-C2, build scope |

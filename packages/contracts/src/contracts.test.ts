@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Assessment, parseRepoSlug, sanitizeAgentComponents } from "./index.js";
+import { Assessment, groupTickets, parseRepoSlug, sanitizeAgentComponents, type RunDto } from "./index.js";
 
 describe("agent components", () => {
   it("drops system-only cards an agent tries to emit", () => {
@@ -35,5 +35,54 @@ describe("assessment schema", () => {
   });
   it("rejects plans without sub-tasks", () => {
     expect(Assessment.safeParse({ ready: true, questions: [], plan: { summary: "s", subtasks: [] } }).success).toBe(false);
+  });
+});
+
+describe("tickets group the runs of one issue", () => {
+  const run = (id: string, ticketKey: string, state: RunDto["state"], createdAt: string, updatedAt = createdAt): RunDto => ({
+    id,
+    ticketKey,
+    repo: "acme/demo",
+    issueNumber: Number(ticketKey.split("#")[1]),
+    title: `Title of ${id}`,
+    url: "u",
+    requester: "tester",
+    state,
+    conversationId: `conv_${id}`,
+    branch: null,
+    prNumber: null,
+    prUrl: null,
+    plan: null,
+    track: "guided",
+    trackReasons: [],
+    homeProduct: "calc",
+    products: ["calc"],
+    analysis: null,
+    catalogHash: null,
+    error: null,
+    createdAt,
+    updatedAt,
+  });
+  const runs = [
+    run("r1", "run:github:acme/demo#12", "cancelled", "2026-11-01T10:00:00Z"),
+    run("r3", "run:github:acme/demo#12", "awaiting_approval", "2026-11-03T10:00:00Z"),
+    run("r2", "run:github:acme/demo#9", "completed", "2026-11-02T10:00:00Z", "2026-11-02T12:00:00Z"),
+  ];
+
+  it("lists tickets by latest activity, their runs newest first, numbered in the order they started", () => {
+    const tickets = groupTickets(runs, { r3: 1 });
+    expect(tickets.map((t) => t.issueNumber)).toEqual([12, 9]);
+    const twelve = tickets[0]!;
+    expect(twelve.runs.map((r) => [r.runId, r.ordinal])).toEqual([
+      ["r3", 2],
+      ["r1", 1],
+    ]);
+    expect(twelve).toMatchObject({ state: "awaiting_approval", active: true, pending: 1, title: "Title of r3" });
+    expect(tickets[1]).toMatchObject({ state: "completed", active: false, pending: 0 });
+    expect(tickets[1]!.runs[0]!.conversationId).toBe("conv_r2");
+  });
+
+  it("returns nothing for no runs", () => {
+    expect(groupTickets([])).toEqual([]);
   });
 });

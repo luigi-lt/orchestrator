@@ -22,8 +22,10 @@ import type {
   StepKind,
   StepResult,
   StepState,
+  TicketDto,
   Track,
 } from "@orch/contracts";
+import { groupTickets } from "@orch/contracts";
 import { type Db, type Queryable, notify, withTx } from "./db.js";
 
 const iso = (d: Date | string | null): string | null => (d == null ? null : new Date(d).toISOString());
@@ -60,6 +62,7 @@ interface RunRow {
 
 const toRun = (r: RunRow): RunDto => ({
   id: r.id,
+  ticketKey: r.workflow_id,
   repo: `${r.repo_owner}/${r.repo_name}`,
   issueNumber: r.issue_number,
   title: r.title,
@@ -129,6 +132,22 @@ export async function findLatestCardByPrefix(db: Queryable, prefix: string): Pro
 export async function listRuns(db: Queryable, limit = 100): Promise<RunDto[]> {
   const { rows } = await db.query<RunRow>("select * from runs order by updated_at desc limit $1", [limit]);
   return rows.map(toRun);
+}
+
+/**
+ * Tickets with all their runs, most recently active tickets first: the top of the conversation
+ * hierarchy (ticket, run, later sub-task). `onlyKey` returns one ticket.
+ */
+export async function listTickets(db: Queryable, limit = 200, onlyKey?: string): Promise<TicketDto[]> {
+  const { rows } = await db.query<RunRow>(
+    onlyKey
+      ? "select * from runs where workflow_id = $2 and $1::int > 0"
+      : `select * from runs where workflow_id in (
+           select workflow_id from (select workflow_id, max(updated_at) as latest from runs group by workflow_id order by latest desc limit $1) recent)`,
+    onlyKey ? [limit, onlyKey] : [limit],
+  );
+  const pending = await db.query<{ run_id: string; n: string }>("select run_id, count(*) as n from approvals where state = 'pending' group by run_id");
+  return groupTickets(rows.map(toRun), Object.fromEntries(pending.rows.map((p) => [p.run_id, Number(p.n)])));
 }
 
 export interface RunPatch {

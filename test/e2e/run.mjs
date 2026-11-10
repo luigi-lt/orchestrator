@@ -1,7 +1,8 @@
 // End-to-end scenario against the running stack (started by test/e2e/run.sh), with a fake GitHub serving
 // two repositories of two products and a fake model. Exercises iteration 2, increment 1:
 // product catalog, analysis in a sandbox with several repositories, track rules, one conversation per run,
-// the fast track without stops, the guided track with plan approval, and work that spans two products.
+// the fast track without stops, the guided track with plan approval, work that spans two products,
+// and conversations grouped by ticket when a ticket is run again.
 const API = process.env.API_URL ?? "http://localhost:3000";
 const GH = process.env.FAKE_GITHUB_URL ?? "http://127.0.0.1:8095";
 const MODEL = process.env.FAKE_ANTHROPIC_URL ?? "http://127.0.0.1:8099";
@@ -148,7 +149,22 @@ async function main() {
   const crossCards = await cardsOf(cross.run.conversationId);
   check(crossCards.some((c) => c.type === "notice" && /2 repositories/.test(c.text)), "the conversation says why the run stopped");
 
-  console.log("5. Guided track: plan approval before anything is built");
+  console.log("5. Conversations grouped by ticket: the same ticket run again");
+  const again = await api("/api/runs", { method: "POST", body: { repo: "acme/demo", issueNumber: story.number } });
+  check(again.started && again.runId !== crossRun.id, "a ticket whose run ended can be run again");
+  const second = await waitForState(again.runId, ["closed"]);
+  const tickets = await api("/api/tickets");
+  const ticket = tickets.find((t) => t.issueNumber === story.number);
+  check(tickets.length === 2 && ticket?.runs.length === 2, `${tickets.length} tickets; the ticket #${story.number} holds ${ticket?.runs.length} runs`);
+  check(ticket.runs[0].runId === again.runId && ticket.runs[0].ordinal === 2 && ticket.runs[1].ordinal === 1, "its runs are listed newest first and numbered in the order they started");
+  check(
+    new Set(ticket.runs.map((r) => r.conversationId)).size === 2 && ticket.runs[0].conversationId === second.run.conversationId,
+    "each run keeps its own conversation under the ticket",
+  );
+  check(ticket.key === second.run.ticketKey && second.ticket?.runs.length === 2, "a run knows its ticket and the other runs of it");
+  check(tickets.find((t) => t.issueNumber === bug.number)?.runs.length === 1 && !ticket.active && ticket.pending === 0, "other tickets keep their own runs");
+
+  console.log("6. Guided track: plan approval before anything is built");
   const guided = await newIssue("Add subtract with care", "A subtract function that needs a design choice. [guided]", ["ai-ready"]);
   const guidedRun = await runFor(guided.number);
   const awaiting = await waitForState(guidedRun.id, ["awaiting_approval"]);

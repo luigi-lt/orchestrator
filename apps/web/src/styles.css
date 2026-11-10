@@ -211,13 +211,38 @@ table.grid { background: var(--surface); border: 1px solid var(--border); border
 .card.analysis details { margin-top: 8px; }
 .agent-origin { color: var(--muted); margin-bottom: 2px; }
 .blocked-image, .link-target { color: var(--muted); font-size: 12px; word-break: break-all; }
-.conversation-kind {
-  font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--orch);
-  border: 1px solid color-mix(in srgb, var(--orch) 40%, transparent); border-radius: 4px; padding: 0 4px; margin-right: 6px; flex: none;
-}
 .ops-nav { display: flex; gap: 14px; font-size: 13px; }
 .ops-nav a { color: var(--muted); padding-bottom: 2px; border-bottom: 2px solid transparent; }
 .ops-nav a.active { color: var(--text); border-bottom-color: var(--accent); }
 .panel.product { margin-bottom: 14px; }
 .panel.product h2 code { text-transform: none; letter-spacing: 0; }
 .panel.product td code { margin-right: 4px; }
+
+/* Conversations grouped by ticket: ticket, then its runs (the sub-task level comes with sub-tasks) */
+.ticket-tree { display: flex; flex-direction: column; gap: 2px; margin-top: 12px; }
+.tree-section { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); font-weight: 600; margin: 10px 4px 4px; }
+.ticket-row { display: flex; align-items: center; gap: 2px; border-radius: 8px; }
+.ticket-row.current { background: var(--surface-2); }
+.ticket-row button { border: 0; background: transparent; padding: 6px 4px; }
+.ticket-row .caret { flex: none; width: 22px; color: var(--muted); }
+.ticket-row .ticket-open { flex: 1; min-width: 0; display: flex; gap: 6px; align-items: baseline; text-align: left; }
+.ticket-row .ticket-open:hover .title { text-decoration: underline; }
+.ticket-ref { flex: none; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ticket-row .title, .run-row .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ticket-row .dot, .run-row .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warning); flex: none; margin-right: 8px; }
+.state-mark { width: 8px; height: 8px; border-radius: 50%; flex: none; margin-right: 8px; border: 1.5px solid var(--border); }
+.state-mark.active { border-color: var(--accent); background: var(--accent); }
+.state-mark.completed { border-color: var(--success); }
+.state-mark.failed { border-color: var(--danger); }
+.run-row {
+  display: flex; align-items: center; gap: 6px; width: calc(100% - 24px); margin-left: 24px; text-align: left;
+  border: 0; border-left: 1px solid var(--border); border-radius: 0 8px 8px 0; background: transparent;
+  padding: 5px 4px 5px 10px; font-size: 13px; color: var(--muted);
+}
+.run-row.active { background: var(--accent-soft); color: var(--text); border-left-color: var(--accent); }
+.ticket-tree .conversation-item { width: 100%; }
+table.tickets tr.ticket td { font-weight: 500; }
+table.tickets tr.run-of-ticket td { border-bottom-color: transparent; padding-top: 2px; padding-bottom: 2px; }
+table.tickets tr.run-of-ticket td:first-child { padding-left: 28px; }
+table.tickets .badge.pending { margin-left: 8px; }
+.other-runs { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }

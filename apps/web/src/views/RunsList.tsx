@@ -1,18 +1,18 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import type { RunDto } from "@orch/contracts";
+import type { TicketDto } from "@orch/contracts";
 import { api, post, subscribe } from "../api";
 import { useApp } from "../App";
 import { OpsNav } from "./Products";
 
 export function RunsList() {
   const { me, setToggleTarget } = useApp();
-  const [runs, setRuns] = useState<RunDto[]>([]);
+  const [tickets, setTickets] = useState<TicketDto[]>([]);
   const [repo, setRepo] = useState("");
   const [issue, setIssue] = useState("");
   const [error, setError] = useState<string | null>(null);
 
-  const load = useCallback(async () => setRuns(await api<RunDto[]>("/api/runs")), []);
+  const load = useCallback(async () => setTickets(await api<TicketDto[]>("/api/tickets")), []);
 
   useEffect(() => {
     void load();
@@ -71,10 +71,10 @@ export function RunsList() {
         </form>
       </div>
       {error && <div className="error-banner">{error}</div>}
-      <table className="grid">
+      <table className="grid tickets">
         <thead>
           <tr>
-            <th>Issue</th>
+            <th>Ticket and its runs</th>
             <th>Track</th>
             <th>State</th>
             <th>Requester</th>
@@ -83,23 +83,49 @@ export function RunsList() {
           </tr>
         </thead>
         <tbody>
-          {runs.map((r) => (
-            <tr key={r.id}>
-              <td>
-                <Link to={`/ops/runs/${r.id}`}>
-                  {r.repo}#{r.issueNumber} · {r.title}
-                </Link>
-              </td>
-              <td>{r.track ? <span className={`badge track ${r.track}`}>{r.track}</span> : <span className="muted">—</span>}</td>
-              <td>
-                <span className={`badge ${r.state}`}>{r.state.replace(/_/g, " ")}</span>
-              </td>
-              <td>@{r.requester}</td>
-              <td>{r.prUrl ? <a href={r.prUrl} target="_blank" rel="noreferrer">#{r.prNumber}</a> : "—"}</td>
-              <td className="muted">{new Date(r.updatedAt).toLocaleString()}</td>
-            </tr>
-          ))}
-          {runs.length === 0 && (
+          {tickets.flatMap((t) => {
+            const newest = t.runs[0]!;
+            // A ticket with one run is one row; a ticket that was run again lists every run under it, newest first.
+            const single = t.runs.length === 1;
+            const ticketRow = (
+              <tr key={t.key} className="ticket">
+                <td>
+                  <Link to={`/ops/runs/${newest.runId}`}>
+                    {t.repo}#{t.issueNumber} · {t.title}
+                  </Link>
+                  {!single && <span className="muted small"> · {t.runs.length} runs</span>}
+                  {t.pending > 0 && <span className="badge pending">{t.pending} waiting</span>}
+                </td>
+                <td>{t.track ? <span className={`badge track ${t.track}`}>{t.track}</span> : <span className="muted">—</span>}</td>
+                <td>
+                  <span className={`badge ${t.state}`}>{t.state.replace(/_/g, " ")}</span>
+                </td>
+                <td>@{t.requester}</td>
+                <td>{single && newest.prUrl ? <a href={newest.prUrl} target="_blank" rel="noreferrer">#{newest.prNumber}</a> : single ? "—" : ""}</td>
+                <td className="muted">{new Date(t.updatedAt).toLocaleString()}</td>
+              </tr>
+            );
+            if (single) return [ticketRow];
+            return [
+              ticketRow,
+              ...t.runs.map((r) => (
+                <tr key={r.runId} className="run-of-ticket">
+                  <td>
+                    <Link to={`/ops/runs/${r.runId}`}>Run {r.ordinal}</Link>
+                    <span className="muted small"> · started {new Date(r.createdAt).toLocaleString()}</span>
+                  </td>
+                  <td>{r.track ? <span className={`badge track ${r.track}`}>{r.track}</span> : <span className="muted">—</span>}</td>
+                  <td>
+                    <span className={`badge ${r.state}`}>{r.state.replace(/_/g, " ")}</span>
+                  </td>
+                  <td />
+                  <td>{r.prUrl ? <a href={r.prUrl} target="_blank" rel="noreferrer">#{r.prNumber}</a> : "—"}</td>
+                  <td className="muted">{new Date(r.updatedAt).toLocaleString()}</td>
+                </tr>
+              )),
+            ];
+          })}
+          {tickets.length === 0 && (
             <tr>
               <td colSpan={6} className="muted pad">
                 No runs yet. Label an issue <code>{me?.triggerLabel ?? "ai-ready"}</code> or start one above.

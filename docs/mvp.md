@@ -84,7 +84,7 @@ products:
 - **Label an issue `ai-ready`** in a repository of the catalog. Only labels you add yourself count (the orchestrator checks who added it). It is picked up within about a minute. Labels such as `bug` or `story` are a hint for the analysis; a `story` always takes the guided track.
 - **Ask in the chat:** "work on owner/repo#12", or "create an issue in owner/repo to add input validation to the signup form".
 
-**Every run has its own conversation.** It appears in the side panel, marked *run*. When you start a run from a chat, that chat shows a link card to it.
+**Every run has its own conversation, grouped by ticket.** The side panel lists your tickets; under each ticket are its runs, newest first ("Run 2 · guided · executing"). A ticket that is run again keeps all its runs together. A ticket opens by itself while it is active or waits for you; a dot marks where a decision is waiting. Your chats with the assistant are listed below the tickets, and a chat that started a run shows a link card to it.
 
 **Follow and steer it** in the run's conversation:
 
@@ -102,7 +102,7 @@ products:
 
 Orchestrator cards are marked **◆ Orchestrator**: they come from the orchestrator's records, never from the agent's text, so you can trust what an approval card says. Decisions go straight to the orchestrator and never pass through the agent.
 
-**See everything** in the *operator view* (toggle in the header): all runs with their track, and for each run its analysis, track and reasons, plan, steps, a live transcript of what the agent is doing (messages, tool calls, results), the event timeline and a cancel button. The *Products* page shows the catalog. The toggle keeps context: from a run's conversation it opens that run; from a run it opens its conversation.
+**See everything** in the *operator view* (toggle in the header): all runs with their track, grouped by ticket in the same way, and for each run its analysis, track and reasons, plan, steps, a live transcript of what the agent is doing (messages, tool calls, results), the event timeline and a cancel button. The *Products* page shows the catalog. The toggle keeps context: from a run's conversation it opens that run; from a run it opens its conversation.
 
 GitHub stays in sync: the issue gets comments (picked up, questions, analysis, plan, pull request) and labels (`ai-in-progress`, the track, then `ai-done`).
 
@@ -135,6 +135,7 @@ Security properties implemented as designed: sandboxes run as non-root with a re
 | AI review | None yet: the pull request opens after the orchestrator's own checks (secrets, risk) | Reviewer agent and fix loop before every pull request; fast-track limits re-checked on the real diff (increment 2) |
 | Diff check | None yet | You approve each sub-task's change in the app before its pull request opens (increment 4) |
 | Work across repositories | Analysed and classified, not built | One sub-task and pull request per repository, in dependency order (increments 3 and 4) |
+| Conversation hierarchy | Ticket → run | Ticket → run → sub-task: a conversation for each sub-task under its run (increment 2) |
 | Changing the track | Not yet: the rules decide | The requester can switch any time before the pull request (increment 5) |
 | Product commands and images | In the catalog, not used yet: agents choose how to build and test; one sandbox image | Run from the catalog; image per product (increment 2) |
 | Pull requests | One branch and pull request per run, one commit per sub-task | One branch/pull request per sub-task (increment 2) |
@@ -185,9 +186,9 @@ The web app can run with hot reload against a running stack: `npm run dev -w @or
 
 | Check | Result |
 |---|---|
-| Unit tests: secret scanning, risk rules and product risk paths, path globs, egress allowlist, workspace tokens, hashing, component sanitizing, product catalog validation, track rules, analysis checks against the catalog | Pass (25) |
+| Unit tests: secret scanning, risk rules and product risk paths, path globs, egress allowlist, workspace tokens, hashing, component sanitizing, grouping of runs by ticket, product catalog validation, track rules, analysis checks against the catalog | Pass (27) |
 | Workflow tests on Temporal: fast track without approval, analyst questions, guided track with plan approval, plan rejected, high-risk rejected, cancel, analysis failure, work across repositories stops, building in another repository than the ticket's | Pass (9) |
-| End-to-end in Docker with a fake GitHub (two repositories of two products) and a fake Anthropic API, agents run by the real Copilot runtime in sandboxes: catalog loaded and enforced; chat with generative UI; fast track from label to merged pull request with no approval, including the analyst's questions; analysis card, track label and analysis comment on the ticket; one conversation per run and the link card in the chat; a second repository opened on demand and the rules choosing the guided track over the analyst's proposal; an analysis naming an unknown product sent back and corrected; guided track with plan approval (stale hash refused); product guidance (`AGENTS.md`) reaching the agent as content and not loaded by the runtime itself | Pass (41 checks) |
-| Browser check of the web app against that stack: pages load under the content security policy with no console errors; agent text with an image and raw HTML makes no request to another host | Pass |
+| End-to-end in Docker with a fake GitHub (two repositories of two products) and a fake Anthropic API, agents run by the real Copilot runtime in sandboxes: catalog loaded and enforced; chat with generative UI; fast track from label to merged pull request with no approval, including the analyst's questions; analysis card, track label and analysis comment on the ticket; one conversation per run and the link card in the chat; a second repository opened on demand and the rules choosing the guided track over the analyst's proposal; an analysis naming an unknown product sent back and corrected; guided track with plan approval (stale hash refused); a ticket run again, with both runs grouped under it, each in its own conversation; product guidance (`AGENTS.md`) reaching the agent as content and not loaded by the runtime itself | Pass (47 checks) |
+| Browser check of the web app against that stack: pages load under the content security policy with no console errors; agent text with an image and raw HTML makes no request to another host; the side panel groups conversations by ticket, opens the ticket that holds the open conversation, and choosing a ticket opens its newest run; the Runs page shows the same grouping | Pass |
 
 Not verified in the build environment: calls to the real GitHub API and the real Anthropic API (no credentials there; the fakes follow their documented formats), and therefore the quality of a real analysis: how well the analyst places work in products and proposes a track on your repositories. The first real run is the remaining check.

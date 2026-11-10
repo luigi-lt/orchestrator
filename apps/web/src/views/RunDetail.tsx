@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import type { ApprovalDto, ProgressDto, RunDto, RunEventDto, StepDto } from "@orch/contracts";
+import type { ApprovalDto, ProgressDto, RunDto, RunEventDto, StepDto, TicketDto } from "@orch/contracts";
 import { api, post, subscribe } from "../api";
 import { useApp } from "../App";
 
@@ -9,6 +9,8 @@ interface RunDetailData {
   steps: StepDto[];
   events: RunEventDto[];
   pending: ApprovalDto[];
+  /** The ticket this run belongs to, with all its runs. */
+  ticket: TicketDto | null;
 }
 
 const FINAL = new Set(["completed", "closed", "cancelled", "failed"]);
@@ -52,7 +54,9 @@ export function RunDetail() {
 
   if (error) return <div className="page error-banner">{error}</div>;
   if (!data) return <div className="page muted">Loading…</div>;
-  const { run, events, pending } = data;
+  const { run, events, pending, ticket } = data;
+  const ordinal = ticket?.runs.find((r) => r.runId === run.id)?.ordinal;
+  const otherRuns = ticket?.runs.filter((r) => r.runId !== run.id) ?? [];
 
   const cancel = async () => {
     if (!confirm("Cancel this run?")) return;
@@ -72,7 +76,10 @@ export function RunDetail() {
           <div className="meta">
             <span className={`badge ${run.state}`}>{run.state.replace(/_/g, " ")}</span>
             {run.track && <span className={`badge track ${run.track}`}>{run.track} track</span>}
-            <span>Run {run.id}</span>
+            <span>
+              {ordinal && ticket ? `Run ${ordinal} of ${ticket.runs.length} for this ticket · ` : "Run "}
+              {run.id}
+            </span>
             <span>Requested by @{run.requester}</span>
             {run.branch && <code>{run.branch}</code>}
             <a href={run.url} target="_blank" rel="noreferrer">
@@ -91,6 +98,16 @@ export function RunDetail() {
           </button>
         )}
       </div>
+      {otherRuns.length > 0 && (
+        <div className="other-runs small">
+          <span className="muted">Other runs of this ticket:</span>
+          {otherRuns.map((r) => (
+            <Link key={r.runId} to={`/ops/runs/${r.runId}`}>
+              Run {r.ordinal} <span className={`badge ${r.state}`}>{r.state.replace(/_/g, " ")}</span>
+            </Link>
+          ))}
+        </div>
+      )}
       {run.error && <div className="error-banner">{run.error}</div>}
       {pending.length > 0 && (
         <div className="callout">

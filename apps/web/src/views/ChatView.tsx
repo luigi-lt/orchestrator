@@ -1,23 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import type { ConversationDto, MessageDto } from "@orch/contracts";
+import type { ConversationDto, MessageDto, TicketDto } from "@orch/contracts";
 import { api, post, put, subscribe } from "../api";
 import { useApp } from "../App";
 import { MessageView } from "../components/MessageView";
+import { TicketTree } from "../components/TicketTree";
 
 export function ChatView() {
   const { conversationId } = useParams();
   const navigate = useNavigate();
   const { me, setToggleTarget } = useApp();
   const [conversations, setConversations] = useState<ConversationDto[]>([]);
+  const [tickets, setTickets] = useState<TicketDto[]>([]);
 
-  const loadConversations = useCallback(async () => setConversations(await api<ConversationDto[]>("/api/conversations")), []);
+  // The side panel shows conversations grouped by ticket, and the general chats.
+  const loadConversations = useCallback(async () => {
+    const [list, grouped] = await Promise.all([api<ConversationDto[]>("/api/conversations"), api<TicketDto[]>("/api/tickets")]);
+    setConversations(list);
+    setTickets(grouped);
+  }, []);
 
   useEffect(() => {
     void loadConversations();
     let timer: ReturnType<typeof setTimeout> | undefined;
     return subscribe((n) => {
-      if (n.t === "msg" || n.t === "pending") {
+      if (n.t === "msg" || n.t === "pending" || n.t === "run") {
         clearTimeout(timer);
         timer = setTimeout(() => void loadConversations(), 400);
       }
@@ -53,20 +60,12 @@ export function ChatView() {
         <button className="primary block" onClick={() => void newConversation()}>
           + New conversation
         </button>
-        <nav className="conversation-list">
-          {conversations.map((c) => (
-            <button key={c.id} className={`conversation-item ${c.id === conversationId ? "active" : ""}`} onClick={() => navigate(`/chat/${c.id}`)}>
-              {c.kind === "run" && (
-                <span className="conversation-kind" title="The conversation of one run">
-                  run
-                </span>
-              )}
-              <span className="title">{c.title}</span>
-              {c.pending > 0 && <span className="dot" title={`${c.pending} waiting for you`} />}
-            </button>
-          ))}
-          {conversations.length === 0 && <p className="muted small pad">No conversations yet.</p>}
-        </nav>
+        <TicketTree
+          tickets={tickets}
+          chats={conversations.filter((c) => c.kind === "general")}
+          currentId={conversationId}
+          onOpen={(id) => navigate(`/chat/${id}`)}
+        />
       </aside>
       {conversationId ? (
         <Conversation key={conversationId} id={conversationId} kind={current?.kind ?? "general"} />

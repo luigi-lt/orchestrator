@@ -455,6 +455,8 @@ export interface ConversationDto {
 
 export interface RunDto {
   id: string;
+  /** Identity of the ticket the run belongs to; every run of the same ticket shares it. */
+  ticketKey: string;
   repo: string;
   issueNumber: number;
   title: string;
@@ -476,6 +478,82 @@ export interface RunDto {
   error: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/** One run of a ticket, as listed under it. Each run has its own conversation (AD-38). */
+export interface TicketRunDto {
+  runId: string;
+  conversationId: string | null;
+  /** 1 for the first run of the ticket, 2 for the next, and so on. */
+  ordinal: number;
+  state: RunState;
+  track: Track | null;
+  /** Decisions waiting for the requester in this run. */
+  pending: number;
+  prNumber: number | null;
+  prUrl: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A ticket and everything under it: the top of the conversation hierarchy (ticket, run, later sub-task). */
+export interface TicketDto {
+  key: string;
+  repo: string;
+  issueNumber: number;
+  title: string;
+  url: string;
+  requester: string;
+  /** State and track of the newest run. */
+  state: RunState;
+  track: Track | null;
+  /** True while the newest run has not reached a final state. */
+  active: boolean;
+  /** Decisions waiting anywhere under the ticket. */
+  pending: number;
+  updatedAt: string;
+  /** Newest first. */
+  runs: TicketRunDto[];
+}
+
+/** Groups runs by ticket: tickets by latest activity, runs newest first, numbered in the order they started. */
+export function groupTickets(runs: readonly RunDto[], pendingByRun: Readonly<Record<string, number>> = {}): TicketDto[] {
+  const byTicket = new Map<string, RunDto[]>();
+  for (const run of runs) byTicket.set(run.ticketKey, [...(byTicket.get(run.ticketKey) ?? []), run]);
+  const tickets: TicketDto[] = [];
+  for (const [key, group] of byTicket) {
+    const oldestFirst = [...group].sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+    const ticketRuns: TicketRunDto[] = oldestFirst
+      .map((r, i) => ({
+        runId: r.id,
+        conversationId: r.conversationId,
+        ordinal: i + 1,
+        state: r.state,
+        track: r.track,
+        pending: pendingByRun[r.id] ?? 0,
+        prNumber: r.prNumber,
+        prUrl: r.prUrl,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+      }))
+      .reverse();
+    const newest = oldestFirst[oldestFirst.length - 1]!;
+    tickets.push({
+      key,
+      repo: newest.repo,
+      issueNumber: newest.issueNumber,
+      title: newest.title,
+      url: newest.url,
+      requester: newest.requester,
+      state: newest.state,
+      track: newest.track,
+      active: !FINAL_RUN_STATES.includes(newest.state),
+      pending: ticketRuns.reduce((sum, r) => sum + r.pending, 0),
+      updatedAt: group.map((r) => r.updatedAt).sort().pop()!,
+      runs: ticketRuns,
+    });
+  }
+  return tickets.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
 }
 
 export interface StepDto {

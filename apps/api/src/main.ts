@@ -26,6 +26,7 @@ import {
   listRunEvents,
   listRuns,
   listSteps,
+  listTickets,
   listen,
   resolveApproval,
   setPreference,
@@ -211,6 +212,8 @@ async function main(): Promise<void> {
 
   // --- Runs (operator view) --------------------------------------------------------
   app.get("/api/runs", async () => listRuns(db, 200));
+  // Tickets with their runs: the hierarchy both views show (ticket, run, later sub-task).
+  app.get("/api/tickets", async () => listTickets(db));
   app.post("/api/runs", async (req) => {
     const body = z.object({ repo: z.string(), issueNumber: z.number().int().positive(), conversationId: z.string().optional() }).parse(req.body);
     return startRunForIssue(services, body.repo, body.issueNumber, body.conversationId ?? null);
@@ -218,8 +221,13 @@ async function main(): Promise<void> {
   app.get<{ Params: { id: string } }>("/api/runs/:id", async (req, reply) => {
     const run = await getRun(db, req.params.id);
     if (!run) return notFound(reply, "Run");
-    const [steps, events, pending] = await Promise.all([listSteps(db, run.id), listRunEvents(db, run.id), listPendingApprovals(db)]);
-    return { run, steps, events, pending: pending.filter((p) => p.runId === run.id) };
+    const [steps, events, pending, tickets] = await Promise.all([
+      listSteps(db, run.id),
+      listRunEvents(db, run.id),
+      listPendingApprovals(db),
+      listTickets(db, 1, run.ticketKey),
+    ]);
+    return { run, steps, events, pending: pending.filter((p) => p.runId === run.id), ticket: tickets[0] ?? null };
   });
   app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (req) => {
     const { reason } = z.object({ reason: z.string().max(500).optional() }).parse(req.body ?? {});
