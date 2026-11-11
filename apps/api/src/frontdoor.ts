@@ -10,10 +10,12 @@ import {
   findLatestCardByPrefix,
   getConversation,
   getRun,
+  getSubtask,
   insertMessage,
   listMessages,
   listRuns,
   listSteps,
+  listSubtasks,
   renameConversation,
 } from "@orch/store";
 import { z } from "zod";
@@ -66,7 +68,8 @@ export class FrontDoor {
       products = [`  (the product catalog cannot be read: ${errorMessage(err)})`];
     }
     const conversation = await getConversation(this.s.db, conversationId);
-    const run = conversation?.kind === "run" && conversation.focusedRunId ? await getRun(this.s.db, conversation.focusedRunId) : null;
+    const run = conversation && conversation.kind !== "general" && conversation.focusedRunId ? await getRun(this.s.db, conversation.focusedRunId) : null;
+    const subtask = run && conversation?.subtaskKey ? await getSubtask(this.s.db, run.id, conversation.subtaskKey) : null;
     return [
       frontDoor.instructions.replace("{label}", config.triggerLabel()),
       "",
@@ -74,11 +77,15 @@ export class FrontDoor {
       `- The person you talk to is the owner, GitHub user @${this.s.owner.login}.`,
       "- Products and their repositories:",
       ...products,
-      ...(run
+      ...(run && subtask
         ? [
-            `- This is the conversation of run ${run.id} for ${run.repo}#${run.issueNumber} ("${run.title}"). Questions here are about this run unless the person says otherwise.`,
+            `- This is the conversation of sub-task ${subtask.index + 1} ("${subtask.title}", state: ${subtask.state}) of run ${run.id} for ${run.repo}#${run.issueNumber}. Questions here are about this sub-task unless the person says otherwise. What should change in it is decided on its cards, not by you.`,
           ]
-        : []),
+        : run
+          ? [
+              `- This is the conversation of run ${run.id} for ${run.repo}#${run.issueNumber} ("${run.title}"). Questions here are about this run unless the person says otherwise.`,
+            ]
+          : []),
       `- Today is ${new Date().toISOString().slice(0, 10)}.`,
     ].join("\n");
   }
@@ -141,6 +148,7 @@ export class FrontDoor {
           const run = await getRun(s.db, runId);
           if (!run) return { error: `No run ${runId}` };
           const steps = await listSteps(s.db, runId);
+          const subtasks = await listSubtasks(s.db, runId);
           return {
             runId,
             issue: `${run.repo}#${run.issueNumber}`,
@@ -153,6 +161,16 @@ export class FrontDoor {
             analysis: run.analysis ? { understanding: run.analysis.understanding, size: run.analysis.size, approach: run.analysis.approach } : null,
             plan: run.plan,
             pullRequest: run.prUrl,
+            subtasks: subtasks.map((st) => ({
+              number: st.index + 1,
+              title: st.title,
+              state: st.state,
+              pullRequest: st.prUrl,
+              fixRounds: st.fixRounds,
+              reviewRounds: st.review?.rounds ?? 0,
+              openFindings: st.review?.open.map((f) => `${f.severity}: ${f.title}`) ?? [],
+              checks: st.verification?.commands.map((c) => `${c.name}: ${c.exitCode === 0 ? "passed" : "failed"}`) ?? [],
+            })),
             steps: steps.map((st) => ({ title: st.title, state: st.state, summary: st.summary })),
           };
         },

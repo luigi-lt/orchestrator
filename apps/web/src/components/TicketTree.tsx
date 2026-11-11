@@ -7,8 +7,8 @@ const label = (state: string) => state.replace(/_/g, " ");
 export const runLabel = (run: TicketRunDto) => [`Run ${run.ordinal}`, run.track, label(run.state)].filter(Boolean).join(" · ");
 
 /**
- * The side panel of the user view: conversations grouped by ticket (ticket, then its runs, newest first),
- * and the general chats below. A ticket opens by itself while it is active, waits for a decision or
+ * The side panel of the user view: conversations grouped by ticket (ticket, its runs newest first, and
+ * under a guided run its sub-tasks), and the general chats below. A ticket opens by itself while it is active, waits for a decision or
  * holds the open conversation; the caret overrides that.
  */
 export function TicketTree({
@@ -28,7 +28,7 @@ export function TicketTree({
     <nav className="ticket-tree" aria-label="Conversations">
       <div className="tree-section">Tickets</div>
       {tickets.map((ticket) => {
-        const holdsCurrent = ticket.runs.some((r) => r.conversationId === currentId);
+        const holdsCurrent = ticket.runs.some((r) => r.conversationId === currentId || r.subtasks.some((st) => st.conversationId === currentId));
         const open = toggled[ticket.key] ?? (ticket.active || ticket.pending > 0 || holdsCurrent);
         const newest = ticket.runs[0];
         return (
@@ -63,15 +63,33 @@ export function TicketTree({
             </div>
             {open &&
               ticket.runs.map((run) => (
-                <button
-                  key={run.runId}
-                  className={`run-row ${run.conversationId === currentId ? "active" : ""}`}
-                  disabled={!run.conversationId}
-                  onClick={() => run.conversationId && onOpen(run.conversationId)}
-                >
-                  <span className="title">{runLabel(run)}</span>
-                  {run.pending > 0 && <span className="dot" title={`${run.pending} waiting for you`} />}
-                </button>
+                <div key={run.runId}>
+                  <button
+                    className={`run-row ${run.conversationId === currentId ? "active" : ""}`}
+                    disabled={!run.conversationId}
+                    onClick={() => run.conversationId && onOpen(run.conversationId)}
+                  >
+                    <span className="title">{runLabel(run)}</span>
+                    {run.pending > 0 && <span className="dot" title={`${run.pending} waiting for you`} />}
+                  </button>
+                  {run.subtasks.map((st) => (
+                    <button
+                      key={st.key}
+                      className={`run-row subtask-row ${st.conversationId === currentId ? "active" : ""}`}
+                      title={`${st.title} · ${label(st.state)}`}
+                      onClick={() => onOpen(st.conversationId)}
+                    >
+                      <span className="title">
+                        {st.index + 1}. {st.title}
+                      </span>
+                      {st.pending > 0 ? (
+                        <span className="dot" title={`${st.pending} waiting for you`} />
+                      ) : (
+                        <span className="muted small subtask-state">{label(st.state)}</span>
+                      )}
+                    </button>
+                  ))}
+                </div>
               ))}
           </div>
         );

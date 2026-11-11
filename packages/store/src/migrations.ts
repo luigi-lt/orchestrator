@@ -151,4 +151,46 @@ create table repository_requests (
 create index repository_requests_pending_idx on repository_requests (step_id) where state = 'pending';
 `,
   },
+  {
+    // Iteration 2, increment 2: sub-tasks with their own branch, pull request, review and conversation.
+    version: 3,
+    sql: `
+create table subtasks (
+  run_id text not null references runs(id) on delete cascade,
+  key text not null,
+  idx int not null,
+  title text not null,
+  description text not null default '',
+  acceptance_criteria jsonb not null default '[]',
+  state text not null,
+  product text,
+  repository text,
+  branch text,
+  base_commit text,
+  head_commit text,
+  pr_number int,
+  pr_url text,
+  conversation_id text,
+  review jsonb,
+  verification jsonb,
+  fix_rounds int not null default 0,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  primary key (run_id, key)
+);
+
+alter table steps add column subtask_key text, add column round int not null default 0;
+
+-- A decision is signalled to the workflow that asked for it (the run or one of its sub-tasks)
+-- and shown in the conversation that holds its card.
+alter table approvals add column workflow_id text, add column conversation_id text, add column subtask_key text;
+
+alter table conversations add column subtask_key text;
+
+-- Run events are written by the run workflow and by its sub-task workflows: the sequence number is
+-- assigned on insert, and a key per writer makes retries no-ops.
+alter table run_events add column event_key text;
+create unique index run_events_key_idx on run_events (run_id, event_key) where event_key is not null;
+`,
+  },
 ];

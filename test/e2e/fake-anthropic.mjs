@@ -1,5 +1,5 @@
-// Fake Anthropic Messages API for end-to-end tests. It plays the analyst, the planner, the implementer and the
-// front-door assistant deterministically, based on the tools offered in each request.
+// Fake Anthropic Messages API for end-to-end tests. It plays the analyst, the planner, the implementer, the reviewer
+// and the front-door assistant deterministically, based on the tools offered in each request.
 // Markers in the issue text choose the analyst's behavior: [ask] asks a question first, [web] opens the
 // second repository and finds two products, [guided] proposes the guided track after one rejected submission.
 import http from "node:http";
@@ -104,6 +104,99 @@ function analyse(prompt, used) {
   return submit(analysisBase);
 }
 
+function firstUserText(messages) {
+  for (const m of messages) {
+    if (m.role !== "user") continue;
+    const t = textOf(m.content);
+    if (t.trim()) return t;
+  }
+  return "";
+}
+
+/** Tool uses the model made after the last user message that carried text (a prompt, not a tool result). */
+function toolUsesSinceLastPrompt(messages) {
+  let from = 0;
+  messages.forEach((m, i) => {
+    if (m.role === "user" && textOf(m.content).trim()) from = i;
+  });
+  return assistantToolUses(messages.slice(from));
+}
+
+const SUBTRACT = "export function subtract(a, b) {\n  return a - b;\n}\n";
+const SUBTRACT_WRONG = "export function subtract(a, b) {\n  return a + b;\n}\n";
+const SUBTRACT_CHECKED =
+  "export function subtract(a, b) {\n  if (typeof a !== 'number' || typeof b !== 'number') throw new TypeError('numbers only');\n  return a - b;\n}\n";
+
+/**
+ * The implementer. Markers in the ticket or sub-task: [file:NAME] names the file to create (subtract.js by default),
+ * [broken] makes the first version fail the product's test command, [big] adds six more files.
+ * It also plays the follow-ups: repairing a failed command, and fixing review findings.
+ */
+function implement(tools, messages) {
+  const first = firstUserText(messages);
+  const last = lastUserText(messages);
+  const since = toolUsesSinceLastPrompt(messages);
+  if (since.some((u) => u.name === "submit_result")) return [{ type: "text", text: "Done." }];
+  const dir = /^- (\/workspace\/repos\/\S+) — .*writable\)$/m.exec(first)?.[1];
+  if (!dir) return [{ type: "text", text: "No writable repository in the prompt." }];
+  const file = /\[file:([\w.-]+)\]/.exec(first)?.[1] ?? "subtract.js";
+  const fixing = /## Findings to fix/.test(first);
+  const repairing = /command failed on your change/.test(last);
+  const big = /\[big\]/.test(first) && !fixing && !repairing;
+  const writes = since.length;
+
+  // The shell can replace a file that already exists (a repair or a fix round); the create tool cannot.
+  const write = (name, content) => {
+    const target = `${dir}/${name}`;
+    const shell = findShellTool(tools);
+    if (shell) {
+      const extra = shell.input_schema?.properties?.description ? { description: `Write ${name}` } : {};
+      const b64 = Buffer.from(content).toString("base64");
+      return [{ type: "tool_use", id: id("toolu"), name: shell.name, input: { command: `echo ${b64} | base64 -d > ${target} && cat ${target}`, ...extra } }];
+    }
+    const tool = findWriteTool(tools);
+    if (tool) return [{ type: "tool_use", id: id("toolu"), name: tool.tool.name, input: { [tool.pk]: target, [tool.ck]: content } }];
+    return [{ type: "text", text: `No usable tool among: ${tools.map((t) => t.name).join(", ")}` }];
+  };
+
+  if (big && writes < 6) return write(`extra${writes + 1}.js`, `export const extra${writes + 1} = ${writes + 1};\n`);
+  if (writes >= (big ? 7 : 1)) {
+    const summary = repairing ? `Repaired ${file} so the test command passes.` : fixing ? `Fixed the review findings in ${file}.` : `Added ${file}.`;
+    return [{ type: "tool_use", id: id("toolu"), name: "submit_result", input: { summary } }];
+  }
+  if (file === "subtract.js") {
+    return write(file, fixing ? SUBTRACT_CHECKED : /\[broken\]/.test(first) && !repairing ? SUBTRACT_WRONG : SUBTRACT);
+  }
+  return write(file, `// ${file}${fixing ? ` (fixed ${Date.now()})` : ""}\nexport const marker = "${file}";\n`);
+}
+
+/**
+ * The reviewer. Markers in the ticket: [finding] reports one major finding in the first round and confirms it
+ * as fixed afterwards; [stubborn] reports a blocking finding in every round.
+ */
+function review(prompt, used) {
+  if (used.some((u) => u.name === "submit_review")) return [{ type: "text", text: "Review submitted." }];
+  const earlierIds = [...prompt.matchAll(/^- \[(r\d+-\d+)\]/gm)].map((m) => m[1]);
+  const report = { verdict: "approve", summary: "The change does what the sub-task asks.", criteria: [{ criterion: "Works as described", met: true }], findings: [], earlier: [] };
+  if (/\[stubborn\]/.test(prompt)) {
+    report.verdict = "changes_needed";
+    report.summary = "The approach is not safe.";
+    report.findings = [{ severity: "blocking", title: "Unsafe approach", file: "stub.js", line: 1, explanation: "This must be redesigned.", suggestion: "Rethink it." }];
+    report.earlier = earlierIds.map((eid) => ({ id: eid, resolved: false }));
+  } else if (/\[finding\]/.test(prompt) && earlierIds.length === 0) {
+    report.verdict = "changes_needed";
+    report.summary = "Works for numbers, but accepts anything.";
+    report.findings = [
+      { severity: "major", title: "No input check", file: "subtract.js", line: 1, explanation: "Strings are subtracted silently.", suggestion: "Throw a TypeError for non-numbers." },
+      { severity: "minor", title: "No doc comment", explanation: "A one-line comment would help." },
+    ];
+  } else {
+    report.summary = earlierIds.length ? "The earlier findings are fixed." : report.summary;
+    report.earlier = earlierIds.map((eid) => ({ id: eid, resolved: true, note: "Checked in the code." }));
+  }
+  return [{ type: "tool_use", id: id("toolu"), name: "submit_review", input: report }];
+}
+
 /** Decides the next assistant content blocks for a request. */
 function decide(body) {
   const tools = body.tools ?? [];
@@ -118,46 +211,27 @@ function decide(body) {
 
   if (names.includes("submit_analysis")) return analyse(prompt, used);
 
-  // Planner
+  if (names.includes("submit_review")) return review(firstUserText(messages), used);
+
+  // Planner (guided track, until the architect agent exists): two sub-tasks, each naming the file it creates.
   if (names.includes("submit_assessment")) {
     if (used.some((u) => u.name === "submit_assessment")) return [{ type: "text", text: "Assessment submitted." }];
     const input = {
-          ready: true,
-          questions: [],
-          plan: {
-            summary: "Add a subtract function next to add.",
-            subtasks: [
-              {
-                title: "Add subtract function",
-                description: "Create subtract.js exporting subtract(a, b).",
-                acceptanceCriteria: ["subtract(5, 3) returns 2"],
-              },
-            ],
-          },
+      ready: true,
+      questions: [],
+      plan: {
+        summary: "Add a multiply function, then document it.",
+        subtasks: [
+          { title: "Add multiply function", description: "Create multiply.js exporting multiply(a, b). [file:multiply.js]", acceptanceCriteria: ["multiply(2, 3) returns 6"] },
+          { title: "Document multiply", description: "Describe multiply in NOTES.md. [file:NOTES.md]", acceptanceCriteria: ["NOTES.md mentions multiply"] },
+        ],
+      },
     };
     return [{ type: "tool_use", id: id("toolu"), name: "submit_assessment", input }];
   }
 
   // Implementer
-  if (names.includes("submit_result")) {
-    if (used.some((u) => u.name === "submit_result")) return [{ type: "text", text: "Done." }];
-    if (used.length > 0) return [{ type: "tool_use", id: id("toolu"), name: "submit_result", input: { summary: "Added subtract.js with subtract(a, b)." } }];
-    const content = "export function subtract(a, b) {\n  return a - b;\n}\n";
-    // The prompt lists the checkouts; the writable one is where the change goes.
-    const dir = /^- (\/workspace\/repos\/\S+) — .*writable\)$/m.exec(prompt)?.[1];
-    if (!dir) return [{ type: "text", text: "No writable repository in the prompt." }];
-    const target = `${dir}/subtract.js`;
-    const write = findWriteTool(tools);
-    if (write) {
-      return [{ type: "tool_use", id: id("toolu"), name: write.tool.name, input: { [write.pk]: target, [write.ck]: content } }];
-    }
-    const shell = findShellTool(tools);
-    if (shell) {
-      const extra = shell.input_schema?.properties?.description ? { description: "Create subtract.js" } : {};
-      return [{ type: "tool_use", id: id("toolu"), name: shell.name, input: { command: `printf '%s' '${content.replace(/\n/g, "\\n")}' | sed 's/\\\\n/\\n/g' > ${target} && cat ${target}`, ...extra } }];
-    }
-    return [{ type: "text", text: `No usable tool among: ${names.join(", ")}` }];
-  }
+  if (names.includes("submit_result")) return implement(tools, messages);
 
   // Front-door assistant
   if (names.includes("submit_work_item")) {

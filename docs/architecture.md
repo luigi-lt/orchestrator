@@ -1236,7 +1236,7 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 
 **Build order.** Each increment ends with something that can be shown, and the end-to-end test with the fake GitHub and the fake model grows with it.
 
-**Status:** increment 1 is built and verified (see the [MVP guide](mvp.md) §9), including the grouping of conversations by ticket; the sub-task level of the hierarchy arrives with increment 2. Until increments 2 to 4 replace them, two bridges keep the product usable end to end: the fast track opens its pull request without an AI review, and the guided track uses a planning agent with approval on a card instead of the design session. Work that spans several repositories is analysed and classified but not built.
+**Status:** increments 1 and 2 are built and verified (see the [MVP guide](mvp.md) §9): the catalog, analysis and tracks; the reviewer agent with its fix loop, the product's commands, one branch, pull request and conversation per sub-task, and the fast-track limits on the real change. Until increments 3 and 4 replace them, two bridges keep the product usable end to end: the guided track uses a planning agent with approval on a card instead of the design session, and a sub-task starts when the pull request of the one before it is merged, instead of building on its approved change. Work that spans several repositories is analysed and classified but not built. R-16 (how good the reviewer is on real changes) is not measured yet: it needs a real model.
 
 | # | Increment | Shows | Proofs done first |
 |---|---|---|---|

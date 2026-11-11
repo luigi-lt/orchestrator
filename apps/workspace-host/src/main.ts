@@ -19,17 +19,21 @@ import {
   type SessionEvent,
   type ToolResultObject,
 } from "@github/copilot-sdk";
-import { GUIDANCE_FILES, analyst, implementer, planner, type AgentProfile } from "@orch/agent-profiles";
+import { GUIDANCE_FILES, analyst, implementer, planner, reviewer, type AgentProfile } from "@orch/agent-profiles";
 import {
   Analysis,
   Assessment,
+  ReviewReport,
   StepBrief,
   repoSlug,
   workItemType,
   type BriefRepository,
+  type CommandResult,
   type ProgressEvent,
   type RepositoryRequestDto,
   type StepResult,
+  type TrackedFinding,
+  type Verification,
 } from "@orch/contracts";
 import { z } from "zod";
 
@@ -39,6 +43,10 @@ const ANTHROPIC_BASE_URL = process.env.ANTHROPIC_BASE_URL ?? "http://egress-prox
 const ROOT = "/workspace";
 const REPOS = join(ROOT, "repos");
 const MAX_GUIDANCE_CHARS = 12_000;
+const COMMAND_TIMEOUT_MS = 20 * 60 * 1000;
+const MAX_COMMAND_OUTPUT = 6000;
+/** How often the implementer is asked to repair a failing product command before the result is reported as it is. */
+const MAX_VERIFICATION_REPAIRS = 2;
 
 const auth = { Authorization: `Bearer ${TOKEN}` };
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -109,6 +117,47 @@ function onEvent(event: SessionEvent): void {
       break;
   }
 }
+
+// Product commands (FR-B1, FR-M4): from the catalog, never from the repository ------------------
+
+/** Runs one of the product's commands in the repository and keeps the end of its output. */
+function runCommand(name: CommandResult["name"], command: string, cwd: string): Promise<CommandResult> {
+  const started = Date.now();
+  return new Promise((resolve) => {
+    execFile("bash", ["-lc", command], { cwd, timeout: COMMAND_TIMEOUT_MS, maxBuffer: 32 * 1024 * 1024 }, (err, stdout, stderr) => {
+      const text = `${stdout}${stderr ? `\n${stderr}` : ""}`.trim();
+      const code = err ? (typeof (err as { code?: unknown }).code === "number" ? ((err as { code: number }).code as number) : 1) : 0;
+      const timedOut = !!err && (err as { killed?: boolean }).killed === true;
+      resolve({
+        name,
+        command,
+        exitCode: code,
+        durationMs: Date.now() - started,
+        output: `${text.length > MAX_COMMAND_OUTPUT ? `…${text.slice(-MAX_COMMAND_OUTPUT)}` : text}${timedOut ? "\n(stopped: the command ran too long)" : ""}`,
+      });
+    });
+  });
+}
+
+/** Build and test, in that order; stops at the first failure. No commands in the catalog means nothing to verify. */
+async function verify(brief: StepBrief, cwd: string): Promise<Verification> {
+  const commands: CommandResult[] = [];
+  for (const name of ["build", "test"] as const) {
+    const command = brief.commands[name];
+    if (!command) continue;
+    report("status", `Running the product's ${name} command: ${command}`);
+    const result = await runCommand(name, command, cwd);
+    commands.push(result);
+    report(result.exitCode === 0 ? "status" : "error", `${name} ${result.exitCode === 0 ? "passed" : `failed (exit ${result.exitCode})`}`);
+    if (result.exitCode !== 0) break;
+  }
+  return { commands, passed: commands.every((c) => c.exitCode === 0) };
+}
+
+const describeVerification = (v: Verification): string[] =>
+  v.commands.length
+    ? v.commands.map((c) => `- ${c.name} (\`${c.command}\`): ${c.exitCode === 0 ? "passed" : `FAILED with exit code ${c.exitCode}`}`)
+    : ["- The product has no build or test command configured."];
 
 // Repositories (AD-37): one checkout per repository, at most one writable ---------------
 
@@ -219,6 +268,20 @@ function analysisSection(brief: StepBrief): string[] {
   ];
 }
 
+function commandsSection(brief: StepBrief): string[] {
+  const entries = Object.entries(brief.commands).filter(([, command]) => !!command);
+  if (!entries.length) return [];
+  return [
+    "",
+    "## The product's commands",
+    ...entries.map(([name, command]) => `- ${name}: \`${command}\``),
+    "The orchestrator runs build and test on your result. Run them yourself before you finish.",
+  ];
+}
+
+const findingLine = (f: TrackedFinding): string =>
+  `- [${f.id}] ${f.severity}: ${f.title}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ""})` : ""}\n  ${f.explanation}${f.suggestion ? `\n  Suggested fix: ${f.suggestion}` : ""}`;
+
 function analysePrompt(brief: StepBrief): string {
   return [
     ...ticketSection(brief),
@@ -238,26 +301,67 @@ function planPrompt(brief: StepBrief): string {
   return parts.join("\n");
 }
 
-function implementPrompt(brief: StepBrief): string {
+function subtaskSection(brief: StepBrief): string[] {
   const plan = brief.plan!;
   const index = brief.subtaskIndex ?? 0;
   const sub = plan.subtasks[index]!;
   return [
-    ...ticketSection(brief),
     "",
-    "## Approved plan",
+    "## Plan",
     plan.summary,
     ...plan.subtasks.map((s, i) => `${i + 1}. ${s.title}${i < index ? " (done)" : i === index ? " (current)" : ""}`),
     "",
-    `## Your sub-task (${index + 1} of ${plan.subtasks.length}): ${sub.title}`,
+    `## The sub-task (${index + 1} of ${plan.subtasks.length}): ${sub.title}`,
     sub.description,
     "",
     "Acceptance criteria:",
     ...(sub.acceptanceCriteria.length ? sub.acceptanceCriteria.map((c) => `- ${c}`) : ["- (none given)"]),
+  ];
+}
+
+function implementPrompt(brief: StepBrief): string {
+  const fixing = brief.round > 0 || brief.findings.length > 0;
+  return [
+    ...ticketSection(brief),
+    ...subtaskSection(brief),
+    ...(fixing
+      ? [
+          "",
+          "## Findings to fix",
+          "A reviewer examined the change that is already on this branch and found these problems. Fix exactly these:",
+          ...brief.findings.map(findingLine),
+          ...(brief.guidance ? ["", "## Guidance from the requester", brief.guidance] : []),
+        ]
+      : []),
+    ...repositoriesSection(false),
+    ...commandsSection(brief),
+    ...guidanceSection(),
+    "",
+    fixing ? "Fix the findings now, then call submit_result." : "Implement this sub-task now, then call submit_result.",
+  ].join("\n");
+}
+
+function reviewPrompt(brief: StepBrief, change: { base: string; files: string }): string {
+  return [
+    ...ticketSection(brief),
+    ...subtaskSection(brief),
+    "",
+    "## The change to review",
+    `It is the difference between the base commit ${change.base.slice(0, 12)} and HEAD of this checkout: \`git diff ${change.base}..HEAD\`.`,
+    "Files changed:",
+    change.files.trim() || "(none)",
+    ...(brief.implementerSummary ? ["", "## What the implementer says it did (a claim, verify it)", brief.implementerSummary] : []),
+    "",
+    "## What the product's commands reported on this change",
+    ...(brief.verification ? describeVerification(brief.verification) : ["- Not run."]),
+    ...(brief.verification?.commands.filter((c) => c.exitCode !== 0).map((c) => `\nOutput of ${c.name}:\n${c.output}`) ?? []),
+    ...(brief.findings.length
+      ? ["", "## Earlier findings to check again", "For each id, say in `earlier` whether it is resolved now:", ...brief.findings.map(findingLine)]
+      : []),
     ...repositoriesSection(false),
     ...guidanceSection(),
     "",
-    "Implement this sub-task now, then call submit_result.",
+    "Review the change and call submit_review.",
   ].join("\n");
 }
 
@@ -266,8 +370,10 @@ function implementPrompt(brief: StepBrief): string {
 interface AgentOutcome {
   analysis?: Analysis;
   assessment?: Assessment;
+  review?: ReviewReport;
   summary?: string;
   lastMessage?: string;
+  verification?: Verification;
 }
 
 /** A failed tool call keeps the agent loop running, so the model can read the problem and retry. */
@@ -357,9 +463,44 @@ function implementerTools(outcome: AgentOutcome) {
   ];
 }
 
-async function runAgent(brief: StepBrief, profile: AgentProfile, cwd: string): Promise<AgentOutcome> {
+function reviewerTools(brief: StepBrief, outcome: AgentOutcome) {
+  return [
+    defineTool("submit_review", {
+      description: "Submit your review of the change: verdict, summary, each acceptance criterion, findings, and the state of earlier findings.",
+      parameters: ReviewReport,
+      skipPermission: true,
+      isTerminal: true,
+      handler: async (args: ReviewReport) => {
+        const parsed = ReviewReport.safeParse(args);
+        if (!parsed.success) return failure(`Invalid review: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+        const known = new Set(brief.findings.map((f) => f.id));
+        const unknown = parsed.data.earlier.filter((e) => !known.has(e.id)).map((e) => e.id);
+        if (unknown.length) return failure(`Unknown earlier finding id(s): ${unknown.join(", ")}. Use the ids you were given: ${[...known].join(", ") || "none"}.`);
+        const missing = [...known].filter((id) => !parsed.data.earlier.some((e) => e.id === id));
+        if (missing.length) return failure(`Say for each earlier finding whether it is resolved. Missing: ${missing.join(", ")}.`);
+        outcome.review = parsed.data;
+        return "Review recorded.";
+      },
+    }),
+  ];
+}
+
+interface AgentRun {
+  prompt: string;
+  /** Runs after the agent's turn, with the session still open; returns a follow-up prompt to continue, or null when done. */
+  afterTurn?: (outcome: AgentOutcome) => Promise<string | null>;
+}
+
+async function runAgent(brief: StepBrief, profile: AgentProfile, cwd: string, run: AgentRun): Promise<AgentOutcome> {
   const outcome: AgentOutcome = {};
-  const tools = brief.kind === "analyse" ? analystTools(brief, outcome) : brief.kind === "plan" ? plannerTools(outcome) : implementerTools(outcome);
+  const tools =
+    brief.kind === "analyse"
+      ? analystTools(brief, outcome)
+      : brief.kind === "plan"
+        ? plannerTools(outcome)
+        : brief.kind === "review"
+          ? reviewerTools(brief, outcome)
+          : implementerTools(outcome);
 
   const onPermissionRequest = (request: PermissionRequest): PermissionRequestResult => {
     const kind = request.kind as string;
@@ -391,12 +532,22 @@ async function runAgent(brief: StepBrief, profile: AgentProfile, cwd: string): P
       if (event.type === "assistant.message" && event.data.content?.trim()) outcome.lastMessage = event.data.content.trim();
     });
     const timeoutMs = brief.timeoutMinutes * 60 * 1000;
-    const prompt = brief.kind === "analyse" ? analysePrompt(brief) : brief.kind === "plan" ? planPrompt(brief) : implementPrompt(brief);
-    await session.sendAndWait({ prompt }, timeoutMs);
-    const missing = brief.kind === "analyse" ? (outcome.analysis ? null : "submit_analysis") : brief.kind === "plan" ? (outcome.assessment ? null : "submit_assessment") : null;
+    await session.sendAndWait({ prompt: run.prompt }, timeoutMs);
+    const missing =
+      brief.kind === "analyse"
+        ? outcome.analysis ? null : "submit_analysis"
+        : brief.kind === "plan"
+          ? outcome.assessment ? null : "submit_assessment"
+          : brief.kind === "review"
+            ? outcome.review ? null : "submit_review"
+            : null;
     if (missing) {
       report("status", `Asking the agent to call ${missing}`);
       await session.sendAndWait({ prompt: `Call ${missing} now with your result.`, source: "system" }, 10 * 60 * 1000);
+    }
+    // The implementer keeps its session while the product's commands run, so it can repair what they report.
+    for (let followUp = await run.afterTurn?.(outcome); followUp; followUp = await run.afterTurn?.(outcome)) {
+      await session.sendAndWait({ prompt: followUp }, timeoutMs);
     }
     await session.disconnect();
   } finally {
@@ -423,7 +574,7 @@ async function main(): Promise<StepResult> {
 
   if (brief.kind === "analyse") {
     // The analyst may open several repositories, so it starts above them.
-    const outcome = await runAgent(brief, analyst, REPOS);
+    const outcome = await runAgent(brief, analyst, REPOS, { prompt: analysePrompt(brief) });
     if (!outcome.analysis) return { status: "failed", summary: "The analyst did not submit an analysis", error: outcome.lastMessage?.slice(0, 500) };
     const a = outcome.analysis;
     const summary = a.ready
@@ -433,24 +584,61 @@ async function main(): Promise<StepResult> {
   }
 
   if (brief.kind === "plan") {
-    const outcome = await runAgent(brief, planner, primary.dir);
+    const outcome = await runAgent(brief, planner, primary.dir, { prompt: planPrompt(brief) });
     if (!outcome.assessment) return { status: "failed", summary: "The planner did not submit an assessment", error: outcome.lastMessage?.slice(0, 500) };
     const a = outcome.assessment;
     const summary = a.ready ? `Plan with ${a.plan?.subtasks.length ?? 0} sub-tasks` : `${a.questions.length} clarifying question(s)`;
     return { status: "succeeded", summary, assessment: a };
   }
 
+  if (brief.kind === "review") {
+    // The reviewer sees the change as a diff from the base commit of the default branch, in a checkout it cannot hand back.
+    const base = primary.entry.baseCommit ?? primary.entry.commit;
+    const files = await git(["diff", "--stat", `${base}..HEAD`], primary.dir).catch(() => "");
+    const outcome = await runAgent(brief, reviewer, primary.dir, { prompt: reviewPrompt(brief, { base, files }) });
+    if (!outcome.review) return { status: "failed", summary: "The reviewer did not submit a review", error: outcome.lastMessage?.slice(0, 500) };
+    const r = outcome.review;
+    const counts = (["blocking", "major", "minor"] as const).map((sev) => `${r.findings.filter((f) => f.severity === sev).length} ${sev}`).join(", ");
+    return { status: "succeeded", summary: `Review: ${r.findings.length ? counts : "no findings"}`, review: r };
+  }
+
   // Implementation: commit whatever the agent changed in the one writable repository and hand the commits back as a bundle.
   if (primary.entry.mode !== "writable") throw new Error("An implementation step needs a writable repository");
   const repo = primary.dir;
   const base = (await git(["rev-parse", "HEAD"], repo)).trim();
-  const outcome = await runAgent(brief, implementer, repo);
+  if (brief.commands.setup) {
+    report("status", `Running the product's setup command: ${brief.commands.setup}`);
+    const setup = await runCommand("setup", brief.commands.setup, repo);
+    if (setup.exitCode !== 0) report("error", `setup failed (exit ${setup.exitCode}): ${setup.output.slice(-800)}`);
+  }
+  let repairs = 0;
+  const outcome = await runAgent(brief, implementer, repo, {
+    prompt: implementPrompt(brief),
+    // After each turn the product's own commands judge the result; a failure goes back to the same session.
+    afterTurn: async (o) => {
+      o.verification = await verify(brief, repo);
+      if (o.verification.passed || repairs >= MAX_VERIFICATION_REPAIRS) return null;
+      repairs++;
+      const failed = o.verification.commands.find((c) => c.exitCode !== 0)!;
+      report("status", `Asking the agent to repair the failing ${failed.name} command (attempt ${repairs} of ${MAX_VERIFICATION_REPAIRS})`);
+      return [
+        `The product's ${failed.name} command failed on your change.`,
+        `Command: ${failed.command}`,
+        `Exit code: ${failed.exitCode}`,
+        "Output (end):",
+        failed.output,
+        "",
+        "Fix the cause in your change, then call submit_result again.",
+      ].join("\n");
+    },
+  });
   const sub = brief.plan!.subtasks[brief.subtaskIndex ?? 0]!;
   const summary = outcome.summary ?? outcome.lastMessage ?? "No summary provided";
   await git(["add", "-A"], repo);
   const dirty = (await git(["status", "--porcelain"], repo)).trim().length > 0;
   if (dirty) {
-    const message = `${sub.title}\n\n${summary}\n\nAgent-Run: ${brief.runId}\nRequested-By: ${brief.workItem.requester.login}`;
+    const subject = brief.round > 0 ? `Fix review findings (round ${brief.round}): ${sub.title}` : sub.title;
+    const message = `${subject.slice(0, 200)}\n\n${summary}\n\nAgent-Run: ${brief.runId}\nRequested-By: ${brief.workItem.requester.login}`;
     await git(["commit", "--quiet", "--no-verify", "-m", message], repo);
   }
   const commits = Number.parseInt((await git(["rev-list", "--count", `${base}..HEAD`], repo)).trim(), 10) || 0;
@@ -466,7 +654,7 @@ async function main(): Promise<StepResult> {
     } as RequestInit);
     if (!upload.ok) throw new Error(`Uploading the result bundle failed: ${upload.status}`);
   }
-  return { status: "succeeded", summary: commits ? summary : `No changes were needed. ${summary}`, commits };
+  return { status: "succeeded", summary: commits ? summary : `No changes were needed. ${summary}`, commits, verification: outcome.verification };
 }
 
 const heartbeat = setInterval(() => {

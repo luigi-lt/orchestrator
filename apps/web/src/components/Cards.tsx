@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import type { OrchestratorCard } from "@orch/contracts";
+import type { OrchestratorCard, TrackedFinding, Verification } from "@orch/contracts";
 import { post } from "../api";
 
 type CardOf<T extends OrchestratorCard["type"]> = Extract<OrchestratorCard, { type: T }>;
@@ -21,6 +21,16 @@ export function OrchestratorCardView({ card }: { card: OrchestratorCard }) {
       return <QuestionsCard card={card} />;
     case "risk":
       return <RiskCard card={card} />;
+    case "subtask":
+      return <SubtaskCard card={card} />;
+    case "review":
+      return <ReviewCard card={card} />;
+    case "findings":
+      return <FindingsCard card={card} />;
+    case "limits":
+      return <LimitsCard card={card} />;
+    case "story":
+      return <StoryCard card={card} />;
     case "pull_request":
       return <PullRequestCard card={card} />;
     case "notice":
@@ -299,6 +309,255 @@ function RiskCard({ card }: { card: CardOf<"risk"> }) {
         </div>
       )}
       {error && <p className="error small">{error}</p>}
+    </div>
+  );
+}
+
+function SubtaskCard({ card }: { card: CardOf<"subtask"> }) {
+  return (
+    <div className="card">
+      <div className="card-head">
+        <span className="kicker">
+          Sub-task {card.index + 1} of {card.total} · {card.repository}
+        </span>
+        <Link className="small" to={`/ops/runs/${card.runId}`}>
+          Run details
+        </Link>
+      </div>
+      <div className="card-title">{card.title}</div>
+      <p>{card.description}</p>
+      <ListBlock title="Acceptance criteria" items={card.acceptanceCriteria} />
+      <p className="muted small">
+        Branch <code>{card.branch}</code>
+      </p>
+    </div>
+  );
+}
+
+export function FindingList({ findings }: { findings: TrackedFinding[] }) {
+  return (
+    <ul className="findings">
+      {findings.map((f) => (
+        <li key={f.id}>
+          <span className={`badge severity ${f.severity}`}>{f.severity}</span> <strong>{f.title}</strong>
+          {f.file && (
+            <code>
+              {f.file}
+              {f.line ? `:${f.line}` : ""}
+            </code>
+          )}
+          <div>{f.explanation}</div>
+          {f.suggestion && <div className="muted small">Suggested fix: {f.suggestion}</div>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+export function Checks({ verification }: { verification: Verification | null }) {
+  if (!verification) return null;
+  if (!verification.commands.length) return <p className="muted small">The product has no build or test command configured.</p>;
+  return (
+    <ul className="checks">
+      {verification.commands.map((c) => (
+        <li key={c.name}>
+          <span className={`badge ${c.exitCode === 0 ? "succeeded" : "failed"}`}>{c.exitCode === 0 ? "passed" : "failed"}</span> {c.name} <code>{c.command}</code>{" "}
+          <span className="muted small">{Math.max(1, Math.round(c.durationMs / 1000))}s</span>
+          {c.exitCode !== 0 && c.output && <pre className="command-output">{c.output}</pre>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+const REVIEW_STATUS = {
+  clean: "No blocking or major finding is open.",
+  fixing: "The implementer is fixing the blocking and major findings; the change is reviewed again afterwards.",
+  needs_decision: "Findings are still open after the fix rounds: your decision is needed below.",
+  accepted_with_findings: "You decided to go on with findings open.",
+} as const;
+
+/** Written by the reviewer agent and validated by the orchestrator; what happens next follows from the severities. */
+function ReviewCard({ card }: { card: CardOf<"review"> }) {
+  const { review } = card;
+  const blocking = review.open.filter((f) => f.severity !== "minor");
+  const minor = review.open.filter((f) => f.severity === "minor");
+  return (
+    <div className={`card review ${card.status === "needs_decision" ? "needs-action" : ""}`}>
+      <div className="card-head">
+        <span className="kicker">AI review · written by the reviewer agent · round {review.rounds}</span>
+        <span className={`badge ${card.status === "clean" ? "approved" : card.status === "fixing" ? "running" : "pending"}`}>
+          {card.status === "clean" ? "clean" : `${blocking.length} to fix`}
+        </span>
+      </div>
+      <p className="card-title plain">{review.summary}</p>
+      <p className="muted small">{REVIEW_STATUS[card.status]}</p>
+      {blocking.length > 0 && (
+        <>
+          <div className="section-label">Open findings</div>
+          <FindingList findings={blocking} />
+        </>
+      )}
+      {review.resolved.length > 0 && (
+        <>
+          <div className="section-label">Fixed during the review</div>
+          <ul>
+            {review.resolved.map((f) => (
+              <li key={f.id}>
+                <span className={`badge severity ${f.severity}`}>{f.severity}</span> {f.title}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      <div className="section-label">Checks run on the change</div>
+      <Checks verification={card.verification} />
+      {(minor.length > 0 || review.criteria.length > 0) && (
+        <details>
+          <summary className="muted small">Acceptance criteria and minor notes</summary>
+          {review.criteria.length > 0 && (
+            <ul className="criteria-check">
+              {review.criteria.map((c, i) => (
+                <li key={i}>
+                  {c.met ? "✓" : "✗"} {c.criterion}
+                  {c.note && <span className="muted small"> — {c.note}</span>}
+                </li>
+              ))}
+            </ul>
+          )}
+          {minor.length > 0 && <FindingList findings={minor} />}
+        </details>
+      )}
+    </div>
+  );
+}
+
+const FINDINGS_DECISION = { open: "pull request opened anyway", retry: "another fix round", take_over: "branch taken over", cancel: "cancelled" } as const;
+
+function FindingsCard({ card }: { card: CardOf<"findings"> }) {
+  const { busy, error, run } = useDecision();
+  const [mode, setMode] = useState<"view" | "retry">("view");
+  const [guidance, setGuidance] = useState("");
+  const pending = card.status === "pending";
+  const decide = (decision: "open" | "retry" | "take_over" | "cancel") =>
+    run(() => post(`/api/approvals/${card.approvalId}/findings`, { decision, guidance: decision === "retry" ? guidance : undefined, hash: card.hash }));
+  return (
+    <div className={`card ${pending ? "needs-action" : ""}`}>
+      <div className="card-head">
+        <span className="kicker">
+          Review findings still open after {card.fixRounds} fix round(s){pending ? " · your decision is needed" : ""}
+        </span>
+        <StatusBadge status={card.status === "pending" || card.status === "expired" ? card.status : FINDINGS_DECISION[card.status]} />
+      </div>
+      <FindingList findings={card.findings} />
+      {card.guidance && card.status === "retry" && <p className="muted small">Your guidance: {card.guidance}</p>}
+      {pending && mode === "view" && (
+        <div className="actions">
+          <button className="primary" disabled={busy} onClick={() => setMode("retry")}>
+            Guide and retry
+          </button>
+          <button disabled={busy} onClick={() => void decide("open")} title="The pull request opens with these findings listed in its description">
+            Open the pull request anyway
+          </button>
+          <button disabled={busy} onClick={() => void decide("take_over")} title="The branch is pushed without a pull request, for you to continue">
+            Take over the branch
+          </button>
+          <button className="danger ghost" disabled={busy} onClick={() => void decide("cancel")}>
+            Cancel
+          </button>
+        </div>
+      )}
+      {pending && mode === "retry" && (
+        <div className="actions column">
+          <textarea value={guidance} onChange={(e) => setGuidance(e.target.value)} rows={3} placeholder="What should the agent do differently to resolve these findings?" />
+          <div className="actions">
+            <button className="primary" disabled={busy || !guidance.trim()} onClick={() => void decide("retry")}>
+              Send guidance and retry
+            </button>
+            <button className="ghost" onClick={() => setMode("view")}>
+              Back
+            </button>
+          </div>
+        </div>
+      )}
+      {error && <p className="error small">{error}</p>}
+    </div>
+  );
+}
+
+const LIMITS_DECISION = { continue: "continued on the fast track", guided: "switched to the guided track", cancel: "cancelled" } as const;
+
+function LimitsCard({ card }: { card: CardOf<"limits"> }) {
+  const { busy, error, run } = useDecision();
+  const pending = card.status === "pending";
+  const decide = (decision: "continue" | "guided" | "cancel") => run(() => post(`/api/approvals/${card.approvalId}/limits`, { decision, hash: card.hash }));
+  return (
+    <div className={`card ${pending ? "needs-action" : ""}`}>
+      <div className="card-head">
+        <span className="kicker">Bigger than the fast track allows{pending ? " · your decision is needed" : ""}</span>
+        <StatusBadge status={card.status === "pending" || card.status === "expired" ? card.status : LIMITS_DECISION[card.status]} />
+      </div>
+      <p className="muted small">The analysis expected a small change. The change that was built is beyond the fast-track limits:</p>
+      <ul>
+        {card.reasons.map((r) => (
+          <li key={r}>{r}</li>
+        ))}
+      </ul>
+      <details>
+        <summary className="muted small">{card.files.length} file(s) changed</summary>
+        <ul>
+          {card.files.map((f) => (
+            <li key={f}>
+              <code>{f}</code>
+            </li>
+          ))}
+        </ul>
+      </details>
+      {pending && (
+        <div className="actions">
+          <button className="primary" disabled={busy} onClick={() => void decide("continue")} title="Open the pull request with this change">
+            Continue on the fast track
+          </button>
+          <button disabled={busy} onClick={() => void decide("guided")} title="Set this change aside and agree a plan first">
+            Switch to the guided track
+          </button>
+          <button className="danger ghost" disabled={busy} onClick={() => void decide("cancel")}>
+            Cancel
+          </button>
+        </div>
+      )}
+      {error && <p className="error small">{error}</p>}
+    </div>
+  );
+}
+
+/** The sub-tasks of a guided run; each has its own conversation. */
+function StoryCard({ card }: { card: CardOf<"story"> }) {
+  return (
+    <div className="card">
+      <div className="card-head">
+        <span className="kicker">Sub-tasks · each has its own conversation</span>
+        <Link className="small" to={`/ops/runs/${card.runId}`}>
+          Run details
+        </Link>
+      </div>
+      <ol className="story">
+        {card.subtasks.map((st) => (
+          <li key={st.key}>
+            <span className={`badge ${st.state}`}>{st.state.replace(/_/g, " ")}</span>{" "}
+            {st.conversationId ? <Link to={`/chat/${st.conversationId}`}>{st.title}</Link> : st.title}
+            {st.prUrl && (
+              <>
+                {" · "}
+                <a href={st.prUrl} target="_blank" rel="noreferrer">
+                  pull request #{st.prNumber}
+                </a>
+              </>
+            )}
+          </li>
+        ))}
+      </ol>
+      <p className="muted small">A sub-task starts once the pull request of the one before it is merged.</p>
     </div>
   );
 }

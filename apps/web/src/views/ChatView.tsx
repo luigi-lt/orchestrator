@@ -92,7 +92,7 @@ function EmptyState({ onStart }: { onStart: () => void }) {
   );
 }
 
-function Conversation({ id, kind }: { id: string; kind: "general" | "run" }) {
+function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] }) {
   const [messages, setMessages] = useState<MessageDto[]>([]);
   const [streaming, setStreaming] = useState("");
   const [typing, setTyping] = useState(false);
@@ -181,7 +181,7 @@ function Conversation({ id, kind }: { id: string; kind: "general" | "run" }) {
       >
         <textarea
           value={draft}
-          placeholder={kind === "run" ? "Ask about this run…" : "Ask about runs, or start work on an issue…"}
+          placeholder={kind === "run" ? "Ask about this run…" : kind === "subtask" ? "Ask about this sub-task…" : "Ask about runs, or start work on an issue…"}
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {

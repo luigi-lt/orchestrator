@@ -8,6 +8,8 @@ products:
       - id: acme/demo
         role: library
         contractPaths: ["index.d.ts"]
+        commands:
+          test: "node test.mjs"
   - id: shop
     name: Web shop
     description: Owns the shop's web pages, which call the calculator library. Does not own the arithmetic itself.

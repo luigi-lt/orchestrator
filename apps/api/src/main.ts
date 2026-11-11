@@ -8,7 +8,17 @@ import fastifyStatic from "@fastify/static";
 import Fastify, { type FastifyReply } from "fastify";
 import { z } from "zod";
 import { config, errorMessage, log } from "@orch/common";
-import { PlanDecision, QuestionAnswer, RiskDecision, catalogRepositories, type Catalog, type OrchestratorCard } from "@orch/contracts";
+import {
+  FindingsDecision,
+  LimitsDecision,
+  PlanDecision,
+  QuestionAnswer,
+  RiskDecision,
+  catalogRepositories,
+  type ApprovalKind,
+  type Catalog,
+  type OrchestratorCard,
+} from "@orch/contracts";
 import { GitHubClient } from "@orch/github";
 import {
   connectStore,
@@ -26,6 +36,7 @@ import {
   listRunEvents,
   listRuns,
   listSteps,
+  listSubtasks,
   listTickets,
   listen,
   resolveApproval,
@@ -164,14 +175,17 @@ async function main(): Promise<void> {
   app.get("/api/pending", async () => listPendingApprovals(db));
 
   // --- Decisions on orchestrator cards (never routed through the agent) ---------
-  const loadPendingApproval = async (id: string, kind: "plan" | "questions" | "risk") => {
+  // A decision goes to the workflow that asked for it (the run's, or one of its sub-tasks'),
+  // and its card lives in the conversation of that run or sub-task.
+  const loadPendingApproval = async (id: string, kind: ApprovalKind) => {
     const approval = await getApproval(db, id);
     if (!approval || approval.kind !== kind) throw new UserError("Unknown approval");
     if (approval.state !== "pending") throw new UserError("This decision was already made");
     const run = await getRun(db, approval.runId);
-    const workflowId = await getRunWorkflowId(db, approval.runId);
-    if (!run || !workflowId || !run.conversationId) throw new UserError("Run not found");
-    return { approval, run, workflowId, conversationId: run.conversationId };
+    const workflowId = approval.workflowId ?? (await getRunWorkflowId(db, approval.runId));
+    const conversationId = approval.conversationId ?? run?.conversationId;
+    if (!run || !workflowId || !conversationId) throw new UserError("Run not found");
+    return { approval, run, workflowId, conversationId };
   };
 
   const updateCard = async (conversationId: string, cardKey: string, patch: Partial<OrchestratorCard>) => {
@@ -201,6 +215,29 @@ async function main(): Promise<void> {
     return { ok: true };
   });
 
+  // Findings still blocking after the fix rounds: open anyway, guide and retry, take over the branch, or cancel (FR-R2).
+  app.post<{ Params: { id: string } }>("/api/approvals/:id/findings", async (req) => {
+    const body = FindingsDecision.parse(req.body);
+    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "findings");
+    if (body.hash !== approval.hash) throw new UserError("The findings changed since you looked at them; reload and decide again");
+    if (body.decision === "retry" && !body.guidance?.trim()) throw new UserError("Say what the agent should do differently");
+    await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision, feedback: body.guidance });
+    await resolveApproval(db, approval.id, { decision: body.decision, guidance: body.guidance ?? null, by: me.login });
+    await updateCard(conversationId, `run:${run.id}:findings:${approval.id}`, { status: body.decision, guidance: body.guidance } as Partial<OrchestratorCard>);
+    return { ok: true };
+  });
+
+  // A fast-track change beyond the fast-track limits: continue, switch to the guided track, or cancel (FR-A2).
+  app.post<{ Params: { id: string } }>("/api/approvals/:id/limits", async (req) => {
+    const body = LimitsDecision.parse(req.body);
+    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "limits");
+    if (body.hash !== approval.hash) throw new UserError("The change differs from the one you looked at; reload and decide again");
+    await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
+    await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
+    await updateCard(conversationId, `run:${run.id}:limits:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
+    return { ok: true };
+  });
+
   app.post<{ Params: { id: string } }>("/api/approvals/:id/answer", async (req) => {
     const body = QuestionAnswer.parse(req.body);
     const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "questions");
@@ -221,13 +258,14 @@ async function main(): Promise<void> {
   app.get<{ Params: { id: string } }>("/api/runs/:id", async (req, reply) => {
     const run = await getRun(db, req.params.id);
     if (!run) return notFound(reply, "Run");
-    const [steps, events, pending, tickets] = await Promise.all([
+    const [steps, events, pending, tickets, subtasks] = await Promise.all([
       listSteps(db, run.id),
       listRunEvents(db, run.id),
       listPendingApprovals(db),
       listTickets(db, 1, run.ticketKey),
+      listSubtasks(db, run.id),
     ]);
-    return { run, steps, events, pending: pending.filter((p) => p.runId === run.id), ticket: tickets[0] ?? null };
+    return { run, steps, events, pending: pending.filter((p) => p.runId === run.id), ticket: tickets[0] ?? null, subtasks };
   });
   app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (req) => {
     const { reason } = z.object({ reason: z.string().max(500).optional() }).parse(req.body ?? {});

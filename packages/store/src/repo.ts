@@ -2,6 +2,7 @@ import { newId } from "@orch/common";
 import type {
   Analysis,
   ApprovalDto,
+  ApprovalKind,
   BriefRepository,
   Catalog,
   Component,
@@ -22,8 +23,13 @@ import type {
   StepKind,
   StepResult,
   StepState,
+  SubtaskDto,
+  SubtaskReview,
+  SubtaskState,
   TicketDto,
+  TicketSubtaskDto,
   Track,
+  Verification,
 } from "@orch/contracts";
 import { groupTickets } from "@orch/contracts";
 import { type Db, type Queryable, notify, withTx } from "./db.js";
@@ -146,8 +152,32 @@ export async function listTickets(db: Queryable, limit = 200, onlyKey?: string):
            select workflow_id from (select workflow_id, max(updated_at) as latest from runs group by workflow_id order by latest desc limit $1) recent)`,
     onlyKey ? [limit, onlyKey] : [limit],
   );
-  const pending = await db.query<{ run_id: string; n: string }>("select run_id, count(*) as n from approvals where state = 'pending' group by run_id");
-  return groupTickets(rows.map(toRun), Object.fromEntries(pending.rows.map((p) => [p.run_id, Number(p.n)])));
+  const pending = await db.query<{ run_id: string; subtask_key: string | null; n: string }>(
+    "select run_id, subtask_key, count(*) as n from approvals where state = 'pending' group by run_id, subtask_key",
+  );
+  const pendingByRun: Record<string, number> = {};
+  const pendingBySubtask: Record<string, number> = {};
+  for (const p of pending.rows) {
+    pendingByRun[p.run_id] = (pendingByRun[p.run_id] ?? 0) + Number(p.n);
+    if (p.subtask_key) pendingBySubtask[`${p.run_id}:${p.subtask_key}`] = Number(p.n);
+  }
+  // Sub-tasks with their own conversation form the third level of the hierarchy (AD-43).
+  const subtasks = await db.query<{ run_id: string; key: string; idx: number; title: string; state: SubtaskState; conversation_id: string }>(
+    "select run_id, key, idx, title, state, conversation_id from subtasks where conversation_id is not null and run_id = any($1) order by idx",
+    [rows.map((r) => r.id)],
+  );
+  const subtasksByRun: Record<string, TicketSubtaskDto[]> = {};
+  for (const st of subtasks.rows) {
+    (subtasksByRun[st.run_id] ??= []).push({
+      key: st.key,
+      index: st.idx,
+      title: st.title,
+      state: st.state,
+      conversationId: st.conversation_id,
+      pending: pendingBySubtask[`${st.run_id}:${st.key}`] ?? 0,
+    });
+  }
+  return groupTickets(rows.map(toRun), pendingByRun, subtasksByRun);
 }
 
 export interface RunPatch {
@@ -235,19 +265,26 @@ export async function getCatalogForRun(db: Queryable, runId: string): Promise<Ca
 
 export interface NewRunEvent {
   runId: string;
-  seq: number;
+  /** Unique per run and writer (the run workflow or one of its sub-task workflows); a retry with the same key is a no-op. */
+  key: string;
   type: string;
   actor: string;
   payload: Record<string, unknown>;
   patch?: RunPatch;
 }
 
-/** Idempotent: primary key (run_id, seq) turns retries into no-ops. */
+/**
+ * Appends an event and applies its projection patch in one transaction. The run row is locked, so events
+ * of the run workflow and of its sub-task workflows get a gapless sequence in the order they are written.
+ */
 export async function appendRunEvent(db: Db, e: NewRunEvent): Promise<boolean> {
   return withTx(db, async (tx) => {
+    await tx.query("select 1 from runs where id = $1 for update", [e.runId]);
     const res = await tx.query(
-      `insert into run_events (run_id, seq, type, actor, payload) values ($1,$2,$3,$4,$5) on conflict do nothing`,
-      [e.runId, e.seq, e.type, e.actor, JSON.stringify(e.payload)],
+      `insert into run_events (run_id, seq, type, actor, payload, event_key)
+       select $1, coalesce(max(seq), 0) + 1, $2, $3, $4, $5 from run_events where run_id = $1
+       on conflict do nothing`,
+      [e.runId, e.type, e.actor, JSON.stringify(e.payload), e.key],
     );
     const inserted = (res.rowCount ?? 0) > 0;
     if (inserted && e.patch) await updateRun(tx, e.runId, e.patch);
@@ -308,11 +345,11 @@ export interface StepRecord extends StepDto {
 
 export async function upsertStep(
   db: Queryable,
-  s: { id: string; runId: string; kind: StepKind; title: string; subtaskIndex: number | null },
+  s: { id: string; runId: string; kind: StepKind; title: string; subtaskIndex: number | null; subtaskKey?: string | null; round?: number },
 ): Promise<void> {
   await db.query(
-    `insert into steps (id, run_id, kind, title, subtask_index, state) values ($1,$2,$3,$4,$5,'pending') on conflict (id) do nothing`,
-    [s.id, s.runId, s.kind, s.title, s.subtaskIndex],
+    `insert into steps (id, run_id, kind, title, subtask_index, subtask_key, round, state) values ($1,$2,$3,$4,$5,$6,$7,'pending') on conflict (id) do nothing`,
+    [s.id, s.runId, s.kind, s.title, s.subtaskIndex, s.subtaskKey ?? null, s.round ?? 0],
   );
   await notify(db, { t: "run", r: s.runId });
 }
@@ -383,6 +420,127 @@ export async function listProgress(db: Queryable, stepId: string, afterSeq = 0, 
 }
 
 // ---------------------------------------------------------------------------
+// Sub-tasks: one branch, one pull request, one review each (FR-B1)
+// ---------------------------------------------------------------------------
+
+interface SubtaskRow {
+  run_id: string;
+  key: string;
+  idx: number;
+  title: string;
+  description: string;
+  acceptance_criteria: string[];
+  state: SubtaskState;
+  product: string | null;
+  repository: string | null;
+  branch: string | null;
+  base_commit: string | null;
+  head_commit: string | null;
+  pr_number: number | null;
+  pr_url: string | null;
+  conversation_id: string | null;
+  review: SubtaskReview | null;
+  verification: Verification | null;
+  fix_rounds: number;
+  created_at: Date;
+  updated_at: Date;
+}
+
+const toSubtask = (r: SubtaskRow): SubtaskDto => ({
+  runId: r.run_id,
+  key: r.key,
+  index: r.idx,
+  title: r.title,
+  description: r.description,
+  acceptanceCriteria: r.acceptance_criteria,
+  state: r.state,
+  product: r.product,
+  repository: r.repository,
+  branch: r.branch,
+  baseCommit: r.base_commit,
+  headCommit: r.head_commit,
+  prNumber: r.pr_number,
+  prUrl: r.pr_url,
+  conversationId: r.conversation_id,
+  review: r.review,
+  verification: r.verification,
+  fixRounds: r.fix_rounds,
+  createdAt: iso(r.created_at)!,
+  updatedAt: iso(r.updated_at)!,
+});
+
+export interface NewSubtask {
+  runId: string;
+  key: string;
+  index: number;
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  state: SubtaskState;
+  product?: string | null;
+  repository?: string | null;
+  branch?: string | null;
+}
+
+export async function insertSubtask(db: Queryable, st: NewSubtask): Promise<void> {
+  await db.query(
+    `insert into subtasks (run_id, key, idx, title, description, acceptance_criteria, state, product, repository, branch)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) on conflict (run_id, key) do nothing`,
+    [st.runId, st.key, st.index, st.title, st.description, JSON.stringify(st.acceptanceCriteria), st.state, st.product ?? null, st.repository ?? null, st.branch ?? null],
+  );
+  await notify(db, { t: "run", r: st.runId });
+}
+
+export interface SubtaskPatch {
+  state?: SubtaskState;
+  branch?: string;
+  baseCommit?: string;
+  headCommit?: string;
+  prNumber?: number;
+  prUrl?: string;
+  conversationId?: string;
+  review?: SubtaskReview;
+  verification?: Verification;
+  fixRounds?: number;
+}
+
+const SUBTASK_PATCH_COLUMNS: Record<keyof SubtaskPatch, string> = {
+  state: "state",
+  branch: "branch",
+  baseCommit: "base_commit",
+  headCommit: "head_commit",
+  prNumber: "pr_number",
+  prUrl: "pr_url",
+  conversationId: "conversation_id",
+  review: "review",
+  verification: "verification",
+  fixRounds: "fix_rounds",
+};
+
+export async function updateSubtask(db: Queryable, runId: string, key: string, patch: SubtaskPatch): Promise<void> {
+  const sets: string[] = [];
+  const values: unknown[] = [runId, key];
+  for (const [field, column] of Object.entries(SUBTASK_PATCH_COLUMNS) as [keyof SubtaskPatch, string][]) {
+    if (patch[field] === undefined) continue;
+    values.push(field === "review" || field === "verification" ? JSON.stringify(patch[field]) : patch[field]);
+    sets.push(`${column} = $${values.length}`);
+  }
+  if (!sets.length) return;
+  await db.query(`update subtasks set ${sets.join(", ")}, updated_at = now() where run_id = $1 and key = $2`, values);
+  await notify(db, { t: "run", r: runId });
+}
+
+export async function getSubtask(db: Queryable, runId: string, key: string): Promise<SubtaskDto | null> {
+  const { rows } = await db.query<SubtaskRow>("select * from subtasks where run_id = $1 and key = $2", [runId, key]);
+  return rows[0] ? toSubtask(rows[0]) : null;
+}
+
+export async function listSubtasks(db: Queryable, runId: string): Promise<SubtaskDto[]> {
+  const { rows } = await db.query<SubtaskRow>("select * from subtasks where run_id = $1 order by idx, created_at", [runId]);
+  return rows.map(toSubtask);
+}
+
+// ---------------------------------------------------------------------------
 // Repositories requested by an agent during a step (AD-37)
 // ---------------------------------------------------------------------------
 
@@ -448,7 +606,7 @@ export async function resolveRepositoryRequest(
 // Approvals (plan approvals, clarifying questions, high-risk changes)
 // ---------------------------------------------------------------------------
 
-export type ApprovalKind = "plan" | "questions" | "risk";
+export type { ApprovalKind };
 
 export interface ApprovalRecord {
   id: string;
@@ -458,16 +616,31 @@ export interface ApprovalRecord {
   payload: Record<string, unknown>;
   hash: string;
   decision: Record<string, unknown> | null;
+  /** The workflow to signal with the decision: the run's, or a sub-task's. Null means the run's. */
+  workflowId: string | null;
+  /** The conversation that holds the decision card. Null means the run's. */
+  conversationId: string | null;
+  subtaskKey: string | null;
   createdAt: string;
 }
 
 export async function createApproval(
   db: Queryable,
-  a: { id: string; runId: string; kind: ApprovalKind; payload: Record<string, unknown>; hash: string },
+  a: {
+    id: string;
+    runId: string;
+    kind: ApprovalKind;
+    payload: Record<string, unknown>;
+    hash: string;
+    workflowId?: string | null;
+    conversationId?: string | null;
+    subtaskKey?: string | null;
+  },
 ): Promise<void> {
   await db.query(
-    `insert into approvals (id, run_id, kind, state, payload, hash) values ($1,$2,$3,'pending',$4,$5) on conflict (id) do nothing`,
-    [a.id, a.runId, a.kind, JSON.stringify(a.payload), a.hash],
+    `insert into approvals (id, run_id, kind, state, payload, hash, workflow_id, conversation_id, subtask_key)
+     values ($1,$2,$3,'pending',$4,$5,$6,$7,$8) on conflict (id) do nothing`,
+    [a.id, a.runId, a.kind, JSON.stringify(a.payload), a.hash, a.workflowId ?? null, a.conversationId ?? null, a.subtaskKey ?? null],
   );
   await notify(db, { t: "pending" });
 }
@@ -481,11 +654,26 @@ export async function getApproval(db: Queryable, id: string): Promise<ApprovalRe
     payload: Record<string, unknown>;
     hash: string;
     decision: Record<string, unknown> | null;
+    workflow_id: string | null;
+    conversation_id: string | null;
+    subtask_key: string | null;
     created_at: Date;
   }>("select * from approvals where id = $1", [id]);
   const r = rows[0];
   return r
-    ? { id: r.id, runId: r.run_id, kind: r.kind, state: r.state, payload: r.payload, hash: r.hash, decision: r.decision, createdAt: iso(r.created_at)! }
+    ? {
+        id: r.id,
+        runId: r.run_id,
+        kind: r.kind,
+        state: r.state,
+        payload: r.payload,
+        hash: r.hash,
+        decision: r.decision,
+        workflowId: r.workflow_id,
+        conversationId: r.conversation_id,
+        subtaskKey: r.subtask_key,
+        createdAt: iso(r.created_at)!,
+      }
     : null;
 }
 
@@ -499,17 +687,27 @@ export async function resolveApproval(db: Queryable, id: string, decision: Recor
   return (res.rowCount ?? 0) > 0;
 }
 
-export async function expireApprovalsForRun(db: Queryable, runId: string): Promise<void> {
-  const res = await db.query("update approvals set state = 'expired', resolved_at = now() where run_id = $1 and state = 'pending'", [runId]);
+/** Expires the pending decisions of a run, or only those of one of its sub-tasks. */
+export async function expireApprovalsForRun(db: Queryable, runId: string, subtaskKey?: string): Promise<void> {
+  const res = await db.query(
+    `update approvals set state = 'expired', resolved_at = now() where run_id = $1 and state = 'pending' ${subtaskKey ? "and subtask_key = $2" : ""}`,
+    subtaskKey ? [runId, subtaskKey] : [runId],
+  );
   if ((res.rowCount ?? 0) > 0) await notify(db, { t: "pending" });
 }
 
 export async function listPendingApprovals(db: Queryable): Promise<ApprovalDto[]> {
   const { rows } = await db.query<{ id: string; run_id: string; kind: ApprovalDto["kind"]; created_at: Date; conversation_id: string | null; title: string; issue_number: number }>(
-    `select a.id, a.run_id, a.kind, a.created_at, r.conversation_id, r.title, r.issue_number
+    `select a.id, a.run_id, a.kind, a.created_at, coalesce(a.conversation_id, r.conversation_id) as conversation_id, r.title, r.issue_number
      from approvals a join runs r on r.id = a.run_id where a.state = 'pending' order by a.created_at`,
   );
-  const label = { plan: "Approve plan", questions: "Answer questions", risk: "Approve high-risk change" } as const;
+  const label: Record<ApprovalKind, string> = {
+    plan: "Approve plan",
+    questions: "Answer questions",
+    risk: "Approve high-risk change",
+    findings: "Decide on review findings",
+    limits: "Decide on a change beyond the fast track",
+  };
   return rows.map((r) => ({
     id: r.id,
     runId: r.run_id,
@@ -525,10 +723,19 @@ export async function listPendingApprovals(db: Queryable): Promise<ApprovalDto[]
 // Conversations and messages
 // ---------------------------------------------------------------------------
 
-/** A general chat, or (with a run) the conversation of that run: every run has its own (AD-38). */
-export async function createConversation(db: Queryable, title: string, runId: string | null = null): Promise<string> {
+/**
+ * A general chat, the conversation of a run (every run has its own, AD-38), or the conversation of one
+ * sub-task of a run (AD-43).
+ */
+export async function createConversation(db: Queryable, title: string, runId: string | null = null, subtaskKey: string | null = null): Promise<string> {
   const id = newId("conv");
-  await db.query("insert into conversations (id, title, focused_run_id, kind) values ($1,$2,$3,$4)", [id, title, runId, runId ? "run" : "general"]);
+  await db.query("insert into conversations (id, title, focused_run_id, kind, subtask_key) values ($1,$2,$3,$4,$5)", [
+    id,
+    title,
+    runId,
+    !runId ? "general" : subtaskKey ? "subtask" : "run",
+    subtaskKey,
+  ]);
   return id;
 }
 
@@ -538,13 +745,30 @@ export async function getConversation(db: Queryable, id: string): Promise<Conver
 }
 
 export async function listConversations(db: Queryable, onlyId?: string): Promise<ConversationDto[]> {
-  const { rows } = await db.query<{ id: string; title: string; kind: "general" | "run"; focused_run_id: string | null; updated_at: Date; pending: string }>(
-    `select c.id, c.title, c.kind, c.focused_run_id, c.updated_at,
-       (select count(*) from approvals a join runs r on r.id = a.run_id where r.conversation_id = c.id and a.state = 'pending') as pending
+  const { rows } = await db.query<{
+    id: string;
+    title: string;
+    kind: ConversationDto["kind"];
+    focused_run_id: string | null;
+    subtask_key: string | null;
+    updated_at: Date;
+    pending: string;
+  }>(
+    `select c.id, c.title, c.kind, c.focused_run_id, c.subtask_key, c.updated_at,
+       (select count(*) from approvals a join runs r on r.id = a.run_id
+         where coalesce(a.conversation_id, r.conversation_id) = c.id and a.state = 'pending') as pending
      from conversations c ${onlyId ? "where c.id = $1" : ""} order by c.updated_at desc limit 200`,
     onlyId ? [onlyId] : [],
   );
-  return rows.map((r) => ({ id: r.id, title: r.title, kind: r.kind, focusedRunId: r.focused_run_id, updatedAt: iso(r.updated_at)!, pending: Number(r.pending) }));
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    kind: r.kind,
+    focusedRunId: r.focused_run_id,
+    subtaskKey: r.subtask_key,
+    updatedAt: iso(r.updated_at)!,
+    pending: Number(r.pending),
+  }));
 }
 
 export async function renameConversation(db: Queryable, conversationId: string, title: string): Promise<void> {

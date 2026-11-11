@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Assessment, groupTickets, parseRepoSlug, sanitizeAgentComponents, type RunDto } from "./index.js";
+import { Assessment, findingsToFix, groupTickets, mergeReview, parseRepoSlug, sanitizeAgentComponents, type ReviewReport, type RunDto } from "./index.js";
 
 describe("agent components", () => {
   it("drops system-only cards an agent tries to emit", () => {
@@ -84,5 +84,43 @@ describe("tickets group the runs of one issue", () => {
 
   it("returns nothing for no runs", () => {
     expect(groupTickets([])).toEqual([]);
+  });
+});
+
+describe("review rounds", () => {
+  const first: ReviewReport = {
+    verdict: "approve", // the verdict word is not trusted; severities decide
+    summary: "Works, with one gap",
+    criteria: [{ criterion: "subtract(5, 3) returns 2", met: true }],
+    findings: [
+      { severity: "major", title: "No input check", file: "subtract.js", line: 1, explanation: "Strings are accepted" },
+      { severity: "minor", title: "Missing comment", explanation: "Add a short doc comment" },
+    ],
+    earlier: [],
+  };
+
+  it("numbers findings per round and sends only blocking and major ones back to the implementer", () => {
+    const review = mergeReview(null, first);
+    expect(review.rounds).toBe(1);
+    expect(review.open.map((f) => [f.id, f.round, f.severity])).toEqual([
+      ["r1-1", 0, "major"],
+      ["r1-2", 0, "minor"],
+    ]);
+    expect(findingsToFix(review).map((f) => f.id)).toEqual(["r1-1"]);
+  });
+
+  it("moves findings the next review confirms as fixed to resolved, and takes the newest report as what is open", () => {
+    const second: ReviewReport = { ...first, summary: "Fixed", findings: [], earlier: [{ id: "r1-1", resolved: true }] };
+    const review = mergeReview(mergeReview(null, first), second);
+    expect(review).toMatchObject({ rounds: 2, summary: "Fixed", open: [] });
+    expect(review.resolved.map((f) => f.id)).toEqual(["r1-1"]);
+    expect(findingsToFix(review)).toEqual([]);
+  });
+
+  it("keeps a finding out of resolved when the reviewer says it is still there", () => {
+    const again: ReviewReport = { ...first, findings: [first.findings[0]!], earlier: [{ id: "r1-1", resolved: false }] };
+    const review = mergeReview(mergeReview(null, first), again);
+    expect(review.resolved).toEqual([]);
+    expect(review.open.map((f) => [f.id, f.round])).toEqual([["r2-1", 1]]);
   });
 });

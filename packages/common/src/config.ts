@@ -39,6 +39,12 @@ export const config = {
   triggerLabel: () => str("ORCH_TRIGGER_LABEL", "ai-ready"),
 
   model: () => str("ORCH_MODEL", "claude-opus-5-5"),
+  /** Model of the reviewer agent; another model than the implementer's gives a more independent review (AD-39). */
+  reviewerModel: () => str("ORCH_REVIEWER_MODEL", str("ORCH_MODEL", "claude-opus-5-5")),
+  /** How often an open pull request is polled. */
+  prPollSeconds: () => int("PR_POLL_SECONDS", 60),
+  /** Fix rounds after an AI review before the requester decides (FR-R2). */
+  maxFixRounds: () => int("MAX_FIX_ROUNDS", 2),
   pollIntervalSeconds: () => int("POLL_INTERVAL_SECONDS", 60),
   stepTimeoutMinutes: () => int("STEP_TIMEOUT_MINUTES", 60),
   /** Repositories one read-only step may hold, including those it asks for on demand (AD-37). */

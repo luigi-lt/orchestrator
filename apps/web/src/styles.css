@@ -246,3 +246,27 @@ table.tickets tr.run-of-ticket td { border-bottom-color: transparent; padding-to
 table.tickets tr.run-of-ticket td:first-child { padding-left: 28px; }
 table.tickets .badge.pending { margin-left: 8px; }
 .other-runs { display: flex; gap: 12px; align-items: center; margin-bottom: 10px; }
+
+/* Increment 2: sub-tasks, AI review, decisions */
+.badge.reviewing, .badge.implementing, .badge.pr_open { background: var(--accent-soft); color: var(--accent); }
+.badge.awaiting_decision, .badge.planned { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
+.badge.planned { background: var(--surface-2); color: var(--muted); }
+.badge.handed_over, .badge.closed { background: var(--surface-2); color: var(--muted); }
+.badge.severity.blocking { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
+.badge.severity.major { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); }
+.badge.severity.minor { background: var(--surface-2); color: var(--muted); }
+.findings, .checks, .criteria-check, .story { list-style: none; padding-left: 0 !important; }
+.findings li, .story li { padding: 6px 0; border-top: 1px solid var(--border); }
+.findings li:first-child, .story li:first-child { border-top: 0; }
+.findings code { margin-left: 6px; }
+.checks li { padding: 3px 0; }
+.command-output {
+  margin: 6px 0 0; padding: 8px; max-height: 180px; overflow: auto; font: 12px ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--surface-2); border-radius: 6px; white-space: pre-wrap; word-break: break-word;
+}
+.card.review details { margin-top: 8px; }
+.run-row.subtask-row { margin-left: 40px; width: calc(100% - 40px); font-size: 12.5px; }
+.subtask-state { flex: none; margin-right: 6px; }
+.subtask-detail { border-top: 1px solid var(--border); padding: 10px 0; }
+.subtask-detail:first-of-type { border-top: 0; }
+.subtask-detail .meta { margin: 4px 0; }

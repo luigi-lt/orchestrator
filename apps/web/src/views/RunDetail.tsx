@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import type { ApprovalDto, ProgressDto, RunDto, RunEventDto, StepDto, TicketDto } from "@orch/contracts";
+import type { ApprovalDto, ProgressDto, RunDto, RunEventDto, StepDto, SubtaskDto, TicketDto } from "@orch/contracts";
 import { api, post, subscribe } from "../api";
 import { useApp } from "../App";
+import { Checks, FindingList } from "../components/Cards";
 
 interface RunDetailData {
   run: RunDto;
@@ -11,6 +12,7 @@ interface RunDetailData {
   pending: ApprovalDto[];
   /** The ticket this run belongs to, with all its runs. */
   ticket: TicketDto | null;
+  subtasks: SubtaskDto[];
 }
 
 const FINAL = new Set(["completed", "closed", "cancelled", "failed"]);
@@ -54,7 +56,7 @@ export function RunDetail() {
 
   if (error) return <div className="page error-banner">{error}</div>;
   if (!data) return <div className="page muted">Loading…</div>;
-  const { run, events, pending, ticket } = data;
+  const { run, events, pending, ticket, subtasks } = data;
   const ordinal = ticket?.runs.find((r) => r.runId === run.id)?.ordinal;
   const otherRuns = ticket?.runs.filter((r) => r.runId !== run.id) ?? [];
 
@@ -156,6 +158,37 @@ export function RunDetail() {
           ) : (
             <p className="muted">No plan yet.</p>
           )}
+          <h2>{subtasks.length === 1 && !subtasks[0]!.conversationId ? "Change" : "Sub-tasks"}</h2>
+          {subtasks.length === 0 && <p className="muted">Nothing is being built yet.</p>}
+          {subtasks.map((st) => (
+            <div key={st.key} className="subtask-detail">
+              <div>
+                <span className={`badge ${st.state}`}>{st.state.replace(/_/g, " ")}</span> <strong>{st.title}</strong>
+              </div>
+              <div className="meta">
+                {st.repository && <span>{st.repository}</span>}
+                {st.branch && <code>{st.branch}</code>}
+                {st.prUrl && (
+                  <a href={st.prUrl} target="_blank" rel="noreferrer">
+                    Pull request #{st.prNumber}
+                  </a>
+                )}
+                {st.conversationId && <Link to={`/chat/${st.conversationId}`}>Conversation</Link>}
+              </div>
+              {st.review ? (
+                <>
+                  <p className="small">
+                    <strong>AI review</strong> ({st.review.rounds} round(s), {st.fixRounds} fix round(s)): {st.review.summary}
+                  </p>
+                  {st.review.open.length > 0 && <FindingList findings={st.review.open} />}
+                  {st.review.resolved.length > 0 && <p className="muted small">Fixed during the review: {st.review.resolved.map((f) => f.title).join("; ")}</p>}
+                </>
+              ) : (
+                <p className="muted small">Not reviewed yet.</p>
+              )}
+              <Checks verification={st.verification} />
+            </div>
+          ))}
           <h2>Steps</h2>
           <ul className="step-list">
             {steps.map((s) => (

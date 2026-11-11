@@ -187,6 +187,7 @@ export const RunState = z.enum([
   "awaiting_answers",
   "awaiting_approval",
   "executing",
+  "reviewing",
   "publishing",
   "awaiting_merge",
   "completed",
@@ -198,11 +199,121 @@ export type RunState = z.infer<typeof RunState>;
 
 export const FINAL_RUN_STATES: readonly RunState[] = ["completed", "closed", "cancelled", "failed"];
 
-export const StepKind = z.enum(["analyse", "plan", "implement"]);
+export const StepKind = z.enum(["analyse", "plan", "implement", "review"]);
 export type StepKind = z.infer<typeof StepKind>;
 
 export const StepState = z.enum(["pending", "running", "succeeded", "failed"]);
 export type StepState = z.infer<typeof StepState>;
+
+// ---------------------------------------------------------------------------
+// Verification and AI review of a change (FR-B1, FR-R1, FR-R2)
+// ---------------------------------------------------------------------------
+
+/** One of the product's commands (from the catalog), run by the workspace host on the change. */
+export const CommandResult = z.object({
+  name: z.enum(["setup", "build", "test"]),
+  command: z.string(),
+  exitCode: z.number().int(),
+  durationMs: z.number().int().nonnegative(),
+  /** The end of the combined output. */
+  output: z.string().max(8000),
+});
+export type CommandResult = z.infer<typeof CommandResult>;
+
+export const Verification = z.object({
+  commands: z.array(CommandResult).max(10),
+  /** True when every command exited with 0 (also when the product has no commands). */
+  passed: z.boolean(),
+});
+export type Verification = z.infer<typeof Verification>;
+
+export const ReviewSeverity = z.enum(["blocking", "major", "minor"]);
+export type ReviewSeverity = z.infer<typeof ReviewSeverity>;
+
+export const ReviewFinding = z.object({
+  severity: ReviewSeverity.describe("blocking: must not ship; major: should be fixed before the pull request; minor: a note that never blocks"),
+  title: z.string().min(3).max(200),
+  file: z.string().max(400).optional().describe("Path of the file, relative to the repository root"),
+  line: z.number().int().positive().optional(),
+  explanation: z.string().min(1).max(2000).describe("What is wrong and why it matters"),
+  suggestion: z.string().max(2000).optional().describe("How to fix it"),
+});
+export type ReviewFinding = z.infer<typeof ReviewFinding>;
+
+/** What the reviewer agent submits for one review round. */
+export const ReviewReport = z.object({
+  verdict: z.enum(["approve", "changes_needed"]).describe("approve only when there is no blocking or major finding"),
+  summary: z.string().min(1).max(3000).describe("What the change does and how good it is, in a few sentences"),
+  criteria: z
+    .array(z.object({ criterion: z.string(), met: z.boolean(), note: z.string().max(1000).optional() }))
+    .max(20)
+    .describe("Each acceptance criterion of the sub-task and whether the change meets it"),
+  findings: z.array(ReviewFinding).max(30).describe("Everything that is wrong with the change as it is now"),
+  earlier: z
+    .array(z.object({ id: z.string(), resolved: z.boolean(), note: z.string().max(1000).optional() }))
+    .max(40)
+    .default([])
+    .describe("For each earlier finding you were given: whether it is resolved now"),
+});
+export type ReviewReport = z.infer<typeof ReviewReport>;
+
+/** A finding as the orchestrator tracks it across review rounds. */
+export const TrackedFinding = ReviewFinding.extend({
+  id: z.string(),
+  /** The review round that raised it (0 is the first review). */
+  round: z.number().int().nonnegative(),
+});
+export type TrackedFinding = z.infer<typeof TrackedFinding>;
+
+/** The state of a sub-task's AI review after its latest round. */
+export const SubtaskReview = z.object({
+  /** Number of review rounds so far. */
+  rounds: z.number().int().positive(),
+  summary: z.string(),
+  criteria: ReviewReport.shape.criteria,
+  /** What is wrong with the change as it is now. */
+  open: z.array(TrackedFinding),
+  /** Findings of earlier rounds that a later review confirmed as fixed. */
+  resolved: z.array(TrackedFinding),
+});
+export type SubtaskReview = z.infer<typeof SubtaskReview>;
+
+/** Blocking and major findings go back to the implementer; minor ones never block (FR-R2). */
+export const findingsToFix = (review: SubtaskReview): TrackedFinding[] => review.open.filter((f) => f.severity !== "minor");
+
+/**
+ * Folds a review round into the sub-task's review. The newest report is the truth about what is open;
+ * earlier findings the reviewer confirms as fixed move to `resolved`. The verdict word is not trusted:
+ * what happens next follows from the severities (AD-39).
+ */
+export function mergeReview(previous: SubtaskReview | null, report: ReviewReport): SubtaskReview {
+  const round = previous?.rounds ?? 0;
+  const confirmed = new Set(report.earlier.filter((e) => e.resolved).map((e) => e.id));
+  return {
+    rounds: round + 1,
+    summary: report.summary,
+    criteria: report.criteria,
+    open: report.findings.map((f, i) => ({ ...f, id: `r${round + 1}-${i + 1}`, round })),
+    resolved: [...(previous?.resolved ?? []), ...(previous?.open ?? []).filter((f) => confirmed.has(f.id))],
+  };
+}
+
+export const SubtaskState = z.enum([
+  "planned",
+  "implementing",
+  "reviewing",
+  "awaiting_decision",
+  "publishing",
+  "pr_open",
+  "merged",
+  "closed",
+  "handed_over",
+  "cancelled",
+  "failed",
+]);
+export type SubtaskState = z.infer<typeof SubtaskState>;
+
+export const FINAL_SUBTASK_STATES: readonly SubtaskState[] = ["merged", "closed", "handed_over", "cancelled", "failed"];
 
 /** One repository checked out in a workspace (AD-37). At most one is writable. */
 export const BriefRepository = z.object({
@@ -242,6 +353,17 @@ export const StepBrief = z.object({
   feedback: z.string().optional(),
   plan: Plan.optional(),
   subtaskIndex: z.number().int().optional(),
+  /** 0 for the first implementation or review of a sub-task; fix and re-review rounds count up. */
+  round: z.number().int().nonnegative().default(0),
+  /** The product's commands for the repository being changed, from the catalog: trusted, run by the workspace host. */
+  commands: RepositoryCommands.default({}),
+  /** Implementation: the findings to fix. Review: the earlier findings to check again. */
+  findings: z.array(TrackedFinding).default([]),
+  /** The requester's guidance for a fix round. */
+  guidance: z.string().optional(),
+  /** Review: what the implementer said it did (a claim to verify) and what the product's commands reported. */
+  implementerSummary: z.string().optional(),
+  verification: Verification.optional(),
   commitAuthor: z.object({ name: z.string(), email: z.string() }),
   timeoutMinutes: z.number().int().positive(),
 });
@@ -252,6 +374,8 @@ export const StepResult = z.object({
   summary: z.string(),
   analysis: Analysis.optional(),
   assessment: Assessment.optional(),
+  review: ReviewReport.optional(),
+  verification: Verification.optional(),
   commits: z.number().int().nonnegative().optional(),
   error: z.string().optional(),
 });
@@ -349,6 +473,7 @@ export const RiskCard = z.object({
   runId: z.string(),
   approvalId: z.string(),
   hash: z.string(),
+  subtaskKey: z.string().optional(),
   reasons: z.array(z.string()),
   files: z.array(z.string()),
   status: z.enum(["pending", "approved", "rejected", "expired"]),
@@ -356,6 +481,7 @@ export const RiskCard = z.object({
 export const PullRequestCard = z.object({
   type: z.literal("pull_request"),
   runId: z.string(),
+  subtaskKey: z.string().optional(),
   number: z.number(),
   url: z.string(),
   title: z.string(),
@@ -386,6 +512,69 @@ export const RunLinkCard = z.object({
   number: z.number(),
   title: z.string(),
 });
+/** The header of a sub-task's own conversation (FR-C2). */
+export const SubtaskCard = z.object({
+  type: z.literal("subtask"),
+  runId: z.string(),
+  subtaskKey: z.string(),
+  index: z.number().int(),
+  total: z.number().int(),
+  title: z.string(),
+  description: z.string(),
+  acceptanceCriteria: z.array(z.string()),
+  repository: z.string(),
+  branch: z.string(),
+});
+/** The reviewer agent's report on a change, kept up to date across review rounds (FR-R1). */
+export const ReviewCard = z.object({
+  type: z.literal("review"),
+  runId: z.string(),
+  subtaskKey: z.string(),
+  review: SubtaskReview,
+  verification: Verification.nullable(),
+  /** What happens next: nothing to fix, a fix round is running, or the requester must decide. */
+  status: z.enum(["clean", "fixing", "needs_decision", "accepted_with_findings"]),
+});
+/** Findings still blocking after the fix rounds: the requester decides (FR-R2). */
+export const FindingsCard = z.object({
+  type: z.literal("findings"),
+  runId: z.string(),
+  subtaskKey: z.string(),
+  approvalId: z.string(),
+  hash: z.string(),
+  findings: z.array(TrackedFinding),
+  fixRounds: z.number().int(),
+  status: z.enum(["pending", "open", "retry", "take_over", "cancel", "expired"]),
+  guidance: z.string().optional(),
+});
+/** A fast-track change that turned out bigger than the fast track allows (FR-A2). */
+export const LimitsCard = z.object({
+  type: z.literal("limits"),
+  runId: z.string(),
+  subtaskKey: z.string(),
+  approvalId: z.string(),
+  hash: z.string(),
+  reasons: z.array(z.string()),
+  files: z.array(z.string()),
+  status: z.enum(["pending", "continue", "guided", "cancel", "expired"]),
+});
+/** The sub-tasks of a guided run, each with its state and its own conversation (first form of the story view, FR-R7). */
+export const StoryCard = z.object({
+  type: z.literal("story"),
+  runId: z.string(),
+  subtasks: z.array(
+    z.object({
+      key: z.string(),
+      index: z.number().int(),
+      title: z.string(),
+      state: SubtaskState,
+      repository: z.string().nullable(),
+      conversationId: z.string().nullable(),
+      prNumber: z.number().nullable(),
+      prUrl: z.string().nullable(),
+    }),
+  ),
+});
 export const NoticeCard = z.object({
   type: z.literal("notice"),
   runId: z.string().optional(),
@@ -400,12 +589,32 @@ export const OrchestratorCard = z.discriminatedUnion("type", [
   PlanCard,
   QuestionsCard,
   RiskCard,
+  SubtaskCard,
+  ReviewCard,
+  FindingsCard,
+  LimitsCard,
+  StoryCard,
   PullRequestCard,
   NoticeCard,
 ]);
 export type OrchestratorCard = z.infer<typeof OrchestratorCard>;
 
-export const SYSTEM_ONLY_TYPES = new Set<string>(["work_item", "run_link", "analysis", "progress", "plan", "questions", "risk", "pull_request", "notice"]);
+export const SYSTEM_ONLY_TYPES = new Set<string>([
+  "work_item",
+  "run_link",
+  "analysis",
+  "progress",
+  "plan",
+  "questions",
+  "risk",
+  "subtask",
+  "review",
+  "findings",
+  "limits",
+  "story",
+  "pull_request",
+  "notice",
+]);
 
 export type Component = AgentComponent | OrchestratorCard;
 
@@ -445,10 +654,11 @@ export interface MessageDto {
 export interface ConversationDto {
   id: string;
   title: string;
-  /** "run": the conversation of one run; "general": a chat with the front-door agent. */
-  kind: "general" | "run";
-  /** The run a run conversation belongs to. */
+  /** "run": the conversation of one run; "subtask": of one sub-task of a run; "general": a chat with the front-door agent. */
+  kind: "general" | "run" | "subtask";
+  /** The run a run or sub-task conversation belongs to. */
   focusedRunId: string | null;
+  subtaskKey: string | null;
   updatedAt: string;
   pending: number;
 }
@@ -480,6 +690,41 @@ export interface RunDto {
   updatedAt: string;
 }
 
+/** A sub-task of a run, with its results so far. */
+export interface SubtaskDto {
+  runId: string;
+  key: string;
+  index: number;
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  state: SubtaskState;
+  product: string | null;
+  repository: string | null;
+  branch: string | null;
+  baseCommit: string | null;
+  headCommit: string | null;
+  prNumber: number | null;
+  prUrl: string | null;
+  /** The sub-task's own conversation on the guided track; null on the fast track, where the run's conversation is used. */
+  conversationId: string | null;
+  review: SubtaskReview | null;
+  verification: Verification | null;
+  fixRounds: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** A sub-task as listed under its run in the conversation hierarchy (AD-43). */
+export interface TicketSubtaskDto {
+  key: string;
+  index: number;
+  title: string;
+  state: SubtaskState;
+  conversationId: string;
+  pending: number;
+}
+
 /** One run of a ticket, as listed under it. Each run has its own conversation (AD-38). */
 export interface TicketRunDto {
   runId: string;
@@ -488,8 +733,10 @@ export interface TicketRunDto {
   ordinal: number;
   state: RunState;
   track: Track | null;
-  /** Decisions waiting for the requester in this run. */
+  /** Decisions waiting for the requester in this run, its sub-tasks included. */
   pending: number;
+  /** Sub-tasks that have their own conversation, in plan order (guided track). */
+  subtasks: TicketSubtaskDto[];
   prNumber: number | null;
   prUrl: string | null;
   createdAt: string;
@@ -517,7 +764,11 @@ export interface TicketDto {
 }
 
 /** Groups runs by ticket: tickets by latest activity, runs newest first, numbered in the order they started. */
-export function groupTickets(runs: readonly RunDto[], pendingByRun: Readonly<Record<string, number>> = {}): TicketDto[] {
+export function groupTickets(
+  runs: readonly RunDto[],
+  pendingByRun: Readonly<Record<string, number>> = {},
+  subtasksByRun: Readonly<Record<string, TicketSubtaskDto[]>> = {},
+): TicketDto[] {
   const byTicket = new Map<string, RunDto[]>();
   for (const run of runs) byTicket.set(run.ticketKey, [...(byTicket.get(run.ticketKey) ?? []), run]);
   const tickets: TicketDto[] = [];
@@ -531,6 +782,7 @@ export function groupTickets(runs: readonly RunDto[], pendingByRun: Readonly<Rec
         state: r.state,
         track: r.track,
         pending: pendingByRun[r.id] ?? 0,
+        subtasks: subtasksByRun[r.id] ?? [],
         prNumber: r.prNumber,
         prUrl: r.prUrl,
         createdAt: r.createdAt,
@@ -578,10 +830,12 @@ export interface RunEventDto {
   occurredAt: string;
 }
 
+export type ApprovalKind = "plan" | "questions" | "risk" | "findings" | "limits";
+
 export interface ApprovalDto {
   id: string;
   runId: string;
-  kind: "plan" | "questions" | "risk";
+  kind: ApprovalKind;
   state: "pending" | "resolved" | "expired";
   conversationId: string | null;
   title: string;
@@ -619,6 +873,18 @@ export type PlanDecision = z.infer<typeof PlanDecision>;
 export const RiskDecision = z.object({ decision: z.enum(["approve", "reject"]), hash: z.string() });
 export type RiskDecision = z.infer<typeof RiskDecision>;
 
+/** What to do with findings that are still blocking after the fix rounds (FR-R2). */
+export const FindingsDecision = z.object({
+  decision: z.enum(["open", "retry", "take_over", "cancel"]),
+  guidance: z.string().max(4000).optional(),
+  hash: z.string(),
+});
+export type FindingsDecision = z.infer<typeof FindingsDecision>;
+
+/** What to do with a fast-track change that exceeds the fast-track limits (FR-A2). */
+export const LimitsDecision = z.object({ decision: z.enum(["continue", "guided", "cancel"]), hash: z.string() });
+export type LimitsDecision = z.infer<typeof LimitsDecision>;
+
 export const QuestionAnswer = z.object({ answer: z.string().min(1).max(8000) });
 export type QuestionAnswer = z.infer<typeof QuestionAnswer>;
 
@@ -640,17 +906,20 @@ export interface DeliveryRunInput {
   workItem: WorkItem;
   /** The chat the run was started from, if any; it gets a link to the run's own conversation. */
   conversationId: string | null;
+  /** How often an open pull request is polled, in seconds (default 60). */
+  prPollSeconds?: number;
 }
 
 /** Memo set on runs started by this version; older executions are retired at worker start. */
-export const RUN_WORKFLOW_GENERATION = 2;
+export const RUN_WORKFLOW_GENERATION = 3;
 
 export const workflowIdForIssue = (repo: RepoRef, number: number) => `run:github:${repo.owner}/${repo.name}#${number}`;
 
 // Signals delivered to the delivery-run workflow.
 export interface ApprovalSignal {
   approvalId: string;
-  decision: "approve" | "changes" | "reject";
+  /** Plan: approve, changes, reject. Risk: approve, reject. Findings: open, retry, take_over, cancel. Limits: continue, guided, cancel. */
+  decision: "approve" | "changes" | "reject" | "open" | "retry" | "take_over" | "cancel" | "continue" | "guided";
   feedback?: string;
 }
 export interface AnswerSignal {

@@ -26,7 +26,8 @@ export function git(args: string[], opts: { cwd?: string; env?: Record<string, s
   });
 }
 
-export const runRepoDir = (runId: string) => join(config.reposDir(), runId);
+/** The worker's clone of the repository one sub-task changes: every sub-task has its own, on its own branch (FR-B1). */
+export const workRepoDir = (runId: string, subtaskKey: string) => join(config.reposDir(), runId, subtaskKey.replace(/[^A-Za-z0-9_.-]/g, "_"));
 export const mirrorDir = (repo: RepoRef) => join(config.reposDir(), "_mirrors", repo.owner, `${repo.name}.git`);
 export const stepArtifactsDir = (stepId: string) => join(config.artifactsDir(), stepId);
 
@@ -35,19 +36,22 @@ export function remoteFor(repo: RepoRef): { url: string; env: Record<string, str
   return { url, env: gitAuthEnv(config.githubToken(), url) };
 }
 
-/** Clones the repository for a run (once) and makes sure the run branch exists locally. */
-export async function ensureRunRepo(runId: string, repo: RepoRef, defaultBranch: string, branch: string): Promise<string> {
-  const dir = runRepoDir(runId);
+/**
+ * Clones the repository for a sub-task (once) and puts its branch on the current head of the default branch.
+ * Returns the commit the sub-task starts from.
+ */
+export async function ensureWorkRepo(runId: string, subtaskKey: string, repo: RepoRef, defaultBranch: string, branch: string): Promise<{ dir: string; baseCommit: string }> {
+  const dir = workRepoDir(runId, subtaskKey);
   const { url, env } = remoteFor(repo);
   if (!existsSync(join(dir, ".git"))) {
+    await mkdir(join(dir, ".."), { recursive: true });
     await git(["clone", "--no-tags", "--single-branch", "--branch", defaultBranch, url, dir], { env });
-  } else {
-    await git(["fetch", "--no-tags", "origin", defaultBranch], { cwd: dir, env });
   }
   const local = await git(["branch", "--list", branch], { cwd: dir });
   if (!local.trim()) await git(["checkout", "-B", branch, `origin/${defaultBranch}`], { cwd: dir });
   else await git(["checkout", branch], { cwd: dir });
-  return dir;
+  const baseCommit = (await git(["merge-base", branch, `origin/${defaultBranch}`], { cwd: dir })).trim();
+  return { dir, baseCommit };
 }
 
 // One git operation at a time per mirror: concurrent fetches into the same repository fight over ref locks.

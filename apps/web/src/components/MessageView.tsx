@@ -3,7 +3,22 @@ import { FormBlock, TableBlock } from "./AgentBlocks";
 import { OrchestratorCardView } from "./Cards";
 import { SafeMarkdown } from "./SafeMarkdown";
 
-const SYSTEM = new Set(["work_item", "run_link", "analysis", "progress", "plan", "questions", "risk", "pull_request", "notice"]);
+const SYSTEM = new Set([
+  "work_item",
+  "run_link",
+  "analysis",
+  "progress",
+  "plan",
+  "questions",
+  "risk",
+  "subtask",
+  "review",
+  "findings",
+  "limits",
+  "story",
+  "pull_request",
+  "notice",
+]);
 
 /** Every agent message says which agent wrote it (AD-38). */
 const AGENT_NAMES: Record<MessageAuthor, string> = { "front-door": "Assistant", architect: "Architect agent" };

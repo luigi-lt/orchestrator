@@ -3,7 +3,15 @@
  * these deterministic rules decide what is allowed, because the analysis is model output on untrusted input.
  */
 import { classifyRisk, matchesAnyGlob } from "@orch/common";
-import { findCatalogProduct, findCatalogRepository, workItemType, type Analysis, type Catalog, type TrackDecision } from "@orch/contracts";
+import {
+  findCatalogProduct,
+  findCatalogRepository,
+  workItemType,
+  type Analysis,
+  type Catalog,
+  type CatalogRepository,
+  type TrackDecision,
+} from "@orch/contracts";
 
 /** Splits "owner/name:path" as written by the analyst; a bare path belongs to no known repository. */
 function splitLikelyFile(entry: string): { repo: string | null; path: string } {
@@ -77,4 +85,16 @@ export function decideTrack({ analysis: a, labels, catalog, maxFiles }: TrackInp
     proposed: "fast",
     reasons: ["Clear behavior, one area of one product, size S, no interface or high-risk file", ...a.trackReasons],
   };
+}
+
+/**
+ * The fast-track limits, checked again on the finished change (FR-A2): the analysis is an estimate.
+ * High-risk files are not listed here; they have their own approval before anything is pushed.
+ */
+export function fastTrackLimitsExceeded(changedFiles: readonly string[], repository: CatalogRepository | undefined, maxFiles: number): string[] {
+  const reasons: string[] = [];
+  if (changedFiles.length > maxFiles) reasons.push(`The change touches ${changedFiles.length} files (the fast-track limit is ${maxFiles})`);
+  const contracts = repository ? changedFiles.filter((f) => matchesAnyGlob(f, repository.contractPaths)) : [];
+  if (contracts.length) reasons.push(`The change touches an interface of ${repository!.product} (${contracts.join(", ")})`);
+  return reasons;
 }

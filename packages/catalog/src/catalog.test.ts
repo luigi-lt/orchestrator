@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Analysis } from "@orch/contracts";
-import { CatalogError, catalogFromRepositories, decideTrack, parseCatalog, validateAnalysis } from "./index.js";
+import { CatalogError, catalogFromRepositories, decideTrack, fastTrackLimitsExceeded, parseCatalog, validateAnalysis } from "./index.js";
 
 const YAML = `
 products:
@@ -89,6 +89,14 @@ describe("product catalog", () => {
     const d = decide(two);
     expect(d).toMatchObject({ track: "guided", proposed: "fast" });
     expect(d.reasons[0]).toMatch(/More than one product/);
+  });
+
+  it("checks the fast-track limits again on the real change", () => {
+    const demo = catalog.products[0]!.repositories[0]!;
+    expect(fastTrackLimitsExceeded(["subtract.js", "test.js"], demo, 5)).toEqual([]);
+    expect(fastTrackLimitsExceeded(["a", "b", "c", "d", "e", "f"], demo, 5)[0]).toMatch(/6 files/);
+    expect(fastTrackLimitsExceeded(["api/v2.yaml"], demo, 5)[0]).toMatch(/interface of calc \(api\/v2.yaml\)/);
+    expect(fastTrackLimitsExceeded(["a", "b"], undefined, 1)).toHaveLength(1);
   });
 
   it("checks an analysis against the catalog", () => {

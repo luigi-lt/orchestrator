@@ -17,6 +17,8 @@ const SEED = {
   "acme/demo": {
     "README.md": "# Demo\n\nA tiny calculator library.\n",
     "math.js": "export function add(a, b) {\n  return a + b;\n}\n",
+    // The product's test command (products.yaml): passes once subtract works.
+    "test.mjs": "import('./subtract.js').then((m) => process.exit(m.subtract(5, 3) === 2 ? 0 : 1), () => process.exit(1));\n",
     "AGENTS.md": "# Guidance for agents\n\nE2E-GUIDANCE-MARKER: one exported function per file, two-space indentation.\n",
   },
   "acme/web": {
@@ -100,6 +102,10 @@ const server = http.createServer(async (req, res) => {
       if (m === "POST" && p[1] === "pulls" && p[3] === "merge") {
         const pr = state.pulls.find((x) => x.number === Number(p[2]));
         if (!pr) return send(res, 404, { message: "no pr" });
+        // A real merge (fast-forward), so the next branch starts from the merged change.
+        const bare = join(GIT_ROOT, `${pr.repo}.git`);
+        git(["merge-base", "--is-ancestor", `refs/heads/${pr.base}`, `refs/heads/${pr.head}`], bare);
+        git(["update-ref", `refs/heads/${pr.base}`, `refs/heads/${pr.head}`], bare);
         pr.state = "closed";
         pr.merged = true;
         return send(res, 200, pr);
@@ -115,9 +121,13 @@ const server = http.createServer(async (req, res) => {
         const [o, r] = (url.searchParams.get("repo") ?? REPOS[0]).split("/");
         const branch = url.searchParams.get("name");
         const bare = join(GIT_ROOT, `${o}/${r}.git`);
-        const log = git(["log", "--format=%H %an <%ae> %s%n%b", `main..${branch}`], bare);
-        const files = git(["diff", "--name-only", `main...${branch}`], bare);
-        return send(res, 200, { log, files: files.split("\n").filter(Boolean) });
+        // Against the pull request's base as it was when the branch was made (main may have moved on by a merge).
+        const base = git(["merge-base", "main", branch], bare).trim();
+        const range = base === git(["rev-parse", branch], bare).trim() ? `${branch}~1..${branch}` : `${base}..${branch}`;
+        const log = git(["log", "--format=%H %an <%ae> %s%n%b", range], bare);
+        const files = git(["diff", "--name-only", range], bare);
+        const commits = Number(git(["rev-list", "--count", range], bare).trim());
+        return send(res, 200, { log, files: files.split("\n").filter(Boolean), commits });
       }
     }
     if (m === "GET" && url.pathname === "/user") return send(res, 200, USER);

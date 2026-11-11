@@ -15,7 +15,7 @@ import {
 import { GitHubError, type GitHubClient } from "@orch/github";
 import { getPollEtag, setPollEtag } from "@orch/store";
 import { ctx } from "../context.js";
-import { git, remoteFor, runRepoDir } from "../git.js";
+import { git, remoteFor, workRepoDir } from "../git.js";
 
 const LABEL_IN_PROGRESS = "ai-in-progress";
 const LABEL_DONE = "ai-done";
@@ -100,22 +100,26 @@ export async function finalizeIssue(input: { repo: RepoRef; number: number; outc
   if (input.outcome === "completed") await gh((c) => c.addLabels(input.repo, input.number, [LABEL_DONE]));
 }
 
-/** Pushes the run branch and opens the pull request (or returns the one that already exists). */
-export async function publishBranch(input: {
-  runId: string;
+/** Pushes a sub-task's branch. Only agent branches ever leave the orchestrator. */
+export async function pushBranch(input: { runId: string; subtaskKey: string; repo: RepoRef; branch: string }): Promise<void> {
+  const { url, env } = remoteFor(input.repo);
+  if (!input.branch.startsWith("agent/")) throw ApplicationFailure.nonRetryable(`Refusing to push non-agent branch ${input.branch}`);
+  const cwd = workRepoDir(input.runId, input.subtaskKey);
+  // The branch was squashed locally; on a retry or a re-publish the remote copy is replaced by exactly the inspected commit.
+  await git(["push", "--force", url, `refs/heads/${input.branch}:refs/heads/${input.branch}`], { cwd, env });
+}
+
+/** Opens the pull request of a pushed branch (or returns the one that already exists). */
+export async function openPullRequest(input: {
   repo: RepoRef;
   branch: string;
-  defaultBranch: string;
+  base: string;
   title: string;
   body: string;
 }): Promise<{ number: number; url: string; title: string }> {
-  const { url, env } = remoteFor(input.repo);
-  const dir = runRepoDir(input.runId);
-  if (!input.branch.startsWith("agent/")) throw ApplicationFailure.nonRetryable(`Refusing to push non-agent branch ${input.branch}`);
-  await git(["push", url, `refs/heads/${input.branch}:refs/heads/${input.branch}`], { cwd: dir, env });
   const existing = await gh((c) => c.findPullRequestByHead(input.repo, input.branch));
   if (existing) return { number: existing.number, url: existing.url, title: existing.title };
-  const pr = await gh((c) => c.createPullRequest(input.repo, { title: input.title, head: input.branch, base: input.defaultBranch, body: input.body }));
+  const pr = await gh((c) => c.createPullRequest(input.repo, { title: input.title, head: input.branch, base: input.base, body: input.body }));
   return { number: pr.number, url: pr.url, title: pr.title };
 }
 

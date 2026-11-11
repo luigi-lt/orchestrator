@@ -1,6 +1,6 @@
 # Orchestrator
 
-An orchestration layer for AI agents that turns tickets into reviewed pull requests: it picks up work, has agents plan and implement it in isolated sandboxes, keeps people in control through approvals, and shows everything in a conversational user view and a technical operator view.
+An orchestration layer for AI agents that turns tickets into reviewed pull requests: it picks up work, has agents analyse, plan, implement and review it in isolated sandboxes, keeps people in control through approvals, and shows everything in a conversational user view and a technical operator view.
 
 ## Documents
 

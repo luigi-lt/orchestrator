@@ -30,6 +30,7 @@ x-github: &github
   GITHUB_GIT_URL_TEMPLATE: ${GITHUB_GIT_URL_TEMPLATE:-https://github.com/{owner}/{repo}.git}
   ORCH_TRIGGER_LABEL: ${ORCH_TRIGGER_LABEL:-ai-ready}
   ORCH_MODEL: ${ORCH_MODEL:-claude-opus-5-5}
+  ORCH_REVIEWER_MODEL: ${ORCH_REVIEWER_MODEL:-}
 
 services:
   postgres:
@@ -96,6 +97,8 @@ services:
       STEP_TIMEOUT_MINUTES: ${STEP_TIMEOUT_MINUTES:-60}
       MAX_STEP_REPOSITORIES: ${MAX_STEP_REPOSITORIES:-8}
       FAST_TRACK_MAX_FILES: ${FAST_TRACK_MAX_FILES:-5}
+      MAX_FIX_ROUNDS: ${MAX_FIX_ROUNDS:-2}
+      PR_POLL_SECONDS: ${PR_POLL_SECONDS:-60}
     volumes:
       - artifacts:/data/artifacts
       - repos:/data/repos

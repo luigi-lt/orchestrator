@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ApplicationFailure, Context } from "@temporalio/activity";
+import { fastTrackLimitsExceeded } from "@orch/catalog";
 import { classifyRisk, config, errorMessage, log, scanDiffForSecrets, sleep, type RiskAssessment, type SecretFinding } from "@orch/common";
 import {
   StepBrief,
@@ -18,15 +19,25 @@ import {
   type RepositoryRequestDto,
   type StepKind,
   type StepResult,
+  type TrackedFinding,
+  type Verification,
   type WorkItem,
 } from "@orch/contracts";
 import { GitHubError } from "@orch/github";
 import { failStepIfActive, getStep, listRepositoryRequests, resolveRepositoryRequest, upsertStep } from "@orch/store";
 import { ctx, runCatalog } from "../context.js";
-import { bundleReadOnly, ensureRunRepo, git, runRepoDir, stepArtifactsDir } from "../git.js";
+import { bundleReadOnly, ensureWorkRepo, git, stepArtifactsDir, workRepoDir } from "../git.js";
 
-export async function prepareRunRepo(input: { runId: string; repo: RepoRef; defaultBranch: string; branch: string }): Promise<void> {
-  await ensureRunRepo(input.runId, input.repo, input.defaultBranch, input.branch);
+/** Clones the repository a sub-task changes and creates its branch; returns the commit the sub-task starts from. */
+export async function prepareSubtaskRepo(input: {
+  runId: string;
+  subtaskKey: string;
+  repo: RepoRef;
+  defaultBranch: string;
+  branch: string;
+}): Promise<{ baseCommit: string }> {
+  const { baseCommit } = await ensureWorkRepo(input.runId, input.subtaskKey, input.repo, input.defaultBranch, input.branch);
+  return { baseCommit };
 }
 
 export interface PrepareStepInput {
@@ -34,10 +45,19 @@ export interface PrepareStepInput {
   stepId: string;
   kind: StepKind;
   title: string;
-  /** The repository the agent starts in: the ticket's for analysis, the one being changed for planning and implementation. */
+  /** The repository the agent starts in: the ticket's for analysis, the one being changed for planning, implementation and review. */
   primaryRepo: RepoRef;
-  /** The agent branch; used by implementation steps, which get the primary repository writable. */
+  /** The sub-task's branch; implementation steps get it writable, review steps read-only. */
   branch: string;
+  /** The sub-task an implementation or review step belongs to. */
+  subtaskKey?: string;
+  /** 0 for the first implementation or review; fix and re-review rounds count up. */
+  round?: number;
+  /** Implementation: the findings to fix. Review: the earlier findings to check again. */
+  findings?: TrackedFinding[];
+  guidance?: string;
+  implementerSummary?: string;
+  verification?: Verification;
   workItem: WorkItem;
   commitAuthor: { name: string; email: string };
   analysis?: Analysis;
@@ -79,6 +99,8 @@ export async function prepareStep(input: PrepareStepInput): Promise<void> {
     kind: input.kind,
     title: input.title,
     subtaskIndex: input.subtaskIndex ?? null,
+    subtaskKey: input.subtaskKey ?? null,
+    round: input.round ?? 0,
   });
   const dir = stepArtifactsDir(input.stepId);
   await mkdir(dir, { recursive: true });
@@ -88,9 +110,11 @@ export async function prepareStep(input: PrepareStepInput): Promise<void> {
   if (!primaryEntry) throw ApplicationFailure.nonRetryable(`Repository ${primarySlug} is not in the product catalog`);
 
   const repositories: BriefRepository[] = [];
-  if (input.kind === "implement") {
-    // The one writable repository: the run's own clone, on the agent branch.
-    const cwd = runRepoDir(input.runId);
+  if (input.kind === "implement" || input.kind === "review") {
+    // The sub-task's own clone, on its branch: writable for the implementer, read-only for the reviewer,
+    // whose workspace can hand nothing back (AD-37, AD-39).
+    if (!input.subtaskKey) throw ApplicationFailure.nonRetryable(`A ${input.kind} step needs a sub-task`);
+    const cwd = workRepoDir(input.runId, input.subtaskKey);
     await git(["bundle", "create", join(dir, bundleName(0)), input.branch], { cwd });
     const commit = (await git(["rev-parse", input.branch], { cwd })).trim();
     const baseCommit = (await git(["merge-base", input.branch, "origin/HEAD"], { cwd }).catch(() => commit)).trim();
@@ -102,7 +126,7 @@ export async function prepareStep(input: PrepareStepInput): Promise<void> {
       branch: input.branch,
       commit,
       baseCommit,
-      mode: "writable",
+      mode: input.kind === "implement" ? "writable" : "readonly",
       path: workspaceRepoPath(primaryEntry.product, input.primaryRepo),
       primary: true,
     });
@@ -122,7 +146,7 @@ export async function prepareStep(input: PrepareStepInput): Promise<void> {
     stepId: input.stepId,
     runId: input.runId,
     kind: input.kind,
-    model: config.model(),
+    model: input.kind === "review" ? config.reviewerModel() : config.model(),
     branch: repositories[0]!.branch,
     workItem: input.workItem,
     repositories,
@@ -133,6 +157,13 @@ export async function prepareStep(input: PrepareStepInput): Promise<void> {
     feedback: input.feedback,
     plan: input.plan,
     subtaskIndex: input.subtaskIndex,
+    round: input.round ?? 0,
+    // The product's commands come from the catalog, so nothing in the repository can replace them (FR-M4, FR-M6).
+    commands: input.kind === "implement" ? primaryEntry.commands : {},
+    findings: input.findings ?? [],
+    guidance: input.guidance,
+    implementerSummary: input.implementerSummary,
+    verification: input.verification,
     commitAuthor: input.commitAuthor,
     timeoutMinutes: config.stepTimeoutMinutes(),
   };
@@ -193,17 +224,17 @@ export async function awaitStep(input: { stepId: string }): Promise<StepResult> 
   }
 }
 
-/** Fast-forwards the run branch with the commits produced by the step. Returns the number of new commits. */
-export async function applyStepResult(input: { runId: string; stepId: string; branch: string }): Promise<{ commits: number }> {
+/** Fast-forwards the sub-task's branch with the commits produced by the step. Returns the number of new commits. */
+export async function applyStepResult(input: { runId: string; subtaskKey: string; stepId: string; branch: string }): Promise<{ commits: number }> {
   const bundle = join(stepArtifactsDir(input.stepId), "out.bundle");
   if (!existsSync(bundle)) return { commits: 0 };
-  const cwd = runRepoDir(input.runId);
+  const cwd = workRepoDir(input.runId, input.subtaskKey);
   await git(["checkout", input.branch], { cwd });
   const before = (await git(["rev-parse", "HEAD"], { cwd })).trim();
   try {
     await git(["bundle", "verify", bundle], { cwd });
   } catch (err) {
-    throw ApplicationFailure.nonRetryable(`The step's changes do not build on the run branch: ${(err as Error).message}`);
+    throw ApplicationFailure.nonRetryable(`The step's changes do not build on the sub-task's branch: ${(err as Error).message}`);
   }
   const ref = `refs/orch/${input.stepId}`;
   await git(["fetch", bundle, `refs/heads/${input.branch}:${ref}`], { cwd });
@@ -216,19 +247,61 @@ export async function applyStepResult(input: { runId: string; stepId: string; br
   return { commits: Number.parseInt(count, 10) || 0 };
 }
 
+/**
+ * Turns the sub-task's commits (the implementation and its fix rounds) into one commit on top of the base.
+ * What is pushed then contains exactly the change that was inspected: nothing from an earlier round
+ * survives in the history, such as a secret that a fix round removed.
+ */
+export async function squashSubtask(input: {
+  runId: string;
+  subtaskKey: string;
+  branch: string;
+  baseCommit: string;
+  title: string;
+  summary: string;
+  requester: string;
+  commitAuthor: { name: string; email: string };
+}): Promise<{ headCommit: string }> {
+  const cwd = workRepoDir(input.runId, input.subtaskKey);
+  await git(["checkout", input.branch], { cwd });
+  await git(["reset", "--soft", input.baseCommit], { cwd });
+  const staged = (await git(["diff", "--cached", "--name-only"], { cwd })).trim();
+  if (staged) {
+    const message = `${input.title.slice(0, 200)}\n\n${input.summary}\n\nAgent-Run: ${input.runId}\nRequested-By: ${input.requester}`;
+    const identity = ["-c", `user.name=${input.commitAuthor.name}`, "-c", `user.email=${input.commitAuthor.email}`];
+    await git([...identity, "commit", "--quiet", "--no-verify", "-m", message], { cwd });
+  }
+  return { headCommit: (await git(["rev-parse", "HEAD"], { cwd })).trim() };
+}
+
 export interface ChangeInspection {
   changedFiles: string[];
   secrets: SecretFinding[];
   risk: RiskAssessment;
+  /** Why the change is beyond the fast track; empty when it is within the limits or the limits were not asked for. */
+  limits: string[];
 }
 
-/** Secret scan and risk classification of everything the run changed, before anything is pushed. */
-export async function inspectChanges(input: { runId: string; repo: RepoRef; branch: string; defaultBranch: string }): Promise<ChangeInspection> {
-  const cwd = runRepoDir(input.runId);
-  const range = `origin/${input.defaultBranch}...${input.branch}`;
+/** Secret scan, risk classification and fast-track limits of a sub-task's change, before anything is pushed. */
+export async function inspectChanges(input: {
+  runId: string;
+  subtaskKey: string;
+  repo: RepoRef;
+  branch: string;
+  baseCommit: string;
+  checkLimits: boolean;
+}): Promise<ChangeInspection> {
+  const cwd = workRepoDir(input.runId, input.subtaskKey);
+  const range = `${input.baseCommit}..${input.branch}`;
   const names = (await git(["diff", "--name-only", range], { cwd })).split("\n").filter(Boolean);
   const diff = await git(["diff", "--unified=0", range], { cwd });
   // The product's own high-risk paths add to the baseline rules; they can never relax them (D15).
   const entry = findCatalogRepository(await runCatalog(input.runId), repoSlug(input.repo));
-  return { changedFiles: names, secrets: scanDiffForSecrets(diff), risk: classifyRisk(names, entry?.highRiskPaths ?? []) };
+  return {
+    changedFiles: names,
+    secrets: scanDiffForSecrets(diff),
+    risk: classifyRisk(names, entry?.highRiskPaths ?? []),
+    // The analysis was an estimate; the fast track is checked again on what was really changed (FR-A2).
+    limits: input.checkLimits ? fastTrackLimitsExceeded(names, entry, config.fastTrackMaxFiles()) : [],
+  };
 }
