@@ -85,6 +85,7 @@ services:
       WORKSPACE_MEMORY_MB: ${WORKSPACE_MEMORY_MB:-4096}
       WORKSPACE_CPUS: ${WORKSPACE_CPUS:-2}
       STEP_TIMEOUT_MINUTES: ${STEP_TIMEOUT_MINUTES:-60}
+      DESIGN_MAX_MINUTES: ${DESIGN_MAX_MINUTES:-480}
     volumes:
       - ${DOCKER_SOCKET_PATH:-/var/run/docker.sock}:/var/run/docker.sock
 
@@ -99,6 +100,8 @@ services:
       FAST_TRACK_MAX_FILES: ${FAST_TRACK_MAX_FILES:-5}
       MAX_FIX_ROUNDS: ${MAX_FIX_ROUNDS:-2}
       PR_POLL_SECONDS: ${PR_POLL_SECONDS:-60}
+      DESIGN_IDLE_SECONDS: ${DESIGN_IDLE_SECONDS:-1200}
+      DESIGN_MAX_MINUTES: ${DESIGN_MAX_MINUTES:-480}
     volumes:
       - artifacts:/data/artifacts
       - repos:/data/repos

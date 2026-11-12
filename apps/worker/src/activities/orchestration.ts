@@ -1,15 +1,22 @@
 import { ApplicationFailure, Context } from "@temporalio/activity";
 import { CatalogError, currentCatalog, decideTrack, validateAnalysis } from "@orch/catalog";
 import { config, hashOf, newId } from "@orch/common";
+import { architect } from "@orch/agent-profiles";
 import {
+  buildOrder,
+  diffPlans,
   findCatalogProduct,
   findCatalogRepository,
   findingsToFix,
   mergeReview,
   repoSlug,
+  sanitizeAgentComponents,
   type Analysis,
+  type DesignTurnInput,
+  type DesignTurnResult,
+  type HandoffPlan,
   type OrchestratorCard,
-  type Plan,
+  type PlanVersionDto,
   type RepoRef,
   type ReviewReport,
   type RunState,
@@ -20,21 +27,27 @@ import {
   type WorkItem,
 } from "@orch/contracts";
 import {
+  addPlanVersion,
   appendRunEvent,
   createApproval,
   createConversation,
   expireApprovalsForRun,
   getCard,
+  getLatestPlanVersion,
   getRun,
   getSubtask,
+  insertMessage,
+  notify,
   insertRun,
   insertSubtask,
   listSubtasks,
   resolveApproval,
   saveCatalogVersion,
+  setPlanVersionStatus,
   updateRun,
   updateSubtask,
   upsertCard,
+  voidApprovals,
   type Db,
   type NewRunEvent,
   type SubtaskPatch,
@@ -59,7 +72,12 @@ export async function initRun(input: {
   runId: string;
   workItem: WorkItem;
   originConversationId: string | null;
-}): Promise<{ conversationId: string; homeProduct: string; catalogHash: string; settings: { maxFixRounds: number; prPollSeconds: number } }> {
+}): Promise<{
+  conversationId: string;
+  homeProduct: string;
+  catalogHash: string;
+  settings: { maxFixRounds: number; prPollSeconds: number; designIdleSeconds: number };
+}> {
   const { db } = ctx();
   const { runId, workItem } = input;
   const slug = repoSlug(workItem.repo);
@@ -119,7 +137,7 @@ export async function initRun(input: {
       title: workItem.title,
     });
   }
-  return { conversationId, homeProduct, catalogHash, settings: { maxFixRounds: config.maxFixRounds(), prPollSeconds: config.prPollSeconds() } };
+  return { conversationId, homeProduct, catalogHash, settings: { maxFixRounds: config.maxFixRounds(), prPollSeconds: config.prPollSeconds(), designIdleSeconds: config.designIdleSeconds() } };
 }
 
 /**
@@ -209,20 +227,109 @@ export async function recordTicketAnswer(input: { runId: string; conversationId:
   if (card?.type === "questions") await upsertCard(db, input.conversationId, cardKey, { ...card, status: "answered", answer: input.answer });
 }
 
-export async function requestPlanApproval(input: { runId: string; conversationId: string; plan: Plan }): Promise<{ approvalId: string; hash: string }> {
-  const { db } = ctx();
-  const approvalId = newId("apr");
-  const hash = hashOf({ runId: input.runId, plan: input.plan });
-  await createApproval(db, { id: approvalId, runId: input.runId, kind: "plan", payload: { plan: input.plan }, hash });
-  await upsertCard(db, input.conversationId, key(input.runId, "plan", approvalId), {
+// ---------------------------------------------------------------------------
+// Design session: the architect's replies, plan versions and the plan's approval (FR-P1 to FR-P4, AD-36)
+// ---------------------------------------------------------------------------
+
+const planCardKey = (runId: string) => key(runId, "plan");
+
+/** The plan card shows the latest version: read-only, with what changed since the version before. */
+/**
+ * Shows a plan version on the run's one plan card. With `toEnd` the card moves below the architect's reply, so
+ * a new version, or the Approve button, is where the requester is reading.
+ */
+async function showPlan(db: Db, runId: string, conversationId: string, version: PlanVersionDto, approvalId: string | null, toEnd: boolean): Promise<void> {
+  const catalog = await runCatalog(runId);
+  const card: OrchestratorCard = {
     type: "plan",
-    runId: input.runId,
-    approvalId,
-    hash,
-    plan: input.plan,
-    status: "pending",
-  });
-  return { approvalId, hash };
+    runId,
+    version: version.version,
+    hash: version.hash,
+    plan: version.plan,
+    status: version.status === "approved" ? "approved" : version.status === "proposed" ? "proposed" : "draft",
+    ...(approvalId ? { approvalId } : {}),
+    changes: version.changes,
+    promptedBy: version.promptedBy,
+    products: Object.fromEntries(catalog.products.map((p) => [p.id, p.name])),
+  };
+  await upsertCard(db, conversationId, planCardKey(runId), card, { toEnd });
+}
+
+/**
+ * Records one turn of the design session, after it ended: the architect's reply in the conversation, a new plan
+ * version when the architect submitted one, and the approval request when it put the plan up for approval.
+ * The workflow is the only writer of plan versions (AD-13, AD-36); the plan was validated by the gateway.
+ */
+export async function recordDesignTurn(input: {
+  runId: string;
+  conversationId: string;
+  turn: DesignTurnInput;
+  result: DesignTurnResult;
+}): Promise<{ version: number | null; created: boolean; changes: number; voidedApproval: boolean; proposedApprovalId: string | null }> {
+  const { db } = ctx();
+  const { runId, conversationId, result } = input;
+  const failed = result.status !== "succeeded";
+  const text = failed ? `I could not reply (${result.error ?? "unknown error"}). Send your message again to retry.` : result.text.trim();
+  const components = failed ? [] : sanitizeAgentComponents(result.components);
+  if (text || components.length) {
+    await insertMessage(db, { conversationId, role: "agent", author: "architect", text: text || null, components, key: key(runId, "turn", input.turn.turnId) });
+  }
+  // The turn is over, however it ended (a lost workspace never reports its own end).
+  await notify(db, { t: "typing", c: conversationId, on: false });
+  if (failed) return { version: null, created: false, changes: 0, voidedApproval: false, proposedApprovalId: null };
+
+  let latest = await getLatestPlanVersion(db, runId);
+  let created = false;
+  let voidedApproval = false;
+  if (result.plan) {
+    const promptedBy = input.turn.messages.length ? input.turn.messages.join("\n").slice(0, 2000) : null;
+    const added = await addPlanVersion(db, {
+      runId,
+      hash: hashOf({ runId, plan: result.plan }),
+      plan: result.plan,
+      changes: diffPlans(latest?.plan ?? null, result.plan),
+      author: `${architect.id}@${architect.version}`,
+      promptedBy,
+    });
+    created = added.created;
+    latest = added.version;
+    // A newer version voids the approval asked for an older one: what is approved is exactly what was shown (FR-P4).
+    if (created) voidedApproval = (await voidApprovals(db, runId, "plan")).length > 0;
+  }
+  if (!latest) return { version: null, created: false, changes: 0, voidedApproval, proposedApprovalId: null };
+
+  let proposedApprovalId: string | null = null;
+  if (result.proposed && latest.status !== "proposed" && latest.status !== "approved") {
+    proposedApprovalId = newId("apr");
+    await createApproval(db, {
+      id: proposedApprovalId,
+      runId,
+      kind: "plan",
+      payload: { version: latest.version },
+      hash: latest.hash,
+      workflowId: callingWorkflow(),
+      conversationId,
+    });
+    await setPlanVersionStatus(db, runId, latest.version, "proposed");
+    latest = { ...latest, status: "proposed" };
+  }
+  if (created || proposedApprovalId) await showPlan(db, runId, conversationId, latest, proposedApprovalId, true);
+  return { version: latest.version, created, changes: latest.changes.length, voidedApproval, proposedApprovalId };
+}
+
+/**
+ * The requester approved a plan version. It becomes the plan of the run; returns the order in which
+ * its sub-tasks are built (each after the ones it depends on).
+ */
+export async function finalizePlan(input: { runId: string; conversationId: string; version: number }): Promise<{ plan: HandoffPlan; order: string[] }> {
+  const { db } = ctx();
+  const latest = await getLatestPlanVersion(db, input.runId);
+  if (!latest || latest.version !== input.version) throw ApplicationFailure.nonRetryable(`Plan version ${input.version} is not the latest version of the run`);
+  const order = buildOrder(latest.plan);
+  if (!order) throw ApplicationFailure.nonRetryable("The approved plan has a dependency cycle");
+  await setPlanVersionStatus(db, input.runId, latest.version, "approved");
+  await showPlan(db, input.runId, input.conversationId, { ...latest, status: "approved" }, null, false);
+  return { plan: latest.plan, order: order.map((st) => st.key) };
 }
 
 export async function requestRiskApproval(input: {
@@ -300,6 +407,8 @@ export async function initSubtask(input: {
   branch: string;
   ownConversation: boolean;
   runConversationId: string;
+  /** The sub-issue that mirrors the sub-task on the ticket, when the plan was mirrored (FR-P5). */
+  ticket?: { number: number; url: string };
 }): Promise<{ conversationId: string }> {
   const { db } = ctx();
   const slug = repoSlug(input.repo);
@@ -316,6 +425,7 @@ export async function initSubtask(input: {
     repository: slug,
     branch: input.branch,
   });
+  if (input.ticket) await updateSubtask(db, input.runId, input.key, { ticketNumber: input.ticket.number, ticketUrl: input.ticket.url });
   if (!input.ownConversation) return { conversationId: input.runConversationId };
   let conversationId = (await getSubtask(db, input.runId, input.key))?.conversationId ?? null;
   if (!conversationId) {

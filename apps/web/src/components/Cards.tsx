@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
-import type { OrchestratorCard, TrackedFinding, Verification } from "@orch/contracts";
-import { post } from "../api";
+import type { HandoffPlan, OrchestratorCard, PlanVersionDto, TrackedFinding, Verification } from "@orch/contracts";
+import { api, post } from "../api";
 
 type CardOf<T extends OrchestratorCard["type"]> = Extract<OrchestratorCard, { type: T }>;
 
@@ -190,62 +190,158 @@ function ProgressCard({ card }: { card: CardOf<"progress"> }) {
   );
 }
 
+const CHANGE_WORD = { added: "Added", removed: "Removed", changed: "Changed" } as const;
+
+/** The plan's sub-tasks in the order they are built: each after the ones it depends on (plan order otherwise). */
+function inBuildOrder(plan: HandoffPlan): HandoffPlan["subtasks"] {
+  const ordered: HandoffPlan["subtasks"] = [];
+  const placed = new Set<string>();
+  const known = new Set(plan.subtasks.map((st) => st.key));
+  while (ordered.length < plan.subtasks.length) {
+    const next = plan.subtasks.find((st) => !placed.has(st.key) && st.dependsOn.every((d) => placed.has(d) || !known.has(d))) ?? plan.subtasks.find((st) => !placed.has(st.key))!;
+    placed.add(next.key);
+    ordered.push(next);
+  }
+  return ordered;
+}
+
+function PlanBody({ plan, products }: { plan: HandoffPlan; products: Record<string, string> }) {
+  // Sub-tasks grouped by product and numbered in build order, so "after 1" means what it says.
+  const ordered = inBuildOrder(plan);
+  const numberOf = (key: string) => ordered.findIndex((st) => st.key === key) + 1;
+  const groups = [...new Set(ordered.map((st) => st.product))];
+  const titleOf = (key: string) => plan.subtasks.find((st) => st.key === key)?.title ?? key;
+  return (
+    <>
+      <p className="card-title plain">{plan.goal}</p>
+      <div className="section-label">Approach</div>
+      <p>{plan.approach}</p>
+      <ListBlock title="Constraints" items={plan.constraints} />
+      {plan.contracts.length > 0 && (
+        <>
+          <div className="section-label">Contracts between products</div>
+          <ul>
+            {plan.contracts.map((ct) => (
+              <li key={ct.name}>
+                <strong>{ct.name}</strong>: {ct.description}
+                <div className="muted small">
+                  Provided by: {ct.providers.map(titleOf).join("; ")} · used by: {ct.consumers.map(titleOf).join("; ")}
+                </div>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      <div className="section-label">Sub-tasks</div>
+      {groups.map((product) => (
+        <div key={product} className="plan-product">
+          {groups.length > 1 && <div className="plan-product-name">{products[product] ?? product}</div>}
+          <ol className="subtasks">
+            {ordered
+              .filter((st) => st.product === product)
+              .map((st) => (
+                <li key={st.key} value={numberOf(st.key)}>
+                  <details>
+                    <summary>
+                      {st.title} <span className="badge size">{st.size}</span>{" "}
+                      <span className="muted small">
+                        {st.repository}
+                        {st.dependsOn.length > 0 && ` · after ${st.dependsOn.map(numberOf).filter(Boolean).join(", ")}`}
+                      </span>
+                    </summary>
+                    <p>{st.description}</p>
+                    <ul className="criteria">
+                      {st.acceptanceCriteria.map((ac, j) => (
+                        <li key={j}>{ac}</li>
+                      ))}
+                    </ul>
+                    {st.dependsOn.length > 0 && <p className="muted small">After: {st.dependsOn.map(titleOf).join("; ")}</p>}
+                    {st.likelyFiles.length > 0 && <p className="muted small">Likely files: {st.likelyFiles.join(", ")}</p>}
+                  </details>
+                </li>
+              ))}
+          </ol>
+        </div>
+      ))}
+      <details>
+        <summary className="muted small">Out of scope, risks, assumptions, definition of done, rollout</summary>
+        <ListBlock title="Out of scope" items={plan.outOfScope} />
+        <ListBlock title="Risks" items={plan.risks} />
+        <ListBlock title="Assumptions" items={plan.assumptions} />
+        <ListBlock title="Definition of done" items={plan.definitionOfDone} />
+        {plan.rollout && (
+          <>
+            <div className="section-label">Rollout</div>
+            <p>{plan.rollout}</p>
+          </>
+        )}
+      </details>
+    </>
+  );
+}
+
+const PLAN_STATUS = {
+  draft: "The architect is still shaping this plan with you. Ask for changes in the conversation.",
+  proposed: "The architect put this version up for your approval. To change it, ask in the conversation; a new version replaces this one.",
+  approved: "You approved this version. It is what the agents build.",
+  expired: "The run ended before this plan was approved.",
+} as const;
+
+/**
+ * The hand-off plan: written by the architect agent, validated and rendered by the orchestrator.
+ * It is read-only. Changes are asked for in the conversation; approval is this card's button, bound to the version shown.
+ */
 function PlanCard({ card }: { card: CardOf<"plan"> }) {
   const { busy, error, run } = useDecision();
-  const [mode, setMode] = useState<"view" | "changes">("view");
-  const [feedback, setFeedback] = useState("");
-  const decide = (decision: "approve" | "changes" | "reject") =>
-    run(() => post(`/api/approvals/${card.approvalId}/plan`, { decision, feedback: decision === "changes" ? feedback : undefined, hash: card.hash }));
-  const pending = card.status === "pending";
+  const [versions, setVersions] = useState<PlanVersionDto[] | null>(null);
+  const [shown, setShown] = useState<number | null>(null);
+  const older = shown !== null && shown !== card.version ? versions?.find((v) => v.version === shown) : undefined;
+  const view = older ?? { version: card.version, plan: card.plan, changes: card.changes, promptedBy: card.promptedBy };
+  const browse = async (to: number) => {
+    const list = versions ?? (await api<PlanVersionDto[]>(`/api/runs/${card.runId}/plans`));
+    setVersions(list);
+    setShown(to);
+  };
+  const canApprove = card.status === "proposed" && card.approvalId && !older;
   return (
-    <div className={`card plan ${pending ? "needs-action" : ""}`}>
+    <div className={`card plan ${card.status === "proposed" ? "needs-action" : ""}`}>
       <div className="card-head">
-        <span className="kicker">Plan {pending ? "· your approval is needed" : ""}</span>
-        <StatusBadge status={card.status} />
+        <span className="kicker">Hand-off plan · written by the architect agent{card.status === "proposed" ? " · your approval is needed" : ""}</span>
+        <span className="badges">
+          <span className="version-nav">
+            <button className="ghost small" disabled={view.version <= 1} onClick={() => void browse(view.version - 1)} aria-label="Earlier version">
+              ‹
+            </button>
+            Version {view.version} of {card.version}
+            <button className="ghost small" disabled={view.version >= card.version} onClick={() => void browse(view.version + 1)} aria-label="Later version">
+              ›
+            </button>
+          </span>
+          <StatusBadge status={older ? "superseded" : card.status} />
+        </span>
       </div>
-      <p className="card-title">{card.plan.summary}</p>
-      <ol className="subtasks">
-        {card.plan.subtasks.map((s, i) => (
-          <li key={i}>
-            <details>
-              <summary>{s.title}</summary>
-              <p>{s.description}</p>
-              {s.acceptanceCriteria.length > 0 && (
-                <ul className="criteria">
-                  {s.acceptanceCriteria.map((c, j) => (
-                    <li key={j}>{c}</li>
-                  ))}
-                </ul>
-              )}
-            </details>
-          </li>
-        ))}
-      </ol>
-      {card.feedback && card.status === "changes_requested" && <p className="muted small">Requested changes: {card.feedback}</p>}
-      {pending && mode === "view" && (
-        <div className="actions">
-          <button className="primary" disabled={busy} onClick={() => void decide("approve")}>
-            Approve
-          </button>
-          <button disabled={busy} onClick={() => setMode("changes")}>
-            Request changes
-          </button>
-          <button className="danger ghost" disabled={busy} onClick={() => void decide("reject")}>
-            Reject
-          </button>
+      <p className="muted small">{older ? "An earlier version, kept for reference." : PLAN_STATUS[card.status]}</p>
+      {view.changes.length > 0 && (
+        <div className="plan-changes">
+          <div className="section-label">What changed since version {view.version - 1}</div>
+          {view.promptedBy && <p className="muted small">You asked: "{view.promptedBy}"</p>}
+          <ul>
+            {view.changes.map((ch, i) => (
+              <li key={i} className={`change ${ch.kind}`}>
+                {CHANGE_WORD[ch.kind]} {ch.what === "subtask" ? "sub-task" : ch.what === "contract" ? "contract" : ""} <strong>{ch.title}</strong>
+                {ch.fields?.length ? <span className="muted small"> ({ch.fields.join(", ")})</span> : null}
+              </li>
+            ))}
+          </ul>
         </div>
       )}
-      {pending && mode === "changes" && (
-        <div className="actions column">
-          <textarea value={feedback} onChange={(e) => setFeedback(e.target.value)} rows={3} placeholder="What should the plan do differently?" />
-          <div className="actions">
-            <button className="primary" disabled={busy || !feedback.trim()} onClick={() => void decide("changes")}>
-              Send feedback
-            </button>
-            <button className="ghost" onClick={() => setMode("view")}>
-              Back
-            </button>
-          </div>
+      <PlanBody plan={view.plan} products={card.products} />
+      {canApprove && (
+        <div className="actions">
+          <button className="primary" disabled={busy} onClick={() => void run(() => post(`/api/approvals/${card.approvalId}/plan`, { decision: "approve", hash: card.hash }))}>
+            Approve version {card.version}
+          </button>
+          <span className="muted small">Typing "approve" in the conversation approves nothing.</span>
         </div>
       )}
       {error && <p className="error small">{error}</p>}

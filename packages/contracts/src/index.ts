@@ -146,6 +146,144 @@ export const Analysis = z.object({
 });
 export type Analysis = z.infer<typeof Analysis>;
 
+// ---------------------------------------------------------------------------
+// Hand-off plan (FR-P2, FR-M3): written by the architect agent, approved by the requester
+// ---------------------------------------------------------------------------
+
+export const PlanSubtask = z.object({
+  key: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9-]{0,23}$/)
+    .describe("Short stable id in lowercase letters, digits and dashes, e.g. api-discount. Keep it the same across plan versions"),
+  title: z.string().min(3).max(200).describe("Short imperative title"),
+  description: z.string().min(1).max(4000).describe("What to change and why, with enough detail for an engineer"),
+  acceptanceCriteria: z.array(z.string().min(1)).min(1).max(12).describe("Checkable conditions that prove the sub-task is done"),
+  product: z.string().min(1).describe("Product id from the catalog"),
+  repository: z.string().min(3).describe("The one repository this sub-task changes, as owner/name"),
+  likelyFiles: z.array(z.string()).max(30).default([]).describe("Files or areas likely to change"),
+  dependsOn: z.array(z.string()).max(10).default([]).describe("Keys of the sub-tasks that must be done before this one"),
+  size: Size,
+});
+export type PlanSubtask = z.infer<typeof PlanSubtask>;
+
+/** An interface between products that the plan fixes before anyone builds (FR-M3). */
+export const PlanContract = z.object({
+  name: z.string().min(1).max(120),
+  description: z.string().min(1).max(3000).describe("The shape of the interface, its versioning and backward compatibility"),
+  providers: z.array(z.string()).max(10).default([]).describe("Keys of the sub-tasks that provide it"),
+  consumers: z.array(z.string()).max(10).default([]).describe("Keys of the sub-tasks that use it"),
+});
+export type PlanContract = z.infer<typeof PlanContract>;
+
+export const HandoffPlan = z.object({
+  goal: z.string().min(1).max(2000).describe("What the work achieves, for the requester"),
+  approach: z.string().min(1).max(4000).describe("How it will be done and why this way"),
+  outOfScope: z.array(z.string()).max(12).default([]),
+  risks: z.array(z.string()).max(12).default([]),
+  assumptions: z.array(z.string()).max(12).default([]),
+  constraints: z.array(z.string()).max(12).default([]).describe("What the requester asked to respect, e.g. 'do not change the public API'"),
+  definitionOfDone: z.array(z.string()).max(12).default([]),
+  contracts: z.array(PlanContract).max(10).default([]).describe("Interfaces between products, when more than one product is involved"),
+  rollout: z.string().max(2000).default("").describe("Order of changes across products, merge order, feature flags where needed"),
+  subtasks: z.array(PlanSubtask).min(1).max(20).describe("Each sub-task changes exactly one repository and is reviewed and merged on its own"),
+});
+export type HandoffPlan = z.infer<typeof HandoffPlan>;
+
+export interface PlanChange {
+  kind: "added" | "removed" | "changed";
+  what: "subtask" | "contract" | "plan";
+  /** The sub-task title, the contract name, or the name of the plan section. */
+  title: string;
+  /** For a changed sub-task or contract: which of its fields differ. */
+  fields?: string[];
+}
+
+const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+const PLAN_SECTIONS: [keyof HandoffPlan, string][] = [
+  ["goal", "Goal"],
+  ["approach", "Approach"],
+  ["outOfScope", "Out of scope"],
+  ["risks", "Risks"],
+  ["assumptions", "Assumptions"],
+  ["constraints", "Constraints"],
+  ["definitionOfDone", "Definition of done"],
+  ["rollout", "Rollout"],
+];
+const SUBTASK_FIELDS: [keyof PlanSubtask, string][] = [
+  ["title", "title"],
+  ["description", "description"],
+  ["acceptanceCriteria", "acceptance criteria"],
+  ["product", "product"],
+  ["repository", "repository"],
+  ["likelyFiles", "likely files"],
+  ["dependsOn", "dependencies"],
+  ["size", "size"],
+];
+
+/** What changed between two plan versions, shown on the plan card (FR-P3). Sub-tasks are matched by key. */
+export function diffPlans(previous: HandoffPlan | null, next: HandoffPlan): PlanChange[] {
+  if (!previous) return [];
+  const changes: PlanChange[] = [];
+  for (const [field, title] of PLAN_SECTIONS) if (!same(previous[field], next[field])) changes.push({ kind: "changed", what: "plan", title });
+  const before = new Map(previous.subtasks.map((st) => [st.key, st]));
+  const after = new Map(next.subtasks.map((st) => [st.key, st]));
+  for (const st of next.subtasks) {
+    const old = before.get(st.key);
+    if (!old) changes.push({ kind: "added", what: "subtask", title: st.title });
+    else {
+      const fields = SUBTASK_FIELDS.filter(([f]) => !same(old[f], st[f])).map(([, label]) => label);
+      if (fields.length) changes.push({ kind: "changed", what: "subtask", title: st.title, fields });
+    }
+  }
+  for (const st of previous.subtasks) if (!after.has(st.key)) changes.push({ kind: "removed", what: "subtask", title: st.title });
+  if (!same(previous.subtasks.map((st) => st.key).filter((k) => after.has(k)), next.subtasks.map((st) => st.key).filter((k) => before.has(k)))) {
+    changes.push({ kind: "changed", what: "plan", title: "Order of sub-tasks" });
+  }
+  const contractsBefore = new Map(previous.contracts.map((c) => [c.name, c]));
+  const contractsAfter = new Map(next.contracts.map((c) => [c.name, c]));
+  for (const c of next.contracts) {
+    const old = contractsBefore.get(c.name);
+    if (!old) changes.push({ kind: "added", what: "contract", title: c.name });
+    else if (!same(old, c)) changes.push({ kind: "changed", what: "contract", title: c.name });
+  }
+  for (const c of previous.contracts) if (!contractsAfter.has(c.name)) changes.push({ kind: "removed", what: "contract", title: c.name });
+  return changes;
+}
+
+/**
+ * The order in which sub-tasks are built: every sub-task after the ones it depends on, otherwise in plan order.
+ * Returns null when the dependencies form a cycle.
+ */
+export function buildOrder(plan: HandoffPlan): PlanSubtask[] | null {
+  const done = new Set<string>();
+  const ordered: PlanSubtask[] = [];
+  const known = new Set(plan.subtasks.map((st) => st.key));
+  while (ordered.length < plan.subtasks.length) {
+    const next = plan.subtasks.find((st) => !done.has(st.key) && st.dependsOn.every((d) => done.has(d) || !known.has(d)));
+    if (!next) return null;
+    done.add(next.key);
+    ordered.push(next);
+  }
+  return ordered;
+}
+
+export type PlanVersionStatus = "draft" | "proposed" | "approved" | "superseded";
+
+/** One immutable version of a run's hand-off plan (AD-36). */
+export interface PlanVersionDto {
+  runId: string;
+  version: number;
+  hash: string;
+  plan: HandoffPlan;
+  status: PlanVersionStatus;
+  /** What changed compared with the version before. */
+  changes: PlanChange[];
+  /** The agent profile that wrote it, and the requester's request that prompted it. */
+  author: string;
+  promptedBy: string | null;
+  createdAt: string;
+}
+
 export interface TrackDecision {
   track: Track;
   /** What the analyst proposed; the rules may have overruled it. */
@@ -166,13 +304,6 @@ export const Plan = z.object({
 });
 export type Plan = z.infer<typeof Plan>;
 
-export const Assessment = z.object({
-  ready: z.boolean().describe("true when the issue is clear enough to plan and implement"),
-  questions: z.array(z.string()).max(5).describe("Clarifying questions for the requester when ready is false; empty otherwise"),
-  plan: Plan.optional().describe("The plan when ready is true"),
-});
-export type Assessment = z.infer<typeof Assessment>;
-
 export const QuestionRound = z.object({ questions: z.array(z.string()), answer: z.string() });
 export type QuestionRound = z.infer<typeof QuestionRound>;
 
@@ -184,6 +315,7 @@ export const RunState = z.enum([
   "intake",
   "analysing",
   "planning",
+  "designing",
   "awaiting_answers",
   "awaiting_approval",
   "executing",
@@ -199,7 +331,7 @@ export type RunState = z.infer<typeof RunState>;
 
 export const FINAL_RUN_STATES: readonly RunState[] = ["completed", "closed", "cancelled", "failed"];
 
-export const StepKind = z.enum(["analyse", "plan", "implement", "review"]);
+export const StepKind = z.enum(["analyse", "plan", "design", "implement", "review"]);
 export type StepKind = z.infer<typeof StepKind>;
 
 export const StepState = z.enum(["pending", "running", "succeeded", "failed"]);
@@ -315,6 +447,55 @@ export type SubtaskState = z.infer<typeof SubtaskState>;
 
 export const FINAL_SUBTASK_STATES: readonly SubtaskState[] = ["merged", "closed", "handed_over", "cancelled", "failed"];
 
+// ---------------------------------------------------------------------------
+// Design session (FR-P1, AD-34, AD-35): turns of the architect agent in a session workspace
+// ---------------------------------------------------------------------------
+
+export const DesignTurnInput = z.object({
+  turnId: z.string(),
+  /** The first turn has no message: the architect opens the session from the analysis. */
+  opening: z.boolean(),
+  messages: z.array(z.string()),
+});
+export type DesignTurnInput = z.infer<typeof DesignTurnInput>;
+
+export const DesignTurnResult = z.object({
+  turnId: z.string(),
+  status: z.enum(["succeeded", "failed"]),
+  /** The architect's reply, as markdown. */
+  text: z.string().max(40000).default(""),
+  components: z.array(z.unknown()).max(10).default([]),
+  /** The plan the architect submitted in this turn, already checked by the gateway. */
+  plan: HandoffPlan.optional(),
+  /** True when the architect put the plan up for the requester's approval. */
+  proposed: z.boolean().default(false),
+  /** How the session started in this workspace, for the record: new, restored from a checkpoint, or rebuilt from the record. */
+  session: z.enum(["new", "restored", "rebuilt", "continued"]).default("continued"),
+  error: z.string().optional(),
+});
+export type DesignTurnResult = z.infer<typeof DesignTurnResult>;
+
+/** What a design step's brief adds: how to start or restore the architect's session. */
+export const DesignBrief = z.object({
+  sessionId: z.string(),
+  hasCheckpoint: z.boolean(),
+  /** The conversation so far and the latest plan: the record a session is rebuilt from when no checkpoint can be restored. */
+  history: z.array(z.object({ role: z.enum(["requester", "architect"]), text: z.string() })).default([]),
+  latestPlan: HandoffPlan.optional(),
+  latestVersion: z.number().int().optional(),
+});
+export type DesignBrief = z.infer<typeof DesignBrief>;
+
+export type DesignSessionState = "active" | "suspending" | "suspended" | "closed";
+
+export interface DesignSessionDto {
+  runId: string;
+  state: DesignSessionState;
+  /** True while the architect is working on a reply. */
+  turnRunning: boolean;
+  turns: number;
+}
+
 /** One repository checked out in a workspace (AD-37). At most one is writable. */
 export const BriefRepository = z.object({
   index: z.number().int().nonnegative(),
@@ -364,6 +545,8 @@ export const StepBrief = z.object({
   /** Review: what the implementer said it did (a claim to verify) and what the product's commands reported. */
   implementerSummary: z.string().optional(),
   verification: Verification.optional(),
+  /** Design steps: the session to start or restore. */
+  design: DesignBrief.optional(),
   commitAuthor: z.object({ name: z.string(), email: z.string() }),
   timeoutMinutes: z.number().int().positive(),
 });
@@ -373,7 +556,6 @@ export const StepResult = z.object({
   status: z.enum(["succeeded", "failed"]),
   summary: z.string(),
   analysis: Analysis.optional(),
-  assessment: Assessment.optional(),
   review: ReviewReport.optional(),
   verification: Verification.optional(),
   commits: z.number().int().nonnegative().optional(),
@@ -451,14 +633,22 @@ export const ProgressCard = z.object({
   headline: z.string(),
   steps: z.array(ProgressStep),
 });
+/** The hand-off plan of a guided run: read-only, with its versions; approval is a button bound to one version (FR-P3, FR-P4). */
 export const PlanCard = z.object({
   type: z.literal("plan"),
   runId: z.string(),
-  approvalId: z.string(),
+  version: z.number().int(),
   hash: z.string(),
-  plan: Plan,
-  status: z.enum(["pending", "approved", "changes_requested", "rejected", "expired"]),
-  feedback: z.string().optional(),
+  plan: HandoffPlan,
+  /** draft: the architect is still shaping it; proposed: waiting for the requester's approval. */
+  status: z.enum(["draft", "proposed", "approved", "expired"]),
+  /** Set while the version is proposed. */
+  approvalId: z.string().optional(),
+  changes: z.array(z.object({ kind: z.enum(["added", "removed", "changed"]), what: z.enum(["subtask", "contract", "plan"]), title: z.string(), fields: z.array(z.string()).optional() })),
+  /** The requester's request that led to this version. */
+  promptedBy: z.string().nullable(),
+  /** Product names, for grouping the sub-tasks. */
+  products: z.record(z.string(), z.string()),
 });
 export const QuestionsCard = z.object({
   type: z.literal("questions"),
@@ -708,6 +898,9 @@ export interface SubtaskDto {
   prUrl: string | null;
   /** The sub-task's own conversation on the guided track; null on the fast track, where the run's conversation is used. */
   conversationId: string | null;
+  /** The sub-issue that mirrors the sub-task on the ticket (FR-P5). */
+  ticketNumber: number | null;
+  ticketUrl: string | null;
   review: SubtaskReview | null;
   verification: Verification | null;
   fixRounds: number;
@@ -863,11 +1056,8 @@ export type StreamNotice =
 // Decisions sent from the UI
 // ---------------------------------------------------------------------------
 
-export const PlanDecision = z.object({
-  decision: z.enum(["approve", "changes", "reject"]),
-  feedback: z.string().max(4000).optional(),
-  hash: z.string(),
-});
+/** Approval of one plan version. Changes are asked for in the conversation with the architect, never here (FR-P3). */
+export const PlanDecision = z.object({ decision: z.literal("approve"), hash: z.string() });
 export type PlanDecision = z.infer<typeof PlanDecision>;
 
 export const RiskDecision = z.object({ decision: z.enum(["approve", "reject"]), hash: z.string() });
@@ -890,7 +1080,8 @@ export type QuestionAnswer = z.infer<typeof QuestionAnswer>;
 
 // Activities served by workspace-manager on the `workspaces` task queue.
 export interface WorkspaceActivities {
-  createWorkspace(input: { stepId: string; runId: string }): Promise<{ containerId: string }>;
+  /** `session`: a design-session workspace, which lives much longer than a step's (AD-34). */
+  createWorkspace(input: { stepId: string; runId: string; session?: boolean }): Promise<{ containerId: string }>;
   destroyWorkspace(input: { stepId: string }): Promise<void>;
 }
 
@@ -911,7 +1102,7 @@ export interface DeliveryRunInput {
 }
 
 /** Memo set on runs started by this version; older executions are retired at worker start. */
-export const RUN_WORKFLOW_GENERATION = 3;
+export const RUN_WORKFLOW_GENERATION = 4;
 
 export const workflowIdForIssue = (repo: RepoRef, number: number) => `run:github:${repo.owner}/${repo.name}#${number}`;
 
@@ -930,3 +1121,10 @@ export interface AnswerSignal {
 export interface CancelSignal {
   reason: string;
 }
+/** A message of the requester for the architect, delivered to the design session of a run. */
+export interface RequesterMessageSignal {
+  messageId: string;
+  text: string;
+}
+
+export const designWorkflowId = (runId: string) => `design:${runId}`;

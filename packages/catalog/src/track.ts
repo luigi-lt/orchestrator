@@ -4,12 +4,14 @@
  */
 import { classifyRisk, matchesAnyGlob } from "@orch/common";
 import {
+  buildOrder,
   findCatalogProduct,
   findCatalogRepository,
   workItemType,
   type Analysis,
   type Catalog,
   type CatalogRepository,
+  type HandoffPlan,
   type TrackDecision,
 } from "@orch/contracts";
 
@@ -97,4 +99,36 @@ export function fastTrackLimitsExceeded(changedFiles: readonly string[], reposit
   const contracts = repository ? changedFiles.filter((f) => matchesAnyGlob(f, repository.contractPaths)) : [];
   if (contracts.length) reasons.push(`The change touches an interface of ${repository!.product} (${contracts.join(", ")})`);
   return reasons;
+}
+
+/**
+ * The checks a hand-off plan must pass before it is stored as a version (FR-P2, AD-36). Problems go back
+ * to the architect, so it can correct the plan in the same turn.
+ */
+export function validateHandoffPlan(plan: HandoffPlan, catalog: Catalog): string[] {
+  const errors: string[] = [];
+  const keys = new Set<string>();
+  for (const st of plan.subtasks) {
+    if (keys.has(st.key)) errors.push(`Sub-task key "${st.key}" is used twice; every sub-task needs its own key.`);
+    keys.add(st.key);
+  }
+  for (const st of plan.subtasks) {
+    const product = findCatalogProduct(catalog, st.product);
+    const repo = findCatalogRepository(catalog, st.repository);
+    if (!product) errors.push(`Sub-task "${st.key}": unknown product "${st.product}". Products in the catalog: ${catalog.products.map((p) => p.id).join(", ")}.`);
+    if (!repo) errors.push(`Sub-task "${st.key}": repository "${st.repository}" is not in the catalog. A sub-task changes exactly one catalog repository.`);
+    else if (product && repo.product !== product.id) errors.push(`Sub-task "${st.key}": repository "${st.repository}" belongs to product "${repo.product}", not "${product.id}".`);
+    for (const dep of st.dependsOn) {
+      if (dep === st.key) errors.push(`Sub-task "${st.key}" depends on itself.`);
+      else if (!keys.has(dep)) errors.push(`Sub-task "${st.key}" depends on "${dep}", which is not a sub-task of this plan.`);
+    }
+  }
+  if (!errors.length && !buildOrder(plan)) errors.push("The dependencies between sub-tasks form a cycle; no sub-task could start.");
+  for (const c of plan.contracts) {
+    for (const key of [...c.providers, ...c.consumers]) {
+      if (!keys.has(key)) errors.push(`Contract "${c.name}" names "${key}", which is not a sub-task of this plan.`);
+    }
+    if (!c.providers.length || !c.consumers.length) errors.push(`Contract "${c.name}" must name the sub-tasks that provide it and those that use it.`);
+  }
+  return errors;
 }

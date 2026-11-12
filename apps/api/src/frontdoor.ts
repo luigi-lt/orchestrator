@@ -159,7 +159,7 @@ export class FrontDoor {
             trackReasons: run.trackReasons,
             products: run.products,
             analysis: run.analysis ? { understanding: run.analysis.understanding, size: run.analysis.size, approach: run.analysis.approach } : null,
-            plan: run.plan,
+            plan: run.plan ? { summary: run.plan.summary, subtasks: run.plan.subtasks.map((st) => st.title) } : null,
             pullRequest: run.prUrl,
             subtasks: subtasks.map((st) => ({
               number: st.index + 1,
@@ -182,7 +182,7 @@ export class FrontDoor {
         handler: async ({ runId, card }: { runId: string; card: "analysis" | "plan" | "progress" | "pull_request" | "work_item" }) => {
           const prefix = {
             analysis: `run:${runId}:analysis`,
-            plan: `run:${runId}:plan:`,
+            plan: `run:${runId}:plan`,
             progress: `run:${runId}:progress`,
             pull_request: `run:${runId}:pr`,
             work_item: `run:${runId}:work_item`,

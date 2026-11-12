@@ -12,6 +12,8 @@ export interface GitHubUser {
 }
 
 export interface GitHubIssue {
+  /** GitHub's own id of the issue (not its number); needed to attach it as a sub-issue. */
+  id: number;
   number: number;
   title: string;
   body: string;
@@ -49,6 +51,7 @@ export class GitHubError extends Error {
 }
 
 interface RawIssue {
+  id?: number;
   number: number;
   title: string;
   body: string | null;
@@ -61,6 +64,7 @@ interface RawIssue {
 }
 
 const toIssue = (r: RawIssue): GitHubIssue => ({
+  id: r.id ?? 0,
   number: r.number,
   title: r.title,
   body: r.body ?? "",
@@ -143,9 +147,34 @@ export class GitHubClient {
     return toIssue(data!);
   }
 
-  async createIssue(repo: RepoRef, title: string, body: string): Promise<GitHubIssue> {
-    const { data } = await this.request<RawIssue>("POST", `${this.repoPath(repo)}/issues`, { body: { title, body } });
+  async createIssue(repo: RepoRef, title: string, body: string, labels: string[] = []): Promise<GitHubIssue> {
+    const { data } = await this.request<RawIssue>("POST", `${this.repoPath(repo)}/issues`, { body: { title, body, labels } });
     return toIssue(data!);
+  }
+
+  /** Open and closed issues carrying a label (used to find the sub-issues the orchestrator created). */
+  async listIssuesByLabel(repo: RepoRef, label: string): Promise<GitHubIssue[]> {
+    const q = new URLSearchParams({ labels: label, state: "all", per_page: "100" });
+    const { data } = await this.request<RawIssue[]>("GET", `${this.repoPath(repo)}/issues?${q}`);
+    return (data ?? []).filter((i) => !i.pull_request).map(toIssue);
+  }
+
+  /**
+   * Attaches an issue as a sub-issue of another, which may be in another repository.
+   * Returns false when GitHub refuses (the feature is off, or the link is not allowed), so the caller can fall back.
+   */
+  async addSubIssue(parentRepo: RepoRef, parentNumber: number, childIssueId: number): Promise<boolean> {
+    try {
+      await this.request("POST", `${this.repoPath(parentRepo)}/issues/${parentNumber}/sub_issues`, { body: { sub_issue_id: childIssueId } });
+      return true;
+    } catch (err) {
+      if (err instanceof GitHubError && !err.retryable) return false;
+      throw err;
+    }
+  }
+
+  async closeIssue(repo: RepoRef, number: number, reason: "completed" | "not_planned" = "completed"): Promise<void> {
+    await this.request("PATCH", `${this.repoPath(repo)}/issues/${number}`, { body: { state: "closed", state_reason: reason }, allow404: true });
   }
 
   /** Who most recently added the label, from the issue's event history. */

@@ -8,6 +8,7 @@ import {
   catalogRepositories,
   workflowIdForIssue,
   type DeliveryRunInput,
+  type HandoffPlan,
   type RepoRef,
   type Track,
   type WorkItem,
@@ -91,6 +92,73 @@ export async function setTrackLabel(input: { repo: RepoRef; number: number; trac
   for (const t of Object.values(TRACK_LABELS)) await gh((c) => c.ensureLabel(input.repo, t.name, t.color, t.description));
   await gh((c) => c.removeLabel(input.repo, input.number, TRACK_LABELS[other].name));
   await gh((c) => c.addLabels(input.repo, input.number, [TRACK_LABELS[input.track].name]));
+}
+
+const LABEL_SUBTASK = "ai-subtask";
+
+export interface SubIssue {
+  key: string;
+  repo: RepoRef;
+  number: number;
+  url: string;
+}
+
+/**
+ * Mirrors an approved plan on the ticket (FR-P5): a summary comment on the story, and one sub-issue per
+ * sub-task in the repository it changes, attached to the story. Where GitHub refuses the attachment
+ * (R-15), the story gets a checklist with links instead. Idempotent: a sub-issue carries a marker.
+ */
+export async function mirrorPlanOnTicket(input: { runId: string; workItem: WorkItem; plan: HandoffPlan; version: number; order: string[] }): Promise<{ subIssues: SubIssue[]; attached: number }> {
+  const story = input.workItem;
+  const storyRef = `${story.repo.owner}/${story.repo.name}#${story.number}`;
+  const ordered = input.order.map((k) => input.plan.subtasks.find((st) => st.key === k)!).filter(Boolean);
+  const subIssues: SubIssue[] = [];
+  let attached = 0;
+  for (const [index, st] of ordered.entries()) {
+    const [owner, name] = st.repository.split("/") as [string, string];
+    const repo = { owner, name };
+    const marker = MARKER(`run=${input.runId}:subtask=${st.key}`);
+    await gh((c) => c.ensureLabel(repo, LABEL_SUBTASK, "c5def5", "A sub-task built by the orchestrator's agents"));
+    let issue = (await gh((c) => c.listIssuesByLabel(repo, LABEL_SUBTASK))).find((i) => i.body.includes(marker));
+    if (!issue) {
+      const body = [
+        st.description,
+        "",
+        "**Acceptance criteria**",
+        ...st.acceptanceCriteria.map((c) => `- [ ] ${c}`),
+        "",
+        `Sub-task ${index + 1} of ${ordered.length} of ${storyRef}. It is built by an agent; follow it in the orchestrator web app.`,
+        ...(st.dependsOn.length ? [`Depends on: ${st.dependsOn.map((d) => input.plan.subtasks.find((x) => x.key === d)?.title ?? d).join("; ")}`] : []),
+        "",
+        marker,
+      ].join("\n");
+      issue = await gh((c) => c.createIssue(repo, st.title, body, [LABEL_SUBTASK]));
+    }
+    if (await gh((c) => c.addSubIssue(story.repo, story.number, issue!.id))) attached++;
+    subIssues.push({ key: st.key, repo, number: issue.number, url: issue.url });
+  }
+  const list = subIssues.map((si, n) => `- [ ] ${ordered[n]!.title} — ${si.repo.owner}/${si.repo.name}#${si.number}`);
+  await commentOnIssue({
+    repo: story.repo,
+    number: story.number,
+    key: `run=${input.runId}:plan=v${input.version}`,
+    body: [
+      `🤖 **Plan approved** (version ${input.version})`,
+      "",
+      input.plan.goal,
+      "",
+      `**Approach:** ${input.plan.approach}`,
+      "",
+      attached === subIssues.length ? "**Sub-tasks** (sub-issues of this ticket)" : "**Sub-tasks**",
+      ...list,
+    ].join("\n"),
+  });
+  return { subIssues, attached };
+}
+
+/** Closes the sub-issue of a sub-task once its pull request is merged. */
+export async function closeSubIssue(input: { repo: RepoRef; number: number }): Promise<void> {
+  await gh((c) => c.closeIssue(input.repo, input.number));
 }
 
 export async function finalizeIssue(input: { repo: RepoRef; number: number; outcome: "completed" | "closed" | "cancelled" | "failed" }): Promise<void> {

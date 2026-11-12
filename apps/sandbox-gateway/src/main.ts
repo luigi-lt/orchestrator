@@ -4,21 +4,27 @@
  * catalog repositories; validates analyses against the catalog; receives progress and results.
  */
 import { createReadStream, createWriteStream, existsSync } from "node:fs";
-import { readFile, rename } from "node:fs/promises";
+import { mkdir, readFile, rename } from "node:fs/promises";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import type { Readable } from "node:stream";
 import Fastify, { type FastifyRequest } from "fastify";
-import { validateAnalysis } from "@orch/catalog";
-import { config, log, tokenHash, verifyWorkspaceToken } from "@orch/common";
-import { Analysis, ProgressEvent, StepBrief, StepResult, findCatalogRepository, repoSlug } from "@orch/contracts";
+import { validateAnalysis, validateHandoffPlan } from "@orch/catalog";
+import { config, log, sleep, tokenHash, verifyWorkspaceToken } from "@orch/common";
+import { Analysis, DesignTurnResult, HandoffPlan, ProgressEvent, StepBrief, StepResult, findCatalogRepository, repoSlug } from "@orch/contracts";
 import {
+  completeDesignTurn,
   completeStep,
   connectStore,
   createRepositoryRequest,
   getCatalogForRun,
+  getDesignSession,
   getRepositoryRequest,
+  getRun,
   getStep,
+  notify,
+  saveDesignSession,
+  takeDesignTurn,
   insertProgress,
   listRepositoryRequests,
   markStepRunning,
@@ -78,7 +84,7 @@ async function main(): Promise<void> {
     if (!step) return reply.code(401).send({ error: "unauthorized" });
     const parsed = RepositoryRequest.safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: "invalid repository request" });
-    if (step.kind !== "analyse") return reply.code(403).send({ error: "This step cannot open more repositories" });
+    if (step.kind !== "analyse" && step.kind !== "design") return reply.code(403).send({ error: "This step cannot open more repositories" });
     const catalog = await getCatalogForRun(db, step.runId);
     const entry = catalog ? findCatalogRepository(catalog, parsed.data.repository) : undefined;
     const reason = parsed.data.reason ?? null;
@@ -140,6 +146,113 @@ async function main(): Promise<void> {
     await touchStep(db, step.id);
     await insertProgress(db, step.id, step.runId, parsed.data.events);
     return { ok: true };
+  });
+
+  // --- Design session (AD-34, AD-35): turns for the architect's session workspace ------------------
+
+  const checkpointFile = (runId: string) => join(artifacts, `design-${runId}`, "checkpoint.tgz");
+
+  /** The workspace that holds the session now; a workspace that was replaced is told to stop. */
+  const sessionStep = async (req: FastifyRequest) => {
+    const step = await authenticate(req);
+    if (!step || step.kind !== "design") return null;
+    const session = await getDesignSession(db, step.runId);
+    return session && session.stepId === step.id ? { step, session } : null;
+  };
+
+  const typing = async (runId: string, on: boolean) => {
+    const conversationId = (await getRun(db, runId))?.conversationId;
+    if (conversationId) await notify(db, { t: "typing", c: conversationId, on });
+  };
+
+  // Long poll: the next turn, or the request to save the session and stop, or to just stop.
+  app.get<{ Querystring: { wait?: string } }>("/v1/session/turn", async (req, reply) => {
+    const deadline = Date.now() + Math.min(25, Math.max(0, Number(req.query.wait) || 0)) * 1000;
+    for (;;) {
+      const current = await sessionStep(req);
+      if (!current) return reply.code(401).send({ error: "unauthorized" });
+      if (current.session.state === "closed") return { close: true };
+      if (current.session.state === "suspending") return { checkpoint: true };
+      const turn = await takeDesignTurn(db, current.step.runId);
+      if (turn) {
+        await touchStep(db, current.step.id);
+        await typing(current.step.runId, true);
+        return { turn: turn.input };
+      }
+      if (Date.now() >= deadline) return {};
+      await sleep(700);
+    }
+  });
+
+  // The reply as it is written: passed on to the conversation, never stored and never part of a workflow.
+  app.post("/v1/session/delta", async (req, reply) => {
+    const current = await sessionStep(req);
+    if (!current) return reply.code(401).send({ error: "unauthorized" });
+    const parsed = z.object({ text: z.string().max(20000) }).safeParse(req.body);
+    const conversationId = (await getRun(db, current.step.runId))?.conversationId;
+    if (parsed.success && conversationId) {
+      for (let i = 0; i < parsed.data.text.length; i += 3000) {
+        await notify(db, { t: "delta", c: conversationId, tempId: conversationId, text: parsed.data.text.slice(i, i + 3000) });
+      }
+    }
+    return { ok: true };
+  });
+
+  /** Problems of a hand-off plan against the catalog the run pinned and the plan rules (FR-P2). */
+  const planProblems = async (runId: string, plan: HandoffPlan): Promise<string[]> => {
+    const catalog = await getCatalogForRun(db, runId);
+    return catalog ? validateHandoffPlan(plan, catalog) : ["The run has no product catalog"];
+  };
+
+  // submit_plan checks here first, so the architect can correct the plan in the same turn.
+  app.post("/v1/session/plan/check", async (req, reply) => {
+    const current = await sessionStep(req);
+    if (!current) return reply.code(401).send({ error: "unauthorized" });
+    const parsed = HandoffPlan.safeParse(req.body);
+    if (!parsed.success) return { problems: parsed.error.issues.slice(0, 8).map((i) => `${i.path.join(".")}: ${i.message}`) };
+    return { problems: await planProblems(current.step.runId, parsed.data) };
+  });
+
+  app.post("/v1/session/turn-result", async (req, reply) => {
+    const current = await sessionStep(req);
+    if (!current) return reply.code(401).send({ error: "unauthorized" });
+    const parsed = DesignTurnResult.safeParse(req.body);
+    if (!parsed.success) return reply.code(400).send({ error: "invalid turn result", issues: parsed.error.issues.slice(0, 5) });
+    let result = parsed.data;
+    // Nothing the architect writes is taken on trust: a plan in the result is checked again before the workflow stores it.
+    if (result.plan) {
+      const problems = await planProblems(current.step.runId, result.plan);
+      if (problems.length) result = { ...result, plan: undefined, proposed: false, error: `The plan was rejected: ${problems.join(" ")}`.slice(0, 2000) };
+    }
+    // Only a turn of this workspace's own run can be answered, whatever turn id the result names.
+    if (!(await completeDesignTurn(db, current.step.runId, result.turnId, result))) {
+      log("sandbox-gateway", `turn result ignored: ${result.turnId} is not an open turn of ${current.step.runId}`);
+    }
+    await touchStep(db, current.step.id);
+    await typing(current.step.runId, false);
+    return { ok: true };
+  });
+
+  // A saved session is the runtime's own state, far smaller than this limit; the limit bounds what a sandbox can store.
+  app.put("/v1/session/checkpoint", { bodyLimit: 256 * 1024 * 1024 }, async (req, reply) => {
+    const current = await sessionStep(req);
+    if (!current) return reply.code(401).send({ error: "unauthorized" });
+    const target = checkpointFile(current.step.runId);
+    await mkdir(join(target, ".."), { recursive: true });
+    await pipeline(req.body as Readable, createWriteStream(`${target}.partial`));
+    await rename(`${target}.partial`, target);
+    await saveDesignSession(db, current.step.runId, { hasCheckpoint: true });
+    log("sandbox-gateway", `design session of ${current.step.runId} saved`);
+    return { ok: true };
+  });
+
+  app.get("/v1/session/checkpoint", async (req, reply) => {
+    const current = await sessionStep(req);
+    if (!current) return reply.code(401).send({ error: "unauthorized" });
+    const file = checkpointFile(current.step.runId);
+    if (!existsSync(file)) return reply.code(404).send({ error: "no checkpoint" });
+    reply.header("content-type", "application/octet-stream");
+    return reply.send(createReadStream(file));
   });
 
   app.put("/v1/step/result-bundle", { bodyLimit: 1024 * 1024 * 1024 }, async (req, reply) => {

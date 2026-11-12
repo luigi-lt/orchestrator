@@ -67,9 +67,9 @@ function withMirrorLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {
 
 /**
  * Writes a git bundle of a repository's branch for a read-only checkout in a workspace (AD-24, AD-37).
- * The repository is fetched with the requester's token into a cached bare mirror; returns the bundled commit.
+ * The repository is fetched with the requester's token into a cached bare mirror; returns the bundled commit and its ref.
  */
-export async function bundleReadOnly(repo: RepoRef, branch: string, target: string): Promise<string> {
+export async function bundleReadOnly(repo: RepoRef, branch: string, target: string, pin?: string): Promise<{ commit: string; ref: string }> {
   const dir = mirrorDir(repo);
   const { url, env } = remoteFor(repo);
   return withMirrorLock(dir, async () => {
@@ -78,8 +78,15 @@ export async function bundleReadOnly(repo: RepoRef, branch: string, target: stri
       await git(["init", "--bare", "--quiet", dir]);
     }
     await git(["fetch", "--no-tags", "--prune", url, `+refs/heads/${branch}:refs/heads/${branch}`], { cwd: dir, env });
-    const commit = (await git(["rev-parse", `refs/heads/${branch}`], { cwd: dir })).trim();
-    await git(["bundle", "create", target, `refs/heads/${branch}`], { cwd: dir });
-    return commit;
+    let commit = (await git(["rev-parse", `refs/heads/${branch}`], { cwd: dir })).trim();
+    let ref = branch;
+    // A design session keeps the commits it opened: a restored workspace gets the same code (AD-34).
+    if (pin && pin !== commit && (await git(["cat-file", "-e", `${pin}^{commit}`], { cwd: dir }).then(() => true, () => false))) {
+      ref = `orch-pin-${pin.slice(0, 12)}`;
+      await git(["branch", "-f", ref, pin], { cwd: dir });
+      commit = pin;
+    }
+    await git(["bundle", "create", target, `refs/heads/${ref}`], { cwd: dir });
+    return { commit, ref };
   });
 }

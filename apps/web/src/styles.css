@@ -270,3 +270,24 @@ table.tickets .badge.pending { margin-left: 8px; }
 .subtask-detail { border-top: 1px solid var(--border); padding: 10px 0; }
 .subtask-detail:first-of-type { border-top: 0; }
 .subtask-detail .meta { margin: 4px 0; }
+
+/* Increment 3: design session and plan versions */
+.design-strip {
+  padding: 8px 16px; font-size: 13px; border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--orch) 9%, var(--surface)); color: var(--text);
+}
+.design-strip.suspended, .design-strip.suspending { background: color-mix(in srgb, var(--warning) 10%, var(--surface)); }
+.badge.designing { background: color-mix(in srgb, var(--orch) 16%, transparent); color: var(--orch); }
+.badge.draft, .badge.superseded { background: var(--surface-2); color: var(--muted); }
+.badge.proposed { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
+.version-nav { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.card.plan .badges { flex-shrink: 0; }
+.plan-summary { white-space: pre-wrap; }
+.bubble.streaming { white-space: pre-wrap; }
+.version-nav button { padding: 0 6px; border: 0; }
+.plan-changes { border: 1px dashed var(--border); border-radius: 8px; padding: 2px 12px 6px; margin: 8px 0; }
+.plan-changes .change.added strong { color: var(--success); }
+.plan-changes .change.removed strong { color: var(--danger); text-decoration: line-through; }
+.plan-product-name { font-weight: 600; margin-top: 8px; }
+.plan-versions { list-style: none; padding-left: 0; }
+.plan-versions li { padding: 3px 0; }

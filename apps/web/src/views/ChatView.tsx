@@ -92,8 +92,16 @@ function EmptyState({ onStart }: { onStart: () => void }) {
   );
 }
 
+interface DesignState {
+  runId: string;
+  state: "active" | "suspending" | "suspended" | "closed";
+  turnRunning: boolean;
+}
+
 function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] }) {
   const [messages, setMessages] = useState<MessageDto[]>([]);
+  // Set while the run's design session is open: messages here go to the architect agent (AD-38).
+  const [design, setDesign] = useState<DesignState | null>(null);
   const [streaming, setStreaming] = useState("");
   const [typing, setTyping] = useState(false);
   const [draft, setDraft] = useState("");
@@ -111,8 +119,9 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
   }, []);
 
   const loadAfter = useCallback(async () => {
-    const data = await api<{ messages: MessageDto[]; busy: boolean }>(`/api/conversations/${id}?after=${maxVersion.current}`);
+    const data = await api<{ messages: MessageDto[]; busy: boolean; design: DesignState | null }>(`/api/conversations/${id}?after=${maxVersion.current}`);
     merge(data.messages);
+    setDesign(data.design);
     return data;
   }, [id, merge]);
 
@@ -121,13 +130,15 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
     void loadAfter().then((d) => setTyping(d.busy));
     return subscribe((n) => {
       if (n.t === "msg" && n.c === id && n.v > maxVersion.current) void loadAfter();
+      // The design session opening, being saved or resumed, or closing changes who answers here.
+      if (n.t === "run" && kind === "run") void loadAfter();
       if (n.t === "delta" && n.c === id) setStreaming((s) => s + n.text);
       if (n.t === "typing" && n.c === id) {
         setTyping(n.on);
         if (!n.on) setStreaming("");
       }
     });
-  }, [id, loadAfter]);
+  }, [id, kind, loadAfter]);
 
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -162,11 +173,22 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
 
   return (
     <section className="conversation">
+      {design && (
+        <div className={`design-strip ${design.state}`} role="status">
+          <strong>Design session with the architect agent.</strong>{" "}
+          {design.state === "active"
+            ? "Your messages here go to the architect. Ask about the code, set constraints, ask for changes to the plan."
+            : design.turnRunning
+              ? "Resuming: the architect's workspace is starting again. This can take a minute."
+              : "The architect's workspace was saved while you were away. Your next message resumes it, which can take a minute."}
+        </div>
+      )}
       <div className="timeline">
         {timeline}
         {typing && (
           <div className="message agent">
-            <div className="bubble">{streaming ? streaming : <span className="typing">Thinking…</span>}</div>
+            {design && <div className="origin agent-origin">Architect agent</div>}
+            <div className="bubble streaming">{streaming ? streaming : <span className="typing">{design ? "The architect is working…" : "Thinking…"}</span>}</div>
           </div>
         )}
         <div ref={bottom} />
@@ -181,7 +203,15 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
       >
         <textarea
           value={draft}
-          placeholder={kind === "run" ? "Ask about this run…" : kind === "subtask" ? "Ask about this sub-task…" : "Ask about runs, or start work on an issue…"}
+          placeholder={
+            design
+              ? "Message the architect…"
+              : kind === "run"
+                ? "Ask about this run…"
+                : kind === "subtask"
+                  ? "Ask about this sub-task…"
+                  : "Ask about runs, or start work on an issue…"
+          }
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {

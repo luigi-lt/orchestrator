@@ -15,6 +15,7 @@ import {
   QuestionAnswer,
   RiskDecision,
   catalogRepositories,
+  designWorkflowId,
   type ApprovalKind,
   type Catalog,
   type OrchestratorCard,
@@ -26,9 +27,13 @@ import {
   getApproval,
   getCard,
   getConversation,
+  getDesignSession,
   getPreference,
   getRun,
   getRunWorkflowId,
+  hasOpenDesignTurn,
+  insertMessage,
+  listPlanVersions,
   listConversations,
   listMessages,
   listPendingApprovals,
@@ -150,25 +155,65 @@ async function main(): Promise<void> {
     const id = await createConversation(db, body.title ?? newConversationTitle());
     return getConversation(db, id);
   });
+  /**
+   * Who answers in a conversation (AD-38): decided here from the run's state, never by a model. In a run's
+   * conversation the requester talks to the architect agent while the design session is open, and to the
+   * front-door agent otherwise.
+   */
+  const openDesignSession = async (conversationId: string) => {
+    const conversation = await getConversation(db, conversationId);
+    if (!conversation || conversation.kind !== "run" || !conversation.focusedRunId) return null;
+    const session = await getDesignSession(db, conversation.focusedRunId);
+    return session && session.state !== "closed" ? session : null;
+  };
+
+  const toArchitect = async (conversationId: string, runId: string, text: string) => {
+    const message = await insertMessage(db, { conversationId, role: "user", text });
+    const client = await temporal();
+    await client.workflow.getHandle(designWorkflowId(runId)).signal("requesterMessage", { messageId: message.id, text });
+    // Shown at once, also while a saved session is still being restored; the end of the turn clears it.
+    hub.broadcast({ t: "typing", c: conversationId, on: true });
+  };
+
   app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/conversations/:id", async (req, reply) => {
     const conversation = await getConversation(db, req.params.id);
     if (!conversation) return notFound(reply, "Conversation");
     const messages = await listMessages(db, req.params.id, Number(req.query.after ?? 0) || 0);
-    return { conversation, messages, busy: frontDoor.isBusy(req.params.id) };
+    const session = await openDesignSession(req.params.id);
+    const turnRunning = session ? await hasOpenDesignTurn(db, session.runId) : false;
+    return {
+      conversation,
+      messages,
+      busy: frontDoor.isBusy(req.params.id) || turnRunning,
+      // Shown as a strip above the conversation: the requester is talking to the architect, and whether its workspace is up.
+      design: session ? { runId: session.runId, state: session.state, turnRunning } : null,
+    };
   });
   app.post<{ Params: { id: string } }>("/api/conversations/:id/messages", async (req, reply) => {
     const { text } = z.object({ text: z.string().min(1).max(8000) }).parse(req.body);
     if (!(await getConversation(db, req.params.id))) return notFound(reply, "Conversation");
+    const session = await openDesignSession(req.params.id);
+    if (session) {
+      await toArchitect(req.params.id, session.runId, text);
+      return reply.code(202).send({ accepted: true, to: "architect" });
+    }
     if (frontDoor.isBusy(req.params.id)) throw new UserError("The assistant is still replying");
     void frontDoor.handle(req.params.id, text);
-    return reply.code(202).send({ accepted: true });
+    return reply.code(202).send({ accepted: true, to: "front-door" });
   });
   app.post<{ Params: { id: string } }>("/api/conversations/:id/form", async (req, reply) => {
     const body = z.object({ title: z.string().optional(), values: z.record(z.string(), z.string()) }).parse(req.body);
     if (!(await getConversation(db, req.params.id))) return notFound(reply, "Conversation");
+    const text = frontDoor.formText(body.title, body.values);
+    const session = await openDesignSession(req.params.id);
+    if (session) {
+      // A choice made in a form the architect showed goes back to the architect, as a message.
+      await toArchitect(req.params.id, session.runId, text);
+      return reply.code(202).send({ accepted: true, to: "architect" });
+    }
     if (frontDoor.isBusy(req.params.id)) throw new UserError("The assistant is still replying");
-    void frontDoor.handle(req.params.id, frontDoor.formText(body.title, body.values));
-    return reply.code(202).send({ accepted: true });
+    void frontDoor.handle(req.params.id, text);
+    return reply.code(202).send({ accepted: true, to: "front-door" });
   });
 
   // --- Pending actions ---------------------------------------------------------
@@ -193,15 +238,15 @@ async function main(): Promise<void> {
     if (card) await upsertCard(db, conversationId, cardKey, { ...card, ...patch } as OrchestratorCard);
   };
 
+  // Approval of one plan version: a button on the plan card, bound to the version's hash (FR-P4).
+  // Changes to a plan are asked for in the conversation with the architect; there is no way to edit one here.
   app.post<{ Params: { id: string } }>("/api/approvals/:id/plan", async (req) => {
     const body = PlanDecision.parse(req.body);
     const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "plan");
-    if (body.hash !== approval.hash) throw new UserError("The plan changed since you looked at it; reload and decide again");
-    if (body.decision === "changes" && !body.feedback?.trim()) throw new UserError("Describe the changes you want");
-    await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision, feedback: body.feedback });
-    await resolveApproval(db, approval.id, { decision: body.decision, feedback: body.feedback ?? null, by: me.login });
-    const status = { approve: "approved", changes: "changes_requested", reject: "rejected" }[body.decision] as "approved";
-    await updateCard(conversationId, `run:${run.id}:plan:${approval.id}`, { status, feedback: body.feedback } as Partial<OrchestratorCard>);
+    if (body.hash !== approval.hash) throw new UserError("The plan changed since you looked at it; reload and decide on the version shown now");
+    await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: "approve" });
+    await resolveApproval(db, approval.id, { decision: "approve", by: me.login });
+    await updateCard(conversationId, `run:${run.id}:plan`, { status: "approved" } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
@@ -258,15 +303,28 @@ async function main(): Promise<void> {
   app.get<{ Params: { id: string } }>("/api/runs/:id", async (req, reply) => {
     const run = await getRun(db, req.params.id);
     if (!run) return notFound(reply, "Run");
-    const [steps, events, pending, tickets, subtasks] = await Promise.all([
+    const [steps, events, pending, tickets, subtasks, plans, session] = await Promise.all([
       listSteps(db, run.id),
       listRunEvents(db, run.id),
       listPendingApprovals(db),
       listTickets(db, 1, run.ticketKey),
       listSubtasks(db, run.id),
+      listPlanVersions(db, run.id),
+      getDesignSession(db, run.id),
     ]);
-    return { run, steps, events, pending: pending.filter((p) => p.runId === run.id), ticket: tickets[0] ?? null, subtasks };
+    return {
+      run,
+      steps,
+      events,
+      pending: pending.filter((p) => p.runId === run.id),
+      ticket: tickets[0] ?? null,
+      subtasks,
+      plans,
+      design: session ? { state: session.state, repositories: session.repositories.map((r) => `${r.repo.owner}/${r.repo.name}`) } : null,
+    };
   });
+  // Every version of a run's plan, oldest first: earlier versions stay viewable (FR-P3).
+  app.get<{ Params: { id: string } }>("/api/runs/:id/plans", async (req) => listPlanVersions(db, req.params.id));
   app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (req) => {
     const { reason } = z.object({ reason: z.string().max(500).optional() }).parse(req.body ?? {});
     const workflowId = await getRunWorkflowId(db, req.params.id);

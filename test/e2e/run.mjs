@@ -1,13 +1,18 @@
 // End-to-end scenario against the running stack (started by test/e2e/run.sh), with a fake GitHub serving
-// two repositories of two products and a fake model. Exercises iteration 2, increments 1 and 2:
+// two repositories of two products and a fake model. Exercises iteration 2, increments 1 to 3:
 // product catalog, analysis in a sandbox with several repositories, track rules, conversations grouped by
 // ticket, run and sub-task; the fast track with the product's test command, the AI review and its fix loop;
-// the guided track with one branch, pull request and conversation per sub-task; the requester's decisions on
-// open findings and on a change beyond the fast-track limits.
+// the guided track with its design session (the architect agent in the run's conversation, plan versions,
+// approval bound to a version, the session saved and restored), sub-issues on the ticket, and one branch,
+// pull request and conversation per sub-task, across two repositories; the requester's decisions on open
+// findings and on a change beyond the fast-track limits.
 const API = process.env.API_URL ?? "http://localhost:3000";
 const GH = process.env.FAKE_GITHUB_URL ?? "http://127.0.0.1:8095";
 const MODEL = process.env.FAKE_ANTHROPIC_URL ?? "http://127.0.0.1:8099";
 
+import { execFileSync } from "node:child_process";
+
+const WORKER = process.env.E2E_WORKER_CONTAINER ?? "orchestrator-e2e-worker-1";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
 const ok = (msg) => console.log(`  ✔ ${msg}`);
@@ -60,6 +65,37 @@ const waitForState = (runId, states, timeoutMs = 600_000) =>
 const cardsOf = async (conversationId) => (await api(`/api/conversations/${conversationId}`)).messages.flatMap((m) => m.components);
 const issueOf = async (number) => (await gh("/_test/state")).issues.find((i) => i.number === number);
 const newIssue = (title, body, labels, repo = "acme/demo") => gh("/_test/issues", { method: "POST", body: { title, body, labels, repo } });
+const say = (conversationId, text) => api(`/api/conversations/${conversationId}/messages`, { method: "POST", body: { text } });
+const planCardOf = async (conversationId) => (await cardsOf(conversationId)).filter((c) => c.type === "plan").pop();
+const waitForPlan = (conversationId, what, pred) =>
+  waitFor(what, async () => {
+    const card = await planCardOf(conversationId);
+    return card && pred(card) ? card : null;
+  }, 300_000);
+const architectSaid = async (conversationId) =>
+  (await api(`/api/conversations/${conversationId}`)).messages.filter((m) => m.role === "agent" && m.author === "architect");
+const refused = (promise) => promise.then(() => false, () => true);
+
+/** Listens to the web app's event stream, as a browser does. */
+function listen() {
+  const notices = [];
+  const ctrl = new AbortController();
+  (async () => {
+    const res = await fetch(`${API}/api/stream`, { headers: { "x-orch-client": "web" }, signal: ctrl.signal });
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for await (const chunk of res.body) {
+      buffer += decoder.decode(chunk, { stream: true });
+      for (let i = buffer.indexOf("\n\n"); i >= 0; i = buffer.indexOf("\n\n")) {
+        const data = buffer.slice(0, i).split("\n").filter((l) => l.startsWith("data:")).map((l) => l.slice(5).trim()).join("");
+        buffer = buffer.slice(i + 2);
+        if (data) notices.push(JSON.parse(data));
+      }
+    }
+  })().catch(() => undefined);
+  return { notices, stop: () => ctrl.abort() };
+}
+
 const runFor = (number) => waitFor(`run for issue #${number}`, async () => (await api("/api/runs")).find((r) => r.issueNumber === number), 120_000);
 
 async function main() {
@@ -160,59 +196,205 @@ async function main() {
   check(fastDone.events.every((e, i) => e.seq === i + 1), "events of the run and of its sub-task share one gapless sequence");
   check(fastDone.subtasks[0].state === "merged", "the change is merged");
 
-  console.log("4. Work across two products, started from the chat");
-  const story = await newIssue("Show subtraction in the shop", "Add subtract and use it on the shop page. [web]", ["enhancement"]);
-  await api(`/api/conversations/${chat.id}/messages`, { method: "POST", body: { text: `work on issue #${story.number}` } });
+  console.log("4. Work across two products, started from the chat: the design session opens by itself");
+  const story = await newIssue("Show negated amounts in the shop", "Add negate and use it on the shop page. [web]", ["enhancement"]);
+  await say(chat.id, `work on issue #${story.number}`);
   const crossRun = await runFor(story.number);
   const linkCard = await waitFor("link card in the chat", async () => (await cardsOf(chat.id)).find((c) => c.type === "run_link" && c.runId === crossRun.id), 60_000);
   check(linkCard.conversationId !== chat.id, "the chat shows a link to the run's own conversation");
-  const cross = await waitForState(crossRun.id, ["closed"]);
-  check(cross.run.conversationId === linkCard.conversationId, "the run lives in the linked conversation");
+  const crossConversation = linkCard.conversationId;
+  const draft = await waitForPlan(crossConversation, "the architect's first draft", (c) => c.version === 1);
+  const cross = await api(`/api/runs/${crossRun.id}`);
+  check(cross.run.conversationId === crossConversation && cross.run.state === "designing", "the run lives in the linked conversation and is in its design session");
   check(cross.run.products.join() === "calc,shop", `products found: ${cross.run.products}`);
   check(cross.run.track === "guided" && cross.run.analysis.proposedTrack === "fast", "the rules chose guided although the analyst proposed fast");
   check(/More than one product/.test(cross.run.trackReasons.join()), `reason: ${cross.run.trackReasons[0]}`);
   const transcript = await api(`/api/steps/${cross.steps[0].id}/progress`);
   check(transcript.some((l) => /Opened acme\/web read-only/.test(l.text)), "the analyst opened the second repository on demand");
   check((await issueOf(story.number)).labels.includes("track:guided"), "the ticket carries the label track:guided");
-  check(!(await gh("/_test/state")).pulls.some((p) => p.head === cross.run.branch) && !cross.run.prUrl, "nothing was built or pushed");
-  const crossCards = await cardsOf(cross.run.conversationId);
-  check(crossCards.some((c) => c.type === "notice" && /2 repositories/.test(c.text)), "the conversation says why the run stopped");
+  check(cross.design?.state === "active" && cross.design.repositories.join() === "acme/demo,acme/web", `the session workspace holds ${cross.design?.repositories.join(" and ")}`);
+  const opening = await architectSaid(crossConversation);
+  check(opening.length === 1 && /first draft/.test(opening[0].text), "the architect opened the session with a message of its own");
+  check(
+    draft.status === "draft" && !draft.approvalId && draft.plan.subtasks.map((st) => st.repository).sort().join() === "acme/demo,acme/web" && draft.plan.contracts.length === 1,
+    "a draft plan card shows sub-tasks in both repositories and the contract between them",
+  );
+  check(!cross.pending.some((p) => p.kind === "plan"), "a draft is not up for approval");
+  const routed = await say(crossConversation, "Why two sub-tasks?");
+  check(routed.to === "architect", "a message in the run's conversation goes to the architect while the session is open");
+  await waitFor("the architect's answer", async () => (await architectSaid(crossConversation)).find((m) => /The plan stays as it is/.test(m.text)), 120_000);
+  await say(crossConversation, "Compare the options in a table");
+  const withOptions = await waitFor("the architect's table", async () => (await architectSaid(crossConversation)).find((m) => m.components.some((c) => c.type === "table")), 120_000);
+  check(withOptions.components[0].title === "Options" && /comparison/.test(withOptions.text ?? ""), "the architect can show structured content in the conversation");
+  check((await api(`/api/runs/${crossRun.id}/plans`)).length === 1, "an answer that changes nothing creates no plan version");
+  await api(`/api/runs/${crossRun.id}/cancel`, { method: "POST", body: { reason: "not now" } });
+  const crossCancelled = await waitForState(crossRun.id, ["cancelled"], 120_000);
+  const afterCancel = await gh("/_test/state");
+  check(crossCancelled.design.state === "closed" && crossCancelled.steps.every((st) => st.state !== "running"), "cancelling during the design closes the session and its workspace");
+  check(crossCancelled.subtasks.length === 0 && afterCancel.subIssues.length === 0 && afterCancel.pulls.length === 1, "nothing was built, pushed or created on the ticket");
+  check((await api(`/api/conversations/${crossConversation}`)).design === null, "the conversation is no longer a design session");
 
-  console.log("5. Conversations grouped by ticket: the same ticket run again");
+  console.log("5. The same ticket run again: runs grouped by ticket; the plan is shaped in the conversation and approved");
   const again = await api("/api/runs", { method: "POST", body: { repo: "acme/demo", issueNumber: story.number } });
   check(again.started && again.runId !== crossRun.id, "a ticket whose run ended can be run again");
-  const second = await waitForState(again.runId, ["closed"]);
-  const tickets = await api("/api/tickets");
-  const ticket = tickets.find((t) => t.issueNumber === story.number);
+  const second = await waitForState(again.runId, ["designing"]);
+  const conv = second.run.conversationId;
+  const v1 = await waitForPlan(conv, "the first draft of the second run", (c) => c.version === 1);
+  let tickets = await api("/api/tickets");
+  let ticket = tickets.find((t) => t.issueNumber === story.number);
   check(tickets.length === 2 && ticket?.runs.length === 2, `${tickets.length} tickets; the ticket #${story.number} holds ${ticket?.runs.length} runs`);
   check(ticket.runs[0].runId === again.runId && ticket.runs[0].ordinal === 2 && ticket.runs[1].ordinal === 1, "its runs are listed newest first and numbered in the order they started");
-  check(
-    new Set(ticket.runs.map((r) => r.conversationId)).size === 2 && ticket.runs[0].conversationId === second.run.conversationId,
-    "each run keeps its own conversation under the ticket",
-  );
+  check(new Set(ticket.runs.map((r) => r.conversationId)).size === 2 && ticket.runs[0].conversationId === conv, "each run keeps its own conversation under the ticket");
   check(ticket.key === second.run.ticketKey && second.ticket?.runs.length === 2, "a run knows its ticket and the other runs of it");
-  check(tickets.find((t) => t.issueNumber === bug.number)?.runs.length === 1 && !ticket.active && ticket.pending === 0, "other tickets keep their own runs");
+  check(tickets.find((t) => t.issueNumber === bug.number)?.runs.length === 1 && ticket.active && ticket.pending === 0, "other tickets keep their own runs; this one is active with nothing to decide yet");
 
-  console.log("6. Guided track: a plan, then one branch, pull request and conversation per sub-task");
+  const stream = listen();
+  await say(conv, "Constraint: do not touch the existing page.js");
+  const v2 = await waitForPlan(conv, "plan version 2", (c) => c.version === 2);
+  check(v2.status === "draft" && v2.plan.constraints.join() === "Constraint: do not touch the existing page.js", "the requester's constraint is in version 2 of the plan");
+  check(
+    v2.changes.some((c) => c.what === "plan" && c.title === "Constraints") && v2.changes.some((c) => c.what === "subtask" && c.kind === "changed" && c.title === "Use negate on the shop page"),
+    `the card says what changed: ${v2.changes.map((c) => `${c.kind} ${c.title}`).join(", ")}`,
+  );
+  check(/do not touch/.test(v2.promptedBy ?? "") && v2.hash !== v1.hash, "version 2 records the request that prompted it");
+  const timeline = (await api(`/api/conversations/${conv}`)).messages;
+  check(
+    timeline.findIndex((m) => m.components.some((c) => c.type === "plan")) > timeline.findLastIndex((m) => m.author === "architect"),
+    "the plan card moved below the architect's reply, where the requester is reading",
+  );
+  let versions = await api(`/api/runs/${again.runId}/plans`);
+  check(versions.map((v) => v.status).join() === "superseded,draft" && versions.every((v) => /^architect@/.test(v.author)), "version 1 stays viewable as superseded; both were written by the architect");
+  check(stream.notices.some((n) => n.t === "delta" && n.c === conv && n.text), "the architect's reply reached the conversation while it was being written");
+  stream.stop();
+
+  await say(conv, "Looks good, put it up for approval");
+  const proposed = await waitForPlan(conv, "the plan put up for approval", (c) => c.status === "proposed" && !!c.approvalId);
+  const waiting = await api(`/api/runs/${again.runId}`);
+  check(proposed.version === 2 && waiting.run.state === "awaiting_approval" && waiting.pending.some((p) => p.id === proposed.approvalId), "version 2 is up for approval and the run waits for the requester");
+  ticket = (await api("/api/tickets")).find((t) => t.issueNumber === story.number);
+  check(ticket.pending === 1 && ticket.runs[0].pending === 1, "the hierarchy shows a decision waiting on the ticket and its run");
+
+  await say(conv, "One more constraint: do not rename anything");
+  const v3 = await waitForPlan(conv, "plan version 3", (c) => c.version === 3);
+  const voided = await api(`/api/runs/${again.runId}`);
+  check(v3.status === "draft" && !voided.pending.some((p) => p.kind === "plan") && voided.run.state === "designing", "a newer version voids the approval asked for the older one");
+  check(await refused(api(`/api/approvals/${proposed.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: proposed.hash } })), "the voided approval can no longer be used");
+  await say(conv, "Now please go ahead with the approval");
+  const final = await waitForPlan(conv, "version 3 put up for approval", (c) => c.version === 3 && c.status === "proposed" && !!c.approvalId);
+  check(await refused(api(`/api/approvals/${final.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: v2.hash } })), "approval with the hash of another version is refused");
+  check(await refused(api(`/api/approvals/${final.approvalId}/plan`, { method: "POST", body: { decision: "reject", hash: final.hash } })), "a plan cannot be rejected or edited here: changes are asked for in the conversation");
+  await api(`/api/approvals/${final.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: final.hash } });
+
+  console.log("6. The approved plan is built across two repositories, each sub-task after the ones it depends on");
+  const subtaskOpen = (runId, index) =>
+    waitFor(
+      `the pull request of sub-task ${index + 1}`,
+      async () => {
+        const d = await api(`/api/runs/${runId}`);
+        if (d.run.state === "failed") throw Object.assign(new Error(`run failed: ${d.run.error}`), { fatal: true });
+        return d.subtasks.length === index + 1 && d.subtasks[index].state === "pr_open" ? d : null;
+      },
+      600_000,
+    );
+  const firstBuilt = await subtaskOpen(again.runId, 0);
+  check((await planCardOf(conv)).status === "approved" && firstBuilt.design.state === "closed", "the plan card shows the approved version and the design session is closed");
+  check((await say(conv, "hello")).to === "front-door", "after the session the conversation is answered by the front-door agent again");
+  versions = await api(`/api/runs/${again.runId}/plans`);
+  check(versions.map((v) => v.status).join() === "superseded,superseded,approved", "all three versions are kept; the third is the approved one");
+  let hub = await gh("/_test/state");
+  const storyKey = `acme/demo#${story.number}`;
+  const children = hub.subIssues.filter((x) => x.parent === storyKey).map((x) => hub.issues.find((i) => i.k === x.child));
+  check(
+    children.length === 2 && children.map((c) => c.k.split("#")[0]).join() === "acme/demo,acme/web" && children.every((c) => c.labels.includes("ai-subtask") && c.state === "open"),
+    `the ticket has a sub-issue per sub-task, each in the repository it changes: ${children.map((c) => c.k).join(", ")}`,
+  );
+  check(hub.comments[storyKey].some((c) => /Plan approved\*\* \(version 3\)/.test(c.body) && c.body.includes(`acme/web#${children[1].number}`)), "the approved plan is summarised on the ticket");
+  const c1 = firstBuilt.subtasks[0];
+  check(c1.key === "calc-negate" && c1.repository === "acme/demo" && c1.branch.endsWith("-calc-negate"), "the calculator sub-task is built first, because the shop sub-task depends on it");
+  check(!!c1.conversationId && c1.conversationId !== conv && c1.ticketNumber === children[0].number, "the sub-task has its own conversation and knows its sub-issue");
+  const crossPr1 = hub.pulls.find((p) => p.head === c1.branch);
+  check(
+    crossPr1?.repo === "acme/demo" && /\(1\/2\): Add negate to the calculator/.test(crossPr1.title) && crossPr1.body.includes(`Part of #${story.number}`) && crossPr1.body.includes(`Closes #${children[0].number}`),
+    "its pull request is part of the ticket and closes its sub-issue",
+  );
+  const storyCardX = (await cardsOf(conv)).find((c) => c.type === "story");
+  check(storyCardX?.subtasks[0]?.conversationId === c1.conversationId, "the run's conversation lists the sub-task and links to its conversation");
+  await gh(`/_test/pulls/${crossPr1.number}/merge`, { method: "POST" });
+  const secondBuilt = await subtaskOpen(again.runId, 1);
+  const c2 = secondBuilt.subtasks[1];
+  hub = await gh("/_test/state");
+  const crossPr2 = hub.pulls.find((p) => p.head === c2.branch);
+  check(secondBuilt.subtasks[0].state === "merged" && c2.key === "shop-page" && c2.repository === "acme/web" && crossPr2?.repo === "acme/web", "the shop sub-task started after the calculator change was merged, in the shop's repository");
+  check(hub.issues.find((i) => i.k === children[0].k).state === "closed", "the sub-issue of the merged sub-task is closed");
+  const shopBranch = await gh(`/_test/branch?repo=acme/web&name=${encodeURIComponent(c2.branch)}`);
+  check(shopBranch.files.join() === "shop.js" && shopBranch.commits === 1, "the shop branch holds one commit with its own file");
+  check(crossPr2.body.includes(`Closes acme/demo#${story.number}`) && crossPr2.body.includes(`Closes #${children[1].number}`), "the last pull request closes the ticket across repositories, and its own sub-issue");
+  const shopStep = secondBuilt.steps.filter((st) => st.kind === "implement").pop();
+  const shopBrief = await api(`/api/steps/${shopStep.id}/progress`);
+  check(shopBrief.length > 0 && secondBuilt.run.plan.summary.includes("do not rename anything") && /negate\(a\)/.test(secondBuilt.run.plan.summary), "the implementers get the plan's constraints and the contract between the products");
+  await gh(`/_test/pulls/${crossPr2.number}/merge`, { method: "POST" });
+  const crossDone = await waitForState(again.runId, ["completed"], 180_000);
+  hub = await gh("/_test/state");
+  check(crossDone.subtasks.every((st) => st.state === "merged") && children.every((c) => hub.issues.find((i) => i.k === c.k).state === "closed"), "the run completed after both merges and both sub-issues are closed");
+  const crossEvents = crossDone.events.map((e) => e.type);
+  check(
+    ["design.opened", "plan.version_created", "plan.proposed", "plan.approval_voided", "design.closed", "plan.approved", "ticket.subtasks_created"].every((t) => crossEvents.includes(t)) &&
+      crossDone.events.every((e, i) => e.seq === i + 1),
+    "the design session's events are in the run's one gapless sequence",
+  );
+
+  console.log("7. A design session that falls silent is saved, and restored by the next message");
   const guided = await newIssue("Add multiply with care", "A multiply function that needs a design choice. [guided]", ["ai-ready"]);
   const guidedRun = await runFor(guided.number);
-  const awaiting = await waitForState(guidedRun.id, ["awaiting_approval"]);
-  check(awaiting.run.track === "guided", "the run is on the guided track");
-  const analyseStep = awaiting.steps.find((s) => s.kind === "analyse");
+  const designing = await waitForState(guidedRun.id, ["designing"]);
+  check(designing.run.track === "guided", "the run is on the guided track");
+  const analyseStep = designing.steps.find((s) => s.kind === "analyse");
   const analyseLog = await api(`/api/steps/${analyseStep.id}/progress`);
   check(analyseStep.state === "succeeded" && analyseLog.filter((l) => /^submit_analysis/.test(l.text)).length === 2, "an analysis naming an unknown product was sent back and corrected");
-  const planCard = (await cardsOf(awaiting.run.conversationId)).filter((c) => c.type === "plan" && c.status === "pending").pop();
-  check(planCard?.plan.subtasks.length === 2, "plan card with two sub-tasks is shown in the run's conversation");
-  const stale = await api(`/api/approvals/${planCard.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: "stale" } }).then(
-    () => false,
-    () => true,
-  );
-  check(stale, "approval with a stale plan hash is refused");
-  await api(`/api/approvals/${planCard.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: planCard.hash } });
+  const gconv = designing.run.conversationId;
+  const g1 = await waitForPlan(gconv, "the first draft", (c) => c.version === 1);
+  let fake = await call(MODEL, "/_test/state");
+  check(fake.planSentBack && g1.plan.subtasks[1].dependsOn.join() === "multiply" && (await api(`/api/runs/${guidedRun.id}/plans`)).length === 1, "a plan with an unknown dependency was sent back and corrected in the same turn");
+  const saved = await waitFor("the session to be saved", async () => {
+    const d = await api(`/api/runs/${guidedRun.id}`);
+    return d.design?.state === "suspended" ? d : null;
+  }, 240_000);
+  const firstSession = saved.steps.find((s) => s.kind === "design");
+  check(firstSession.state === "succeeded" && /saved/.test(firstSession.summary ?? "") && saved.run.state === "designing", "after a silence the session was saved and its workspace shut down; the run stays in design");
+  check((await api(`/api/conversations/${gconv}`)).design?.state === "suspended" && saved.events.some((e) => e.type === "design.suspended"), "the conversation shows the session as resting");
+  const turnsBefore = fake.designTurns.length;
+  await say(gconv, "Constraint: do not change math.js");
+  const g2 = await waitForPlan(gconv, "version 2 after the restore", (c) => c.version === 2);
+  const restored = await api(`/api/runs/${guidedRun.id}`);
+  const sessions = restored.steps.filter((s) => s.kind === "design");
+  const secondLog = await api(`/api/steps/${sessions[1].id}/progress`);
+  check(sessions.length === 2 && secondLog.some((l) => /Session restored from its checkpoint/.test(l.text)) && restored.events.some((e) => e.type === "design.resumed"), "the next message started a new workspace that restored the saved session");
+  fake = await call(MODEL, "/_test/state");
+  const resumedTurn = fake.designTurns[turnsBefore];
+  check(resumedTurn?.remembersOpening && !resumedTurn.rebuilt && resumedTurn.prompts === 2, "the restored session still had its memory: the model saw the opening of the session again (R-13)");
+  check(g2.plan.constraints.join() === "Constraint: do not change math.js" && g2.plan.subtasks[0].acceptanceCriteria.length === 2, "the architect revised the plan in the restored session");
 
-  const firstOpen = await waitForState(guidedRun.id, ["awaiting_merge"]);
+  // The fallback (R-13): a saved session whose checkpoint is gone is rebuilt from the record of the conversation.
+  await waitFor("the session to be saved again", async () => (await api(`/api/runs/${guidedRun.id}`)).design?.state === "suspended", 240_000);
+  execFileSync("docker", ["exec", WORKER, "rm", "-f", `/data/artifacts/design-${guidedRun.id}/checkpoint.tgz`]);
+  const turnsBeforeRebuild = (await call(MODEL, "/_test/state")).designTurns.length;
+  await say(gconv, "One more constraint: do not add dependencies");
+  const g3 = await waitForPlan(gconv, "version 3 from the rebuilt session", (c) => c.version === 3);
+  const rebuilt = await api(`/api/runs/${guidedRun.id}`);
+  const thirdLog = await api(`/api/steps/${rebuilt.steps.filter((s) => s.kind === "design")[2].id}/progress`);
+  const rebuiltTurn = (await call(MODEL, "/_test/state")).designTurns[turnsBeforeRebuild];
+  check(thirdLog.some((l) => /Session rebuilt from the record/.test(l.text)) && rebuiltTurn?.rebuilt && rebuiltTurn.prompts === 1, "without its checkpoint the session was rebuilt from the record of the conversation");
+  check(
+    g3.plan.constraints.join(" | ") === "Constraint: do not change math.js | One more constraint: do not add dependencies",
+    "the rebuilt architect still knew the earlier constraint, and got the new message once",
+  );
+  await say(gconv, "Fine, put it up for approval");
+  const gProposed = await waitForPlan(gconv, "the plan put up for approval", (c) => c.status === "proposed" && !!c.approvalId);
+  await api(`/api/approvals/${gProposed.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: gProposed.hash } });
+
+  const firstOpen = await subtaskOpen(guidedRun.id, 0);
   const s1 = firstOpen.subtasks[0];
-  check(firstOpen.subtasks.length === 1 && s1.key === "s1" && s1.state === "pr_open", "the first sub-task has its pull request open; the second has not started");
+  check(s1.key === "multiply" && s1.state === "pr_open", "the first sub-task has its pull request open; the second has not started");
   check(!!s1.conversationId && s1.conversationId !== firstOpen.run.conversationId, "the sub-task has its own conversation");
   const s1Cards = (await cardsOf(s1.conversationId)).map((c) => c.type);
   check(["subtask", "progress", "review", "pull_request"].every((t) => s1Cards.includes(t)), `its conversation holds its own cards: ${s1Cards.join(", ")}`);
@@ -224,30 +406,22 @@ async function main() {
   check(guidedTicket.runs[0].subtasks.map((st) => st.conversationId).join() === s1.conversationId, "the hierarchy lists the sub-task under its run");
   let pulls = (await gh("/_test/state")).pulls;
   const pr1 = pulls.find((p) => p.head === s1.branch);
-  check(/\(1\/2\): Add multiply function/.test(pr1.title) && /Part of #\d+/.test(pr1.body) && !/Closes #/.test(pr1.body), "the first pull request is part of the ticket and does not close it");
+  check(/\(1\/2\): Add multiply function/.test(pr1.title) && pr1.body.includes(`Part of #${guided.number}`) && !pr1.body.includes(`Closes #${guided.number}`), "the first pull request is part of the ticket and does not close it");
   await gh(`/_test/pulls/${pr1.number}/merge`, { method: "POST" });
 
-  const secondOpen = await waitFor(
-    "the pull request of the second sub-task",
-    async () => {
-      const d = await api(`/api/runs/${guidedRun.id}`);
-      if (d.run.state === "failed") throw Object.assign(new Error(`run failed: ${d.run.error}`), { fatal: true });
-      return d.subtasks.length === 2 && d.subtasks[1].state === "pr_open" ? d : null;
-    },
-    600_000,
-  );
+  const secondOpen = await subtaskOpen(guidedRun.id, 1);
   const s2 = secondOpen.subtasks[1];
-  check(secondOpen.subtasks[0].state === "merged" && s2.branch.endsWith("-s2") && s2.conversationId !== s1.conversationId, "the second sub-task started after the first was merged, on its own branch and conversation");
+  check(secondOpen.subtasks[0].state === "merged" && s2.branch.endsWith("-notes") && s2.conversationId !== s1.conversationId, "the second sub-task started after the first was merged, on its own branch and conversation");
   const s2Branch = await gh(`/_test/branch?repo=acme/demo&name=${encodeURIComponent(s2.branch)}`);
   check(s2Branch.files.join() === "NOTES.md", "the second branch starts from the merged first change and adds only its own file");
   pulls = (await gh("/_test/state")).pulls;
   const pr2 = pulls.find((p) => p.head === s2.branch);
-  check(/\(2\/2\): Document multiply/.test(pr2.title) && /Closes #\d+/.test(pr2.body), "the last pull request closes the ticket");
+  check(/\(2\/2\): Document multiply/.test(pr2.title) && pr2.body.includes(`Closes #${guided.number}`), "the last pull request closes the ticket");
   await gh(`/_test/pulls/${pr2.number}/merge`, { method: "POST" });
   const guidedDone = await waitForState(guidedRun.id, ["completed"], 180_000);
   check(guidedDone.subtasks.every((st) => st.state === "merged"), "guided run completed after both merges");
 
-  console.log("7. Findings still open after two fix rounds: the requester decides");
+  console.log("8. Findings still open after two fix rounds: the requester decides");
   const stubborn = await newIssue("Add a stub", "A small stub file. [stubborn] [file:stub.js]", ["ai-ready", "bug"]);
   const stubbornRun = await runFor(stubborn.number);
   const undecided = await waitForState(stubbornRun.id, ["awaiting_approval"]);
@@ -272,7 +446,7 @@ async function main() {
   const cancelled = await waitForState(stubbornRun.id, ["cancelled"], 120_000);
   check(cancelled.subtasks[0].state === "cancelled", "cancelling the run cancels its sub-task");
 
-  console.log("8. A fast-track change that turned out too big: the requester switches to the guided track");
+  console.log("9. A fast-track change that turned out too big: the requester switches to the guided track");
   const big = await newIssue("Add a big thing", "Looks small. [big] [file:big.js]", ["ai-ready", "bug"]);
   const bigRun = await runFor(big.number);
   const tooBig = await waitForState(bigRun.id, ["awaiting_approval"]);
@@ -280,20 +454,20 @@ async function main() {
   const limitsCard = (await cardsOf(tooBig.run.conversationId)).find((c) => c.type === "limits");
   check(!!limitsApproval && /7 files \(the fast-track limit is 5\)/.test(limitsCard?.reasons.join()), `the change is stopped: ${limitsCard?.reasons[0]}`);
   await api(`/api/approvals/${limitsApproval.id}/limits`, { method: "POST", body: { decision: "guided", hash: limitsCard.hash } });
-  const replanned = await waitFor(
-    "the plan of the guided track",
+  const redesign = await waitFor(
+    "the design session of the guided track",
     async () => {
       const d = await api(`/api/runs/${bigRun.id}`);
-      return d.run.track === "guided" && d.pending.some((p) => p.kind === "plan") ? d : null;
+      return d.run.track === "guided" && d.plans.length === 1 ? d : null;
     },
     300_000,
   );
-  check(replanned.events.some((e) => e.type === "track.changed") && (await issueOf(big.number)).labels.includes("track:guided"), "the track and its label changed to guided");
-  check(replanned.subtasks[0].state === "cancelled" && (await gh("/_test/state")).pulls.every((p) => p.head !== tooBig.run.branch), "the fast-track change was set aside and nothing was pushed");
-  const bigPlan = (await cardsOf(replanned.run.conversationId)).filter((c) => c.type === "plan" && c.status === "pending").pop();
-  await api(`/api/approvals/${bigPlan.approvalId}/plan`, { method: "POST", body: { decision: "reject", hash: bigPlan.hash } });
-  await waitForState(bigRun.id, ["cancelled"], 120_000);
-  ok("rejecting the plan ends the run with nothing changed");
+  check(redesign.events.some((e) => e.type === "track.changed") && (await issueOf(big.number)).labels.includes("track:guided"), "the track and its label changed to guided");
+  check(redesign.subtasks[0].state === "cancelled" && (await gh("/_test/state")).pulls.every((p) => p.head !== tooBig.run.branch), "the fast-track change was set aside and nothing was pushed");
+  check(redesign.run.state === "designing" && redesign.design?.state === "active" && (await planCardOf(redesign.run.conversationId))?.status === "draft", "a design session with the architect opened, with a first draft plan");
+  await api(`/api/runs/${bigRun.id}/cancel`, { method: "POST", body: { reason: "end of test" } });
+  const bigCancelled = await waitForState(bigRun.id, ["cancelled"], 120_000);
+  check(bigCancelled.design.state === "closed", "cancelling ends the design session with nothing built");
 
   console.log(failures ? `\nFAILED: ${failures} check(s)` : "\nPASSED: all checks");
   process.exit(failures ? 1 : 0);

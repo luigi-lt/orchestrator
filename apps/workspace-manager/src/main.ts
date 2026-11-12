@@ -30,8 +30,8 @@ async function removeContainer(name: string): Promise<void> {
 }
 
 const activities: WorkspaceActivities = {
-  async createWorkspace({ stepId, runId }) {
-    const ttlSeconds = (config.stepTimeoutMinutes() + 30) * 60;
+  async createWorkspace({ stepId, runId, session }) {
+    const ttlSeconds = ((session ? config.designMaxMinutes() : config.stepTimeoutMinutes()) + 30) * 60;
     const token = signWorkspaceToken(stepId, ttlSeconds, config.workspaceTokenSecret());
     await setStepToken(db, stepId, tokenHash(token));
 
@@ -68,7 +68,7 @@ const activities: WorkspaceActivities = {
         "HOME=/workspace/home",
         "COPILOT_GITHUB_TELEMETRY_DISABLED=true",
       ],
-      Labels: { "orch.workspace": "1", "orch.step": stepId, "orch.run": runId },
+      Labels: { "orch.workspace": "1", "orch.step": stepId, "orch.run": runId, "orch.session": session ? "1" : "0" },
       // Anonymous volume for the checkout and build output; removed together with the container.
       Volumes: { "/workspace": {} },
       HostConfig: {
@@ -95,11 +95,11 @@ const activities: WorkspaceActivities = {
 
 /** Removes sandboxes whose step is finished, unknown, or older than the maximum lifetime. */
 async function reap(): Promise<void> {
-  const maxAgeMs = (config.stepTimeoutMinutes() + 60) * 60 * 1000;
   const containers = await docker.listContainers({ all: true, filters: { label: ["orch.workspace=1"] } });
   for (const info of containers) {
     const stepId = info.Labels["orch.step"];
     const ageMs = Date.now() - info.Created * 1000;
+    const maxAgeMs = ((info.Labels["orch.session"] === "1" ? config.designMaxMinutes() : config.stepTimeoutMinutes()) + 60) * 60 * 1000;
     const step = stepId ? await getStep(db, stepId) : null;
     const finished = !step || step.state === "succeeded" || step.state === "failed";
     if (ageMs > maxAgeMs || (finished && ageMs > 2 * 60 * 1000)) {

@@ -193,4 +193,46 @@ alter table run_events add column event_key text;
 create unique index run_events_key_idx on run_events (run_id, event_key) where event_key is not null;
 `,
   },
+  {
+    // Iteration 2, increment 3: plan versions, the design session with the architect agent, sub-issues.
+    version: 4,
+    sql: `
+create table plan_versions (
+  run_id text not null references runs(id) on delete cascade,
+  version int not null,
+  hash text not null,
+  document jsonb not null,
+  status text not null,
+  changes jsonb not null default '[]',
+  author text not null,
+  prompted_by text,
+  created_at timestamptz not null default now(),
+  primary key (run_id, version)
+);
+
+create table design_sessions (
+  run_id text primary key references runs(id) on delete cascade,
+  state text not null,
+  step_id text,
+  repositories jsonb not null default '[]',
+  has_checkpoint boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create table design_turns (
+  id text primary key,
+  run_id text not null references runs(id) on delete cascade,
+  seq int not null,
+  state text not null,
+  input jsonb not null,
+  result jsonb,
+  created_at timestamptz not null default now(),
+  finished_at timestamptz
+);
+create index design_turns_run_idx on design_turns (run_id, seq);
+
+alter table subtasks add column ticket_number int, add column ticket_url text;
+`,
+  },
 ];

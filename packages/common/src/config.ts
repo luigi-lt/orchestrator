@@ -43,6 +43,10 @@ export const config = {
   reviewerModel: () => str("ORCH_REVIEWER_MODEL", str("ORCH_MODEL", "claude-opus-5-5")),
   /** How often an open pull request is polled. */
   prPollSeconds: () => int("PR_POLL_SECONDS", 60),
+  /** Silence after which the architect's session workspace is saved and shut down (AD-34). */
+  designIdleSeconds: () => int("DESIGN_IDLE_SECONDS", 20 * 60),
+  /** The longest a session workspace lives before it is saved and replaced. */
+  designMaxMinutes: () => int("DESIGN_MAX_MINUTES", 8 * 60),
   /** Fix rounds after an AI review before the requester decides (FR-R2). */
   maxFixRounds: () => int("MAX_FIX_ROUNDS", 2),
   pollIntervalSeconds: () => int("POLL_INTERVAL_SECONDS", 60),

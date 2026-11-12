@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { join as joinPath } from "node:path";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ApplicationFailure, Context } from "@temporalio/activity";
@@ -13,6 +14,8 @@ import {
   type Analysis,
   type BriefRepository,
   type Catalog,
+  type DesignTurnInput,
+  type DesignTurnResult,
   type Plan,
   type QuestionRound,
   type RepoRef,
@@ -24,7 +27,23 @@ import {
   type WorkItem,
 } from "@orch/contracts";
 import { GitHubError } from "@orch/github";
-import { failStepIfActive, getStep, listRepositoryRequests, resolveRepositoryRequest, upsertStep } from "@orch/store";
+import {
+  completeStep,
+  enqueueDesignTurn,
+  failStepIfActive,
+  getDesignSession,
+  getDesignTurn,
+  getLatestPlanVersion,
+  getRun,
+  getStep,
+  listMessages,
+  listRepositoryRequests,
+  listSteps,
+  resolveRepositoryRequest,
+  saveDesignSession,
+  upsertStep,
+  type StepRecord,
+} from "@orch/store";
 import { ctx, runCatalog } from "../context.js";
 import { bundleReadOnly, ensureWorkRepo, git, stepArtifactsDir, workRepoDir } from "../git.js";
 
@@ -80,14 +99,14 @@ async function defaultBranchOf(repo: RepoRef): Promise<string> {
   return branch;
 }
 
-/** Bundles a catalog repository at its default branch for a read-only checkout. */
-async function readOnlyRepository(stepId: string, catalog: Catalog, slug: string, index: number, primary: boolean): Promise<BriefRepository> {
+/** Bundles a catalog repository at its default branch (or at a pinned commit) for a read-only checkout. */
+async function readOnlyRepository(stepId: string, catalog: Catalog, slug: string, index: number, primary: boolean, pin?: string): Promise<BriefRepository> {
   const entry = findCatalogRepository(catalog, slug);
   if (!entry) throw ApplicationFailure.nonRetryable(`Repository ${slug} is not in the product catalog`);
   const repo = { owner: entry.owner, name: entry.name };
   const branch = await defaultBranchOf(repo);
-  const commit = await bundleReadOnly(repo, branch, join(stepArtifactsDir(stepId), bundleName(index)));
-  return { index, product: entry.product, repo, role: entry.role, branch, commit, mode: "readonly", path: workspaceRepoPath(entry.product, repo), primary };
+  const { commit, ref } = await bundleReadOnly(repo, branch, join(stepArtifactsDir(stepId), bundleName(index)), pin);
+  return { index, product: entry.product, repo, role: entry.role, branch: ref, commit, mode: "readonly", path: workspaceRepoPath(entry.product, repo), primary };
 }
 
 /** Records the step and writes its brief and one git bundle per repository for the workspace (AD-24, AD-37). */
@@ -184,6 +203,9 @@ async function fulfilRepositoryRequest(runId: string, request: RepositoryRequest
     }
     const entry = await readOnlyRepository(request.stepId, catalog, request.repository, taken, false);
     await resolveRepositoryRequest(db, request.id, { state: "ready", entry });
+    // A repository opened in a design session stays part of it: a restored workspace gets it again.
+    const session = await getDesignSession(db, runId);
+    if (session?.stepId === request.stepId) await saveDesignSession(db, runId, { repositories: [...session.repositories, entry] });
     log("worker", `step ${request.stepId}: added repository ${request.repository}`);
   } catch (err) {
     // No read access for the requester's token shows up here (AD-42): the agent is told, the step continues.
@@ -222,6 +244,161 @@ export async function awaitStep(input: { stepId: string }): Promise<StepResult> 
       throw activity.cancellationSignal.reason ?? new Error("Cancelled");
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Design session (AD-34, AD-35): the architect's session workspace and its turns
+// ---------------------------------------------------------------------------
+
+const stepAlive = (step: StepRecord | null): step is StepRecord => {
+  if (!step || (step.state !== "pending" && step.state !== "running")) return false;
+  const now = Date.now();
+  if (step.state === "pending") return now - new Date(step.createdAt).getTime() < START_TIMEOUT_MS;
+  return !step.lastSeenAt || now - new Date(step.lastSeenAt).getTime() < STALE_AFTER_MS;
+};
+
+const designCheckpoint = (runId: string) => joinPath(config.artifactsDir(), `design-${runId}`, "checkpoint.tgz");
+
+/**
+ * Makes sure the design session has a workspace to run its next turn in. Returns the step of a live
+ * workspace, or prepares a new one (brief and bundles) for the workflow to start: on the first turn,
+ * after the session was saved when idle, or after its workspace was lost.
+ */
+export async function prepareDesignWorkspace(input: {
+  runId: string;
+  workItem: WorkItem;
+  analysis: Analysis;
+  /** The repositories the analysis named: what a new session starts with. */
+  repositories: string[];
+}): Promise<{ stepId: string; fresh: boolean; expired: boolean; resumed: boolean }> {
+  const { db } = ctx();
+  const session = await getDesignSession(db, input.runId);
+  const current = session?.stepId ? await getStep(db, session.stepId) : null;
+  if (session?.state === "active" && stepAlive(current)) {
+    // A workspace that has lived too long is saved and replaced before it runs another turn.
+    const expired = Date.now() - new Date(current.createdAt).getTime() > config.designMaxMinutes() * 60 * 1000;
+    return { stepId: current.id, fresh: false, expired, resumed: false };
+  }
+  if (current) await failStepIfActive(db, current.id, "The design session workspace was replaced");
+
+  const earlier = (await listSteps(db, input.runId)).filter((st) => st.kind === "design").length;
+  const stepId = `${input.runId}-d${earlier + 1}`;
+  await upsertStep(db, { id: stepId, runId: input.runId, kind: "design", title: earlier ? `Design session (resumed ${earlier})` : "Design session", subtaskIndex: null });
+  await mkdir(stepArtifactsDir(stepId), { recursive: true });
+  const catalog = await runCatalog(input.runId);
+
+  // The same repositories at the same commits as before; a new session starts with what the analysis named.
+  const wanted = session?.repositories.length
+    ? session.repositories.map((r) => ({ slug: repoSlug(r.repo), pin: r.commit as string | undefined }))
+    : input.repositories.map((slug) => ({ slug, pin: undefined as string | undefined }));
+  const home = repoSlug(input.workItem.repo).toLowerCase();
+  const primaryIndex = Math.max(0, wanted.findIndex((w) => w.slug.toLowerCase() === home));
+  const repositories: BriefRepository[] = [];
+  for (const [index, w] of wanted.entries()) repositories.push(await readOnlyRepository(stepId, catalog, w.slug, index, index === primaryIndex, w.pin));
+
+  // The record of the session: what it is rebuilt from when its checkpoint cannot be restored (R-13).
+  const run = await getRun(db, input.runId);
+  const messages = run?.conversationId ? await listMessages(db, run.conversationId) : [];
+  const history = messages
+    .filter((m) => m.text && (m.role === "user" || (m.role === "agent" && m.author === "architect")))
+    .slice(-60)
+    .map((m) => ({ role: m.role === "user" ? ("requester" as const) : ("architect" as const), text: m.text!.slice(0, 6000) }));
+  const latest = await getLatestPlanVersion(db, input.runId);
+
+  const brief: StepBrief = {
+    stepId,
+    runId: input.runId,
+    kind: "design",
+    model: config.model(),
+    branch: repositories[primaryIndex]!.branch,
+    workItem: input.workItem,
+    repositories,
+    maxRepositories: config.maxStepRepositories(),
+    catalog: catalogExtract(catalog),
+    analysis: input.analysis,
+    questionRounds: [],
+    round: 0,
+    commands: {},
+    findings: [],
+    design: {
+      sessionId: `design-${input.runId}`,
+      hasCheckpoint: !!session?.hasCheckpoint && existsSync(designCheckpoint(input.runId)),
+      history,
+      latestPlan: latest?.plan,
+      latestVersion: latest?.version,
+    },
+    commitAuthor: { name: input.workItem.requester.login, email: `${input.workItem.requester.login}@users.noreply.github.com` },
+    timeoutMinutes: config.designMaxMinutes(),
+  };
+  await writeFile(briefPath(stepId), JSON.stringify(brief, null, 2));
+  await saveDesignSession(db, input.runId, { state: "active", stepId, repositories });
+  return { stepId, fresh: true, expired: false, resumed: earlier > 0 };
+}
+
+/**
+ * Hands a turn to the session workspace and waits for the architect's reply, heartbeating meanwhile.
+ * The turn is queued once; when the workspace is lost the activity fails, and the workflow delivers the
+ * same turn to a new workspace.
+ */
+export async function awaitDesignTurn(input: { runId: string; stepId: string; turn: DesignTurnInput }): Promise<DesignTurnResult> {
+  const { db } = ctx();
+  const activity = Context.current();
+  await enqueueDesignTurn(db, input.runId, input.turn);
+  for (;;) {
+    activity.heartbeat();
+    const turn = await getDesignTurn(db, input.turn.turnId);
+    if (turn?.state === "done" && turn.result) return turn.result;
+    for (const request of await listRepositoryRequests(db, input.stepId, "pending")) {
+      await fulfilRepositoryRequest(input.runId, request);
+      activity.heartbeat();
+    }
+    if (!stepAlive(await getStep(db, input.stepId))) {
+      await failStepIfActive(db, input.stepId, "The design session workspace stopped responding");
+      throw ApplicationFailure.nonRetryable("The design session workspace was lost", "WorkspaceLost");
+    }
+    await Promise.race([sleep(700), activity.cancelled.catch(() => undefined)]);
+    if (activity.cancellationSignal.aborted) throw activity.cancellationSignal.reason ?? new Error("Cancelled");
+  }
+}
+
+/** Waits for a step to end by itself; returns false when it did not within the time given. */
+async function stepEnded(stepId: string, withinMs: number): Promise<boolean> {
+  const { db } = ctx();
+  for (const deadline = Date.now() + withinMs; Date.now() < deadline; ) {
+    const step = await getStep(db, stepId);
+    if (!step || step.state === "succeeded" || step.state === "failed") return true;
+    Context.current().heartbeat();
+    await sleep(500);
+  }
+  return false;
+}
+
+/**
+ * Asks the session workspace to save the architect's session and stop (it was idle, or lived too long).
+ * Returns the step whose workspace the workflow then destroys.
+ */
+export async function suspendDesignWorkspace(input: { runId: string }): Promise<{ stepId: string | null; saved: boolean }> {
+  const { db } = ctx();
+  const session = await getDesignSession(db, input.runId);
+  if (!session?.stepId || session.state === "closed") return { stepId: null, saved: false };
+  await saveDesignSession(db, input.runId, { state: "suspending" });
+  const saved = (await stepEnded(session.stepId, 120_000)) && (await getStep(db, session.stepId))?.state === "succeeded";
+  if (!saved) await failStepIfActive(db, session.stepId, "The design session workspace did not save its session in time");
+  await saveDesignSession(db, input.runId, { state: "suspended", stepId: null });
+  return { stepId: session.stepId, saved };
+}
+
+/** Ends the design session for good: the plan is approved, or the run is cancelled. */
+export async function closeDesignSession(input: { runId: string }): Promise<{ stepId: string | null }> {
+  const { db } = ctx();
+  const session = await getDesignSession(db, input.runId);
+  if (!session) return { stepId: null };
+  await saveDesignSession(db, input.runId, { state: "closed" });
+  if (session.stepId && !(await stepEnded(session.stepId, 30_000))) {
+    await completeStep(db, session.stepId, { status: "succeeded", summary: "Design session closed" });
+  }
+  await saveDesignSession(db, input.runId, { stepId: null });
+  return { stepId: session.stepId };
 }
 
 /** Fast-forwards the sub-task's branch with the commits produced by the step. Returns the number of new commits. */

@@ -8,27 +8,31 @@
 import { execFile } from "node:child_process";
 import { createReadStream, createWriteStream, statSync } from "node:fs";
 import { mkdir, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import {
   CopilotClient,
   defineTool,
+  type CopilotSession,
   type PermissionRequest,
   type PermissionRequestResult,
   type SessionEvent,
   type ToolResultObject,
 } from "@github/copilot-sdk";
-import { GUIDANCE_FILES, analyst, implementer, planner, reviewer, type AgentProfile } from "@orch/agent-profiles";
+import { GUIDANCE_FILES, analyst, architect, implementer, reviewer, type AgentProfile } from "@orch/agent-profiles";
 import {
   Analysis,
-  Assessment,
+  HandoffPlan,
   ReviewReport,
   StepBrief,
   repoSlug,
   workItemType,
   type BriefRepository,
   type CommandResult,
+  type DesignTurnInput,
+  type DesignTurnResult,
   type ProgressEvent,
   type RepositoryRequestDto,
   type StepResult,
@@ -294,13 +298,6 @@ function analysePrompt(brief: StepBrief): string {
   ].join("\n");
 }
 
-function planPrompt(brief: StepBrief): string {
-  const parts = [...ticketSection(brief), ...analysisSection(brief), ...repositoriesSection(false), ...guidanceSection(), ...questionsSection(brief)];
-  if (brief.feedback) parts.push("", "## The requester asked for changes to the previous plan", brief.feedback);
-  parts.push("", "Assess the issue against the repository and call submit_assessment.");
-  return parts.join("\n");
-}
-
 function subtaskSection(brief: StepBrief): string[] {
   const plan = brief.plan!;
   const index = brief.subtaskIndex ?? 0;
@@ -369,7 +366,6 @@ function reviewPrompt(brief: StepBrief, change: { base: string; files: string })
 
 interface AgentOutcome {
   analysis?: Analysis;
-  assessment?: Assessment;
   review?: ReviewReport;
   summary?: string;
   lastMessage?: string;
@@ -379,9 +375,9 @@ interface AgentOutcome {
 /** A failed tool call keeps the agent loop running, so the model can read the problem and retry. */
 const failure = (message: string): ToolResultObject => ({ textResultForLlm: message, resultType: "failure", error: message });
 
-function analystTools(brief: StepBrief, outcome: AgentOutcome) {
-  return [
-    defineTool("request_repository", {
+/** request_repository: the analyst and the architect open another catalog repository read-only (AD-37). */
+function repositoryTool(brief: StepBrief) {
+  return defineTool("request_repository", {
       description:
         "Open another repository of the product catalog read-only in this workspace, to check whether that product is involved. Returns the directory of the checkout.",
       parameters: z.object({
@@ -409,7 +405,12 @@ function analystTools(brief: StepBrief, outcome: AgentOutcome) {
           guidance: opened.guidance.map((g) => ({ file: g.file, content: g.text })),
         };
       },
-    }),
+    });
+}
+
+function analystTools(brief: StepBrief, outcome: AgentOutcome) {
+  return [
+    repositoryTool(brief),
     defineTool("submit_analysis", {
       description: "Submit the analysis of the work item: either clarifying questions (ready=false) or the full analysis (ready=true).",
       parameters: Analysis,
@@ -424,25 +425,6 @@ function analystTools(brief: StepBrief, outcome: AgentOutcome) {
         if (check.problems.length) return failure(`The analysis has problems: ${check.problems.join(" ")} Fix them and call submit_analysis again.`);
         outcome.analysis = parsed.data;
         return "Analysis recorded.";
-      },
-    }),
-  ];
-}
-
-function plannerTools(outcome: AgentOutcome) {
-  return [
-    defineTool("submit_assessment", {
-      description: "Submit your assessment of the issue: either clarifying questions (ready=false) or the plan (ready=true).",
-      parameters: Assessment,
-      skipPermission: true,
-      isTerminal: true,
-      handler: async (args: Assessment) => {
-        const parsed = Assessment.safeParse(args);
-        if (!parsed.success) return failure(`Invalid assessment: ${parsed.error.issues.map((i) => i.message).join("; ")}`);
-        if (parsed.data.ready && !parsed.data.plan) return failure("When ready is true you must include the plan.");
-        if (!parsed.data.ready && parsed.data.questions.length === 0) return failure("When ready is false you must ask at least one question.");
-        outcome.assessment = parsed.data;
-        return "Assessment recorded.";
       },
     }),
   ];
@@ -493,14 +475,7 @@ interface AgentRun {
 
 async function runAgent(brief: StepBrief, profile: AgentProfile, cwd: string, run: AgentRun): Promise<AgentOutcome> {
   const outcome: AgentOutcome = {};
-  const tools =
-    brief.kind === "analyse"
-      ? analystTools(brief, outcome)
-      : brief.kind === "plan"
-        ? plannerTools(outcome)
-        : brief.kind === "review"
-          ? reviewerTools(brief, outcome)
-          : implementerTools(outcome);
+  const tools = brief.kind === "analyse" ? analystTools(brief, outcome) : brief.kind === "review" ? reviewerTools(brief, outcome) : implementerTools(outcome);
 
   const onPermissionRequest = (request: PermissionRequest): PermissionRequestResult => {
     const kind = request.kind as string;
@@ -533,14 +508,7 @@ async function runAgent(brief: StepBrief, profile: AgentProfile, cwd: string, ru
     });
     const timeoutMs = brief.timeoutMinutes * 60 * 1000;
     await session.sendAndWait({ prompt: run.prompt }, timeoutMs);
-    const missing =
-      brief.kind === "analyse"
-        ? outcome.analysis ? null : "submit_analysis"
-        : brief.kind === "plan"
-          ? outcome.assessment ? null : "submit_assessment"
-          : brief.kind === "review"
-            ? outcome.review ? null : "submit_review"
-            : null;
+    const missing = brief.kind === "analyse" ? (outcome.analysis ? null : "submit_analysis") : brief.kind === "review" ? (outcome.review ? null : "submit_review") : null;
     if (missing) {
       report("status", `Asking the agent to call ${missing}`);
       await session.sendAndWait({ prompt: `Call ${missing} now with your result.`, source: "system" }, 10 * 60 * 1000);
@@ -554,6 +522,248 @@ async function runAgent(brief: StepBrief, profile: AgentProfile, cwd: string, ru
     await client.stop().catch(() => undefined);
   }
   return outcome;
+}
+
+// Design session (FR-P1, AD-34): the architect keeps one Copilot session across many turns ----------
+
+const COPILOT_DIR = join(ROOT, ".copilot");
+const CHECKPOINT = join(ROOT, "checkpoint.tgz");
+const TURN_TIMEOUT_MS = 15 * 60 * 1000;
+
+function exec(command: string, args: string[]): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { maxBuffer: 16 * 1024 * 1024 }, (err, _stdout, stderr) => (err ? reject(new Error(stderr.trim() || err.message)) : resolve()));
+  });
+}
+
+/** What the architect produced in the turn it is working on. */
+interface TurnDraft {
+  texts: string[];
+  components: unknown[];
+  plan?: HandoffPlan;
+  proposed: boolean;
+}
+
+function designContext(brief: StepBrief): string[] {
+  return [...ticketSection(brief), ...analysisSection(brief), ...catalogSection(brief), ...repositoriesSection(true), ...guidanceSection()];
+}
+
+/** The prompt of a turn. A session that still has its memory gets only the requester's words. */
+function turnPrompt(brief: StepBrief, turn: DesignTurnInput, start: "new" | "restored" | "rebuilt" | null): string {
+  const design = brief.design!;
+  const says = turn.messages.length ? ["The requester says:", ...turn.messages.map((m) => (turn.messages.length > 1 ? `- ${m}` : m))] : [];
+  if (start === "new" || (start === "rebuilt" && turn.opening)) {
+    return [...designContext(brief), "", "Open the design session now, as your instructions describe, and submit a first draft plan with submit_plan."].join("\n");
+  }
+  if (start === "rebuilt") {
+    // The saved session could not be restored: the record of the session stands in for its memory.
+    // The messages of this turn are already in that record; they are given once, at the end.
+    const record = [...design.history];
+    for (const message of [...turn.messages].reverse()) {
+      const last = record[record.length - 1];
+      if (last?.role !== "requester" || last.text !== message.slice(0, last.text.length)) break;
+      record.pop();
+    }
+    return [
+      ...designContext(brief),
+      "",
+      "## The design session so far",
+      "You are continuing a design session. Your earlier working memory is gone; this is the record of it.",
+      ...record.map((m) => `${m.role === "requester" ? "Requester" : "You (architect)"}: ${m.text}`),
+      ...(design.latestPlan ? ["", `## The current plan (version ${design.latestVersion})`, "```json", JSON.stringify(design.latestPlan, null, 1), "```"] : []),
+      "",
+      ...says,
+    ].join("\n");
+  }
+  return says.join("\n");
+}
+
+async function runDesignSession(brief: StepBrief): Promise<StepResult> {
+  const design = brief.design!;
+  let draft: TurnDraft = { texts: [], components: [], proposed: false };
+  let planKnown = design.latestVersion !== undefined;
+
+  const tools = [
+    repositoryTool(brief),
+    defineTool("submit_plan", {
+      description:
+        "Submit the complete hand-off plan (not a patch). It becomes a new draft version on the requester's plan card when your reply ends. Call it whenever the plan changes.",
+      parameters: HandoffPlan,
+      skipPermission: true,
+      handler: async (args: HandoffPlan) => {
+        const parsed = HandoffPlan.safeParse(args);
+        if (!parsed.success) return failure(`Invalid plan: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+        // The gateway checks the plan against the product catalog and the dependency rules (FR-P2).
+        const res = await gateway("/v1/session/plan/check", jsonInit(parsed.data));
+        const check = res.ok ? ((await res.json()) as { problems: string[] }) : { problems: [`The plan could not be checked (${res.status})`] };
+        if (check.problems.length) return failure(`The plan has problems: ${check.problems.join(" ")} Fix them and call submit_plan again.`);
+        draft.plan = parsed.data;
+        planKnown = true;
+        return "Plan accepted. It is shown to the requester as a new draft version when your reply ends. Say what you changed and why.";
+      },
+    }),
+    defineTool("propose_plan", {
+      description: "Put the current plan up for the requester's approval. Call it when the requester asks for it or agrees to it.",
+      parameters: z.object({}),
+      skipPermission: true,
+      handler: async () => {
+        if (!planKnown) return failure("There is no plan yet. Call submit_plan first.");
+        draft.proposed = true;
+        return "The plan is put up for approval when your reply ends. Tell the requester to use the Approve button on the plan card; you cannot approve it.";
+      },
+    }),
+    defineTool("render", {
+      description: "Show structured content in the conversation: a table, or a form with options for the requester to choose from.",
+      parameters: z.object({ components: z.array(z.unknown()).min(1).max(5) }),
+      skipPermission: true,
+      handler: async ({ components }: { components: unknown[] }) => {
+        draft.components.push(...components);
+        return { rendered: components.length };
+      },
+    }),
+  ];
+
+  const onPermissionRequest = (request: PermissionRequest): PermissionRequestResult => {
+    const kind = request.kind as string;
+    if ((architect.allow as string[]).includes(kind)) return { kind: "approve-once" };
+    return { kind: "reject", feedback: `${kind} is not allowed for the architect agent: it works read-only.` };
+  };
+
+  // A saved session is put back before the runtime starts, so the runtime finds it under its own directory.
+  let restoredFiles = false;
+  if (design.hasCheckpoint) {
+    const res = await gateway("/v1/session/checkpoint");
+    if (res.ok && res.body) {
+      await pipeline(Readable.fromWeb(res.body as import("node:stream/web").ReadableStream), createWriteStream(CHECKPOINT));
+      await exec("tar", ["-xzf", CHECKPOINT, "-C", ROOT]).then(
+        () => (restoredFiles = true),
+        (err: Error) => report("error", `The saved session could not be unpacked: ${err.message}`),
+      );
+      await rm(CHECKPOINT, { force: true });
+    }
+  }
+
+  const config = {
+    model: brief.model,
+    provider: { type: "anthropic" as const, baseUrl: ANTHROPIC_BASE_URL, apiKey: "injected-by-egress-proxy" },
+    workingDirectory: REPOS,
+    systemMessage: { content: architect.instructions },
+    skipCustomInstructions: true,
+    streaming: true,
+    // Long design sessions outgrow the context window; the runtime compacts them in the background (R-14).
+    infiniteSessions: { enabled: true },
+    tools,
+    onPermissionRequest,
+  };
+  let client = new CopilotClient({ useLoggedInUser: false, baseDirectory: COPILOT_DIR, workingDirectory: REPOS, logLevel: "error" });
+  await client.start();
+  let session: CopilotSession | undefined;
+  let start: "new" | "restored" | "rebuilt" = "new";
+  if (restoredFiles) {
+    try {
+      session = await client.resumeSession(design.sessionId, config);
+      start = "restored";
+      report("status", "Session restored from its checkpoint");
+    } catch (err) {
+      // R-13 fallback: the session is rebuilt from the record (analysis, conversation, latest plan).
+      report("error", `The saved session could not be restored (${(err as Error).message}); rebuilding it from the record`);
+      await client.stop().catch(() => undefined);
+      await rm(COPILOT_DIR, { recursive: true, force: true });
+      client = new CopilotClient({ useLoggedInUser: false, baseDirectory: COPILOT_DIR, workingDirectory: REPOS, logLevel: "error" });
+      await client.start();
+    }
+  }
+  if (!session) {
+    session = await client.createSession({ ...config, sessionId: design.sessionId });
+    start = design.history.length ? "rebuilt" : "new";
+    if (start === "rebuilt") report("status", "Session rebuilt from the record of the conversation");
+  }
+
+  // Reply text goes to the conversation as it is written; the gateway passes it on without it entering any workflow.
+  let pendingDelta = "";
+  const flushDelta = async () => {
+    if (!pendingDelta) return;
+    const text = pendingDelta;
+    pendingDelta = "";
+    await postJson("/v1/session/delta", { text }).catch(() => undefined);
+  };
+  const deltaTimer = setInterval(() => void flushDelta(), 300);
+  // A reply can be several messages with tool calls between them; shown as paragraphs, like the stored reply.
+  let paragraphBreak = false;
+  session.on((event) => {
+    onEvent(event);
+    if (event.type === "assistant.message_delta" && event.data.deltaContent) {
+      pendingDelta += (paragraphBreak ? "\n\n" : "") + event.data.deltaContent;
+      paragraphBreak = false;
+    }
+    if (event.type === "assistant.message" && event.data.content?.trim()) {
+      draft.texts.push(event.data.content.trim());
+      paragraphBreak = true;
+    }
+  });
+
+  const saveCheckpoint = async () => {
+    await session!.disconnect().catch(() => undefined);
+    await client.stop().catch(() => undefined);
+    if (!existsSync(COPILOT_DIR)) throw new Error("The runtime left no session state to save");
+    await exec("tar", ["-czf", CHECKPOINT, "-C", ROOT, ".copilot"]);
+    const upload = await gateway("/v1/session/checkpoint", {
+      method: "PUT",
+      headers: { "content-type": "application/octet-stream", "content-length": String(statSync(CHECKPOINT).size) },
+      body: Readable.toWeb(createReadStream(CHECKPOINT)) as unknown as RequestInit["body"],
+      duplex: "half",
+    } as RequestInit);
+    if (!upload.ok) throw new Error(`Uploading the checkpoint failed: ${upload.status}`);
+  };
+
+  try {
+    let first = true;
+    for (;;) {
+      const res = await gateway("/v1/session/turn?wait=20");
+      // The step was ended from outside (the session was closed or replaced): nothing more to do here.
+      if (res.status === 401) return { status: "succeeded", summary: "Design session workspace released" };
+      if (!res.ok) {
+        await sleep(2000);
+        continue;
+      }
+      const next = (await res.json()) as { turn?: DesignTurnInput; checkpoint?: boolean; close?: boolean };
+      if (next.close) return { status: "succeeded", summary: "Design session closed" };
+      if (next.checkpoint) {
+        report("status", "Saving the session before the workspace is shut down");
+        await saveCheckpoint();
+        return { status: "succeeded", summary: "Design session saved; the workspace can be shut down" };
+      }
+      if (!next.turn) continue;
+
+      const turn = next.turn;
+      draft = { texts: [], components: [], proposed: false };
+      paragraphBreak = false;
+      report("status", turn.opening ? "Opening the design session" : `Turn: ${turn.messages.join(" / ").slice(0, 300)}`);
+      let result: DesignTurnResult;
+      try {
+        await session.sendAndWait({ prompt: turnPrompt(brief, turn, first ? start : null) }, TURN_TIMEOUT_MS);
+        result = {
+          turnId: turn.turnId,
+          status: "succeeded",
+          text: draft.texts.join("\n\n"),
+          components: draft.components,
+          plan: draft.plan,
+          proposed: draft.proposed,
+          session: first ? start : "continued",
+        };
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        report("error", message);
+        result = { turnId: turn.turnId, status: "failed", text: "", components: [], proposed: false, session: first ? start : "continued", error: message.slice(0, 1000) };
+      }
+      first = false;
+      await flushDelta();
+      await flush();
+      await postJson("/v1/session/turn-result", result);
+    }
+  } finally {
+    clearInterval(deltaTimer);
+  }
 }
 
 // Main ------------------------------------------------------------------------------------
@@ -583,13 +793,7 @@ async function main(): Promise<StepResult> {
     return { status: "succeeded", summary, analysis: a };
   }
 
-  if (brief.kind === "plan") {
-    const outcome = await runAgent(brief, planner, primary.dir, { prompt: planPrompt(brief) });
-    if (!outcome.assessment) return { status: "failed", summary: "The planner did not submit an assessment", error: outcome.lastMessage?.slice(0, 500) };
-    const a = outcome.assessment;
-    const summary = a.ready ? `Plan with ${a.plan?.subtasks.length ?? 0} sub-tasks` : `${a.questions.length} clarifying question(s)`;
-    return { status: "succeeded", summary, assessment: a };
-  }
+  if (brief.kind === "design") return runDesignSession(brief);
 
   if (brief.kind === "review") {
     // The reviewer sees the change as a diff from the base commit of the default branch, in a checkout it cannot hand back.

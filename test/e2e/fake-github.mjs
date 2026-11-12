@@ -27,7 +27,7 @@ const SEED = {
   },
 };
 
-const state = { issues: new Map(), comments: new Map(), events: new Map(), labels: new Map(), pulls: [], nextIssue: 1, nextComment: 1 };
+const state = { issues: new Map(), comments: new Map(), events: new Map(), labels: new Map(), subIssues: [], pulls: [], nextIssue: 1, nextComment: 1 };
 
 const git = (args, cwd) => execFileSync("git", ["-c", "safe.directory=*", ...args], { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString();
 
@@ -59,6 +59,7 @@ const readBody = (req) =>
   });
 const issueKey = (o, r, n) => `${o}/${r}#${n}`;
 const issueJson = (o, r, i) => ({
+  id: i.id,
   number: i.number,
   title: i.title,
   body: i.body,
@@ -76,7 +77,8 @@ const touch = (o, r, n) => {
 function createIssue(o, r, title, body, labels = []) {
   const number = state.nextIssue++;
   const key = issueKey(o, r, number);
-  state.issues.set(key, { number, title, body, state: "open", updatedAt: new Date().toISOString() });
+  // The id is global (like GitHub's), the number is what people see.
+  state.issues.set(key, { id: 9000 + number, number, title, body, state: "open", updatedAt: new Date().toISOString() });
   state.labels.set(key, new Set());
   state.comments.set(key, []);
   state.events.set(key, []);
@@ -114,6 +116,7 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, {
           issues: [...state.issues.entries()].map(([k, v]) => ({ k, ...v, labels: [...state.labels.get(k)] })),
           comments: Object.fromEntries(state.comments),
+          subIssues: state.subIssues,
           pulls: state.pulls,
         });
       }
@@ -139,8 +142,9 @@ const server = http.createServer(async (req, res) => {
     if (kind === "labels" && m === "POST") return send(res, 201, {});
     if (kind === "issues" && !n && m === "GET") {
       const label = url.searchParams.get("labels");
+      const all = url.searchParams.get("state") === "all";
       const list = [...state.issues.entries()]
-        .filter(([k, i]) => k.startsWith(`${o}/${r}#`) && i.state === "open" && (!label || state.labels.get(k).has(label)))
+        .filter(([k, i]) => k.startsWith(`${o}/${r}#`) && (all || i.state === "open") && (!label || state.labels.get(k).has(label)))
         .map(([, i]) => issueJson(o, r, i));
       const etag = `"${createHash("sha1").update(JSON.stringify(list)).digest("hex")}"`;
       if (req.headers["if-none-match"] === etag) return send(res, 304, undefined, { etag });
@@ -148,10 +152,26 @@ const server = http.createServer(async (req, res) => {
     }
     if (kind === "issues" && !n && m === "POST") {
       const b = await readBody(req);
-      const number = createIssue(o, r, b.title, b.body ?? "");
+      const number = createIssue(o, r, b.title, b.body ?? "", b.labels ?? []);
       return send(res, 201, issueJson(o, r, state.issues.get(issueKey(o, r, number))));
     }
     const key = issueKey(o, r, n);
+    if (kind === "issues" && n && !sub && m === "PATCH") {
+      const i = state.issues.get(key);
+      if (!i) return send(res, 404, { message: "no issue" });
+      const b = await readBody(req);
+      if (b.state) i.state = b.state;
+      touch(o, r, n);
+      return send(res, 200, issueJson(o, r, i));
+    }
+    // Sub-issues: the child is named by its global id and may live in another repository.
+    if (kind === "issues" && sub === "sub_issues" && m === "POST") {
+      const b = await readBody(req);
+      const child = [...state.issues.entries()].find(([, i]) => i.id === b.sub_issue_id);
+      if (!state.issues.has(key) || !child) return send(res, 404, { message: "no issue" });
+      if (!state.subIssues.some((x) => x.parent === key && x.child === child[0])) state.subIssues.push({ parent: key, child: child[0] });
+      return send(res, 201, issueJson(o, r, state.issues.get(key)));
+    }
     if (kind === "issues" && n && !sub && m === "GET") {
       const i = state.issues.get(key);
       return i ? send(res, 200, issueJson(o, r, i)) : send(res, 404, { message: "no issue" });

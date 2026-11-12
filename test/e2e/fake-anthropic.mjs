@@ -1,4 +1,4 @@
-// Fake Anthropic Messages API for end-to-end tests. It plays the analyst, the planner, the implementer, the reviewer
+// Fake Anthropic Messages API for end-to-end tests. It plays the analyst, the architect, the implementer, the reviewer
 // and the front-door assistant deterministically, based on the tools offered in each request.
 // Markers in the issue text choose the analyst's behavior: [ask] asks a question first, [web] opens the
 // second repository and finds two products, [guided] proposes the guided track after one rejected submission.
@@ -53,7 +53,7 @@ function findShellTool(tools) {
 }
 
 // What the tests can ask about afterwards (GET /_test/state).
-const seen = { requests: 0, guidanceInPrompt: false, guidanceInSystem: false };
+const seen = { requests: 0, guidanceInPrompt: false, guidanceInSystem: false, planSentBack: false, designTurns: [] };
 const GUIDANCE_MARKER = "E2E-GUIDANCE-MARKER";
 
 const analysisBase = {
@@ -89,9 +89,14 @@ function analyse(prompt, used) {
     if (submits) return [{ type: "text", text: "Analysis submitted." }];
     return submit({
       ...analysisBase,
-      understanding: "Add subtract to the calculator and show it on the shop page.",
-      products: [...analysisBase.products, { product: "shop", repositories: ["acme/web"], reason: "The page must call the new function.", changes: "Use subtract on the page." }],
-      likelyFiles: ["acme/demo:subtract.js", "acme/web:page.js"],
+      understanding: "Add negate to the calculator and show negated amounts on the shop page.",
+      products: [
+        { ...analysisBase.products[0], changes: "A new negate function." },
+        { product: "shop", repositories: ["acme/web"], reason: "The page must call the new function.", changes: "Use negate on the page." },
+      ],
+      likelyFiles: ["acme/demo:negate.js", "acme/web:shop.js"],
+      acceptanceCriteria: ["negate(2) returns -2", "The shop page shows negated amounts"],
+      approach: "Create negate.js in the calculator, then use it from the shop.",
     });
   }
   if (/\[guided\]/.test(prompt)) {
@@ -197,6 +202,143 @@ function review(prompt, used) {
   return [{ type: "tool_use", id: id("toolu"), name: "submit_review", input: report }];
 }
 
+/** All prompts of the conversation so far: user messages that carry text, oldest first. */
+const userTexts = (messages) => messages.filter((m) => m.role === "user").map((m) => textOf(m.content)).filter((t) => t.trim());
+
+/** What the requester said, from the prompts of a design session (also from the record of a rebuilt session). */
+const requesterSaid = (messages) =>
+  userTexts(messages).flatMap((t) => [
+    ...[...t.matchAll(/^Requester: (.+)$/gm)].map((m) => m[1]),
+    ...(t.includes("The requester says:") ? t.slice(t.lastIndexOf("The requester says:") + 19).split("\n").map((l) => l.replace(/^- /, "").trim()).filter(Boolean) : []),
+  ]);
+
+const CONSTRAINT = /constraint|must not|do not|don't/i;
+
+/** The hand-off plan the fake architect writes: by the ticket's markers, plus the constraints the requester gave. */
+function planFor(ticket, constraints) {
+  const revised = constraints.length > 0;
+  const base = {
+    outOfScope: ["Division"],
+    risks: ["Callers may pass strings"],
+    assumptions: ["Numbers only"],
+    constraints,
+    definitionOfDone: ["Every sub-task is merged"],
+  };
+  if (/\[web\]/.test(ticket)) {
+    return {
+      ...base,
+      goal: "Customers see a negated amount on the shop page.",
+      approach: "The calculator library gets a negate function; the shop page then uses it.",
+      contracts: [{ name: "negate(a)", description: "negate(a: number): number, exported from negate.js. Additive, so existing callers keep working.", providers: ["calc-negate"], consumers: ["shop-page"] }],
+      rollout: "Merge the calculator change first; the shop change builds on it.",
+      subtasks: [
+        // Listed consumer first on purpose: the build order must come from the dependency, not from the list.
+        {
+          key: "shop-page",
+          title: "Use negate on the shop page",
+          description: "Create shop.js that uses the new negate function. [file:shop.js]",
+          acceptanceCriteria: revised ? ["shop.js exists", "The existing page.js is untouched"] : ["shop.js exists"],
+          product: "shop",
+          repository: "acme/web",
+          likelyFiles: ["shop.js"],
+          dependsOn: ["calc-negate"],
+          size: "S",
+        },
+        {
+          key: "calc-negate",
+          title: "Add negate to the calculator",
+          description: "Create negate.js exporting negate(a). [file:negate.js]",
+          acceptanceCriteria: ["negate(2) returns -2"],
+          product: "calc",
+          repository: "acme/demo",
+          likelyFiles: ["negate.js"],
+          dependsOn: [],
+          size: "S",
+        },
+      ],
+    };
+  }
+  return {
+    ...base,
+    goal: "The calculator can multiply.",
+    approach: "Add a multiply function in its own file, then document it.",
+    contracts: [],
+    rollout: "",
+    subtasks: [
+      {
+        key: "multiply",
+        title: "Add multiply function",
+        description: "Create multiply.js exporting multiply(a, b). [file:multiply.js]",
+        acceptanceCriteria: revised ? ["multiply(2, 3) returns 6", "multiply(2, 0) returns 0"] : ["multiply(2, 3) returns 6"],
+        product: "calc",
+        repository: "acme/demo",
+        likelyFiles: ["multiply.js"],
+        dependsOn: [],
+        size: "S",
+      },
+      {
+        key: "notes",
+        title: "Document multiply",
+        description: "Describe multiply in NOTES.md. [file:NOTES.md]",
+        acceptanceCriteria: ["NOTES.md mentions multiply"],
+        product: "calc",
+        repository: "acme/demo",
+        likelyFiles: ["NOTES.md"],
+        dependsOn: ["multiply"],
+        size: "S",
+      },
+    ],
+  };
+}
+
+/**
+ * The architect of a design session. It opens the session with a first draft plan (for a [guided] ticket after one
+ * plan the gateway must send back), writes a new version when the requester gives a constraint, puts the plan up
+ * for approval when asked to, shows a table when asked for one, and otherwise only answers.
+ */
+function design(messages) {
+  const prompts = userTexts(messages);
+  const ticket = prompts[0] ?? "";
+  const last = prompts[prompts.length - 1] ?? "";
+  const since = toolUsesSinceLastPrompt(messages);
+  const tool = (name, input) => ({ type: "tool_use", id: id("toolu"), name, input });
+  const said = requesterSaid(messages);
+  const constraints = [...new Set(said.filter((t) => CONSTRAINT.test(t)))];
+  const now = last.includes("The requester says:") ? last.slice(last.lastIndexOf("The requester says:") + 19) : "";
+
+  if (since.length === 0) {
+    // One entry per turn, so the test can tell whether a session that was saved and restored still had its memory.
+    seen.designTurns.push({ prompts: prompts.length, remembersOpening: prompts.length > 1 && /Open the design session now/.test(prompts[0]), rebuilt: /Your earlier working memory is gone/.test(last), says: now.trim().slice(0, 80) });
+  }
+  if (JSON.stringify(messages[messages.length - 1] ?? "").includes("The plan has problems")) seen.planSentBack = true;
+
+  if (/Open the design session now/.test(last)) {
+    const submits = since.filter((u) => u.name === "submit_plan").length;
+    if (/\[guided\]/.test(ticket) && submits === 0) {
+      const broken = planFor(ticket, []);
+      broken.subtasks[1].dependsOn = ["multiplication"];
+      return [{ type: "text", text: "I read the ticket and the analysis, and looked at the code." }, tool("submit_plan", broken)];
+    }
+    if (submits === 0 || (/\[guided\]/.test(ticket) && submits === 1)) {
+      return [...(submits ? [] : [{ type: "text", text: "I read the ticket and the analysis, and looked at the code." }]), tool("submit_plan", planFor(ticket, []))];
+    }
+    return [{ type: "text", text: "Here is a first draft of the plan. Tell me what to change, or ask me to put it up for your approval." }];
+  }
+
+  if (since.length) {
+    const did = since[since.length - 1].name;
+    if (did === "submit_plan") return [{ type: "text", text: `I changed the plan: it now respects "${constraints[constraints.length - 1]}".` }];
+    if (did === "propose_plan") return [{ type: "text", text: "The plan is up for your approval. Use the Approve button on the plan card." }];
+    return [{ type: "text", text: "Here is the comparison you asked for." }];
+  }
+  if (/approv|put it up|go ahead/i.test(now)) return [tool("propose_plan", {})];
+  if (CONSTRAINT.test(now)) return [{ type: "text", text: "Understood, I am updating the plan." }, tool("submit_plan", planFor(ticket, constraints))];
+  if (/table|compare/i.test(now)) {
+    return [tool("render", { components: [{ type: "table", title: "Options", columns: ["Option", "Effort"], rows: [["One file per function", "S"], ["One module", "M"]] }] })];
+  }
+  return [{ type: "text", text: "Two sub-tasks keep each pull request small enough to review on its own. The plan stays as it is." }];
+}
+
 /** Decides the next assistant content blocks for a request. */
 function decide(body) {
   const tools = body.tools ?? [];
@@ -213,22 +355,8 @@ function decide(body) {
 
   if (names.includes("submit_review")) return review(firstUserText(messages), used);
 
-  // Planner (guided track, until the architect agent exists): two sub-tasks, each naming the file it creates.
-  if (names.includes("submit_assessment")) {
-    if (used.some((u) => u.name === "submit_assessment")) return [{ type: "text", text: "Assessment submitted." }];
-    const input = {
-      ready: true,
-      questions: [],
-      plan: {
-        summary: "Add a multiply function, then document it.",
-        subtasks: [
-          { title: "Add multiply function", description: "Create multiply.js exporting multiply(a, b). [file:multiply.js]", acceptanceCriteria: ["multiply(2, 3) returns 6"] },
-          { title: "Document multiply", description: "Describe multiply in NOTES.md. [file:NOTES.md]", acceptanceCriteria: ["NOTES.md mentions multiply"] },
-        ],
-      },
-    };
-    return [{ type: "tool_use", id: id("toolu"), name: "submit_assessment", input }];
-  }
+  // Architect (design session of the guided track)
+  if (names.includes("submit_plan")) return design(messages);
 
   // Implementer
   if (names.includes("submit_result")) return implement(tools, messages);
@@ -257,7 +385,7 @@ function decide(body) {
   return [{ type: "text", text: "OK." }];
 }
 
-function writeStream(res, body, blocks) {
+async function writeStream(res, body, blocks) {
   const msgId = id("msg");
   const ev = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
@@ -265,16 +393,20 @@ function writeStream(res, body, blocks) {
     type: "message_start",
     message: { id: msgId, type: "message", role: "assistant", model: body.model, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 100, output_tokens: 1 } },
   });
-  blocks.forEach((b, index) => {
+  for (const [index, b] of blocks.entries()) {
     if (b.type === "text") {
       ev("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } });
-      ev("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: b.text } });
+      // Word by word with a short pause, so a conversation can show the reply while it is written.
+      for (const piece of b.text.match(/\S+\s*/g) ?? [b.text]) {
+        ev("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: piece } });
+        await new Promise((r) => setTimeout(r, 40));
+      }
     } else {
       ev("content_block_start", { type: "content_block_start", index, content_block: { type: "tool_use", id: b.id, name: b.name, input: {} } });
       ev("content_block_delta", { type: "content_block_delta", index, delta: { type: "input_json_delta", partial_json: JSON.stringify(b.input) } });
     }
     ev("content_block_stop", { type: "content_block_stop", index });
-  });
+  }
   const stop = blocks.some((b) => b.type === "tool_use") ? "tool_use" : "end_turn";
   ev("message_delta", { type: "message_delta", delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: 20 } });
   ev("message_stop", { type: "message_stop" });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { Analysis } from "@orch/contracts";
-import { CatalogError, catalogFromRepositories, decideTrack, fastTrackLimitsExceeded, parseCatalog, validateAnalysis } from "./index.js";
+import { buildOrder, diffPlans, type Analysis, type HandoffPlan } from "@orch/contracts";
+import { CatalogError, catalogFromRepositories, decideTrack, fastTrackLimitsExceeded, parseCatalog, validateAnalysis, validateHandoffPlan } from "./index.js";
 
 const YAML = `
 products:
@@ -97,6 +97,60 @@ describe("product catalog", () => {
     expect(fastTrackLimitsExceeded(["a", "b", "c", "d", "e", "f"], demo, 5)[0]).toMatch(/6 files/);
     expect(fastTrackLimitsExceeded(["api/v2.yaml"], demo, 5)[0]).toMatch(/interface of calc \(api\/v2.yaml\)/);
     expect(fastTrackLimitsExceeded(["a", "b"], undefined, 1)).toHaveLength(1);
+  });
+
+  const plan: HandoffPlan = {
+    goal: "Show discounts",
+    approach: "Add the field, then show it",
+    outOfScope: [],
+    risks: [],
+    assumptions: [],
+    constraints: ["Do not change add()"],
+    definitionOfDone: [],
+    contracts: [{ name: "discount field", description: "number, optional", providers: ["api"], consumers: ["page"] }],
+    rollout: "library first",
+    subtasks: [
+      { key: "page", title: "Show the discount", description: "d", acceptanceCriteria: ["shown"], product: "shop", repository: "acme/web", likelyFiles: [], dependsOn: ["api"], size: "S" },
+      { key: "api", title: "Add the discount field", description: "d", acceptanceCriteria: ["returned"], product: "calc", repository: "acme/demo", likelyFiles: [], dependsOn: [], size: "S" },
+    ],
+  };
+
+  it("accepts a plan whose sub-tasks each change one catalog repository, and orders them by their dependencies", () => {
+    expect(validateHandoffPlan(plan, catalog)).toEqual([]);
+    expect(buildOrder(plan)!.map((st) => st.key)).toEqual(["api", "page"]);
+  });
+
+  it("sends back a plan with unknown products, wrong repositories, bad dependencies or contracts without sides", () => {
+    const st = plan.subtasks[1]!;
+    const problems = (subtasks: HandoffPlan["subtasks"], contracts = plan.contracts) => validateHandoffPlan({ ...plan, subtasks, contracts }, catalog).join(" | ");
+    expect(problems([plan.subtasks[0]!, { ...st, product: "nope" }])).toMatch(/unknown product "nope"/);
+    expect(problems([plan.subtasks[0]!, { ...st, repository: "acme/web" }])).toMatch(/belongs to product "shop", not "calc"/);
+    expect(problems([plan.subtasks[0]!, { ...st, repository: "acme/other" }])).toMatch(/not in the catalog/);
+    expect(problems([plan.subtasks[0]!, { ...st, key: "page" }])).toMatch(/used twice/);
+    expect(problems([plan.subtasks[0]!, { ...st, dependsOn: ["page"] }])).toMatch(/form a cycle/);
+    expect(problems([{ ...plan.subtasks[0]!, dependsOn: ["gone"] }, st])).toMatch(/not a sub-task of this plan/);
+    expect(problems(plan.subtasks, [{ ...plan.contracts[0]!, consumers: [] }])).toMatch(/must name the sub-tasks/);
+  });
+
+  it("says what changed between two plan versions, matching sub-tasks by key", () => {
+    expect(diffPlans(null, plan)).toEqual([]);
+    expect(diffPlans(plan, plan)).toEqual([]);
+    const next: HandoffPlan = {
+      ...plan,
+      constraints: [...plan.constraints, "Keep it under 50 lines"],
+      contracts: [],
+      subtasks: [
+        { ...plan.subtasks[1]!, title: "Add the discount field to the result", size: "M" },
+        { ...plan.subtasks[0]!, key: "docs", title: "Document the discount", dependsOn: [] },
+      ],
+    };
+    expect(diffPlans(plan, next)).toEqual([
+      { kind: "changed", what: "plan", title: "Constraints" },
+      { kind: "changed", what: "subtask", title: "Add the discount field to the result", fields: ["title", "size"] },
+      { kind: "added", what: "subtask", title: "Document the discount" },
+      { kind: "removed", what: "subtask", title: "Show the discount" },
+      { kind: "removed", what: "contract", title: "discount field" },
+    ]);
   });
 
   it("checks an analysis against the catalog", () => {

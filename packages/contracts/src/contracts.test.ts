@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Assessment, findingsToFix, groupTickets, mergeReview, parseRepoSlug, sanitizeAgentComponents, type ReviewReport, type RunDto } from "./index.js";
+import { findingsToFix, groupTickets, mergeReview, parseRepoSlug, sanitizeAgentComponents, type ReviewReport, type RunDto } from "./index.js";
 
 describe("agent components", () => {
   it("drops system-only cards an agent tries to emit", () => {
@@ -19,22 +19,6 @@ describe("repository slugs", () => {
     expect(parseRepoSlug(" acme/demo ")).toEqual({ owner: "acme", name: "demo" });
     expect(() => parseRepoSlug("acme")).toThrow();
     expect(() => parseRepoSlug("a/b/c")).toThrow();
-  });
-});
-
-describe("assessment schema", () => {
-  it("accepts questions or a plan", () => {
-    expect(Assessment.safeParse({ ready: false, questions: ["Why?"] }).success).toBe(true);
-    expect(
-      Assessment.safeParse({
-        ready: true,
-        questions: [],
-        plan: { summary: "s", subtasks: [{ title: "Add it", description: "d", acceptanceCriteria: ["works"] }] },
-      }).success,
-    ).toBe(true);
-  });
-  it("rejects plans without sub-tasks", () => {
-    expect(Assessment.safeParse({ ready: true, questions: [], plan: { summary: "s", subtasks: [] } }).success).toBe(false);
   });
 });
 

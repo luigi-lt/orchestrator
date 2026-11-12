@@ -6,6 +6,13 @@ import type {
   BriefRepository,
   Catalog,
   Component,
+  DesignSessionState,
+  DesignTurnInput,
+  DesignTurnResult,
+  HandoffPlan,
+  PlanChange,
+  PlanVersionDto,
+  PlanVersionStatus,
   ConversationDto,
   MessageAuthor,
   MessageDto,
@@ -439,6 +446,8 @@ interface SubtaskRow {
   pr_number: number | null;
   pr_url: string | null;
   conversation_id: string | null;
+  ticket_number: number | null;
+  ticket_url: string | null;
   review: SubtaskReview | null;
   verification: Verification | null;
   fix_rounds: number;
@@ -462,6 +471,8 @@ const toSubtask = (r: SubtaskRow): SubtaskDto => ({
   prNumber: r.pr_number,
   prUrl: r.pr_url,
   conversationId: r.conversation_id,
+  ticketNumber: r.ticket_number,
+  ticketUrl: r.ticket_url,
   review: r.review,
   verification: r.verification,
   fixRounds: r.fix_rounds,
@@ -499,6 +510,8 @@ export interface SubtaskPatch {
   prNumber?: number;
   prUrl?: string;
   conversationId?: string;
+  ticketNumber?: number;
+  ticketUrl?: string;
   review?: SubtaskReview;
   verification?: Verification;
   fixRounds?: number;
@@ -512,6 +525,8 @@ const SUBTASK_PATCH_COLUMNS: Record<keyof SubtaskPatch, string> = {
   prNumber: "pr_number",
   prUrl: "pr_url",
   conversationId: "conversation_id",
+  ticketNumber: "ticket_number",
+  ticketUrl: "ticket_url",
   review: "review",
   verification: "verification",
   fixRounds: "fix_rounds",
@@ -538,6 +553,186 @@ export async function getSubtask(db: Queryable, runId: string, key: string): Pro
 export async function listSubtasks(db: Queryable, runId: string): Promise<SubtaskDto[]> {
   const { rows } = await db.query<SubtaskRow>("select * from subtasks where run_id = $1 order by idx, created_at", [runId]);
   return rows.map(toSubtask);
+}
+
+// ---------------------------------------------------------------------------
+// Plan versions: immutable, written by the architect, approved by the requester (AD-36)
+// ---------------------------------------------------------------------------
+
+interface PlanVersionRow {
+  run_id: string;
+  version: number;
+  hash: string;
+  document: HandoffPlan;
+  status: PlanVersionStatus;
+  changes: PlanChange[];
+  author: string;
+  prompted_by: string | null;
+  created_at: Date;
+}
+
+const toPlanVersion = (r: PlanVersionRow): PlanVersionDto => ({
+  runId: r.run_id,
+  version: r.version,
+  hash: r.hash,
+  plan: r.document,
+  status: r.status,
+  changes: r.changes,
+  author: r.author,
+  promptedBy: r.prompted_by,
+  createdAt: iso(r.created_at)!,
+});
+
+export async function listPlanVersions(db: Queryable, runId: string): Promise<PlanVersionDto[]> {
+  const { rows } = await db.query<PlanVersionRow>("select * from plan_versions where run_id = $1 order by version", [runId]);
+  return rows.map(toPlanVersion);
+}
+
+export async function getLatestPlanVersion(db: Queryable, runId: string): Promise<PlanVersionDto | null> {
+  const { rows } = await db.query<PlanVersionRow>("select * from plan_versions where run_id = $1 order by version desc limit 1", [runId]);
+  return rows[0] ? toPlanVersion(rows[0]) : null;
+}
+
+/** Stores a new version after the latest one, which becomes superseded. A plan identical to the latest creates nothing. */
+export async function addPlanVersion(
+  db: Db,
+  v: { runId: string; hash: string; plan: HandoffPlan; changes: PlanChange[]; author: string; promptedBy: string | null },
+): Promise<{ version: PlanVersionDto; created: boolean }> {
+  return withTx(db, async (tx) => {
+    await tx.query("select 1 from runs where id = $1 for update", [v.runId]);
+    const latest = await getLatestPlanVersion(tx, v.runId);
+    if (latest && latest.hash === v.hash) return { version: latest, created: false };
+    await tx.query("update plan_versions set status = 'superseded' where run_id = $1 and status in ('draft','proposed')", [v.runId]);
+    const { rows } = await tx.query<PlanVersionRow>(
+      `insert into plan_versions (run_id, version, hash, document, status, changes, author, prompted_by)
+       values ($1,$2,$3,$4,'draft',$5,$6,$7) returning *`,
+      [v.runId, (latest?.version ?? 0) + 1, v.hash, JSON.stringify(v.plan), JSON.stringify(v.changes), v.author, v.promptedBy],
+    );
+    await notify(tx, { t: "run", r: v.runId });
+    return { version: toPlanVersion(rows[0]!), created: true };
+  });
+}
+
+export async function setPlanVersionStatus(db: Queryable, runId: string, version: number, status: PlanVersionStatus): Promise<void> {
+  await db.query("update plan_versions set status = $3 where run_id = $1 and version = $2", [runId, version, status]);
+  await notify(db, { t: "run", r: runId });
+}
+
+// ---------------------------------------------------------------------------
+// Design session: the architect's session workspace and its turns (AD-34, AD-35)
+// ---------------------------------------------------------------------------
+
+export interface DesignSessionRecord {
+  runId: string;
+  state: DesignSessionState;
+  /** The step whose workspace holds the session now, if any. */
+  stepId: string | null;
+  /** Every repository opened in the session, with the commit it was opened at: a restored workspace gets the same. */
+  repositories: BriefRepository[];
+  hasCheckpoint: boolean;
+}
+
+interface DesignSessionRow {
+  run_id: string;
+  state: DesignSessionState;
+  step_id: string | null;
+  repositories: BriefRepository[];
+  has_checkpoint: boolean;
+}
+
+const toDesignSession = (r: DesignSessionRow): DesignSessionRecord => ({
+  runId: r.run_id,
+  state: r.state,
+  stepId: r.step_id,
+  repositories: r.repositories,
+  hasCheckpoint: r.has_checkpoint,
+});
+
+export async function getDesignSession(db: Queryable, runId: string): Promise<DesignSessionRecord | null> {
+  const { rows } = await db.query<DesignSessionRow>("select * from design_sessions where run_id = $1", [runId]);
+  return rows[0] ? toDesignSession(rows[0]) : null;
+}
+
+export async function saveDesignSession(
+  db: Queryable,
+  runId: string,
+  patch: { state?: DesignSessionState; stepId?: string | null; repositories?: BriefRepository[]; hasCheckpoint?: boolean },
+): Promise<void> {
+  await db.query("insert into design_sessions (run_id, state) values ($1, 'suspended') on conflict (run_id) do nothing", [runId]);
+  const sets: string[] = [];
+  const values: unknown[] = [runId];
+  if (patch.state !== undefined) sets.push(`state = $${values.push(patch.state)}`);
+  if (patch.stepId !== undefined) sets.push(`step_id = $${values.push(patch.stepId)}`);
+  if (patch.repositories !== undefined) sets.push(`repositories = $${values.push(JSON.stringify(patch.repositories))}`);
+  if (patch.hasCheckpoint !== undefined) sets.push(`has_checkpoint = $${values.push(patch.hasCheckpoint)}`);
+  if (sets.length) await db.query(`update design_sessions set ${sets.join(", ")}, updated_at = now() where run_id = $1`, values);
+  await notify(db, { t: "run", r: runId });
+}
+
+export interface DesignTurnRecord {
+  id: string;
+  runId: string;
+  seq: number;
+  state: "pending" | "running" | "done";
+  input: DesignTurnInput;
+  result: DesignTurnResult | null;
+}
+
+interface DesignTurnRow {
+  id: string;
+  run_id: string;
+  seq: number;
+  state: DesignTurnRecord["state"];
+  input: DesignTurnInput;
+  result: DesignTurnResult | null;
+}
+
+const toDesignTurn = (r: DesignTurnRow): DesignTurnRecord => ({ id: r.id, runId: r.run_id, seq: r.seq, state: r.state, input: r.input, result: r.result });
+
+/** Queues a turn for the architect once; a retry finds the turn it queued before. */
+export async function enqueueDesignTurn(db: Queryable, runId: string, input: DesignTurnInput): Promise<DesignTurnRecord> {
+  await db.query(
+    `insert into design_turns (id, run_id, seq, state, input)
+     select $1, $2, coalesce(max(seq), 0) + 1, 'pending', $3 from design_turns where run_id = $2
+     on conflict (id) do nothing`,
+    [input.turnId, runId, JSON.stringify(input)],
+  );
+  return (await getDesignTurn(db, input.turnId))!;
+}
+
+export async function getDesignTurn(db: Queryable, id: string): Promise<DesignTurnRecord | null> {
+  const { rows } = await db.query<DesignTurnRow>("select * from design_turns where id = $1", [id]);
+  return rows[0] ? toDesignTurn(rows[0]) : null;
+}
+
+/**
+ * The turn the session workspace should work on: the oldest one not done. A turn that was handed out
+ * before and is asked for again was interrupted (the workspace was replaced), so it is handed out again.
+ */
+export async function takeDesignTurn(db: Queryable, runId: string): Promise<DesignTurnRecord | null> {
+  const { rows } = await db.query<DesignTurnRow>(
+    `update design_turns set state = 'running'
+     where id = (select id from design_turns where run_id = $1 and state in ('pending','running') order by seq limit 1)
+     returning *`,
+    [runId],
+  );
+  return rows[0] ? toDesignTurn(rows[0]) : null;
+}
+
+/** Records a turn's result once; a second result for the same turn is ignored. */
+/** Stores the result of a turn. The turn must belong to the run named: a workspace can only answer for its own run. */
+export async function completeDesignTurn(db: Queryable, runId: string, id: string, result: DesignTurnResult): Promise<boolean> {
+  const res = await db.query("update design_turns set state = 'done', result = $3, finished_at = now() where id = $1 and run_id = $2 and state <> 'done'", [
+    id,
+    runId,
+    JSON.stringify(result),
+  ]);
+  return (res.rowCount ?? 0) > 0;
+}
+
+export async function hasOpenDesignTurn(db: Queryable, runId: string): Promise<boolean> {
+  const { rows } = await db.query("select 1 from design_turns where run_id = $1 and state in ('pending','running') limit 1", [runId]);
+  return rows.length > 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +882,16 @@ export async function resolveApproval(db: Queryable, id: string, decision: Recor
   return (res.rowCount ?? 0) > 0;
 }
 
+/** Voids the pending approvals of one kind for a run (a newer plan version voids the approval of the older one). Returns their ids. */
+export async function voidApprovals(db: Queryable, runId: string, kind: ApprovalKind): Promise<string[]> {
+  const { rows } = await db.query<{ id: string }>(
+    "update approvals set state = 'expired', resolved_at = now() where run_id = $1 and kind = $2 and state = 'pending' returning id",
+    [runId, kind],
+  );
+  if (rows.length) await notify(db, { t: "pending" });
+  return rows.map((r) => r.id);
+}
+
 /** Expires the pending decisions of a run, or only those of one of its sub-tasks. */
 export async function expireApprovalsForRun(db: Queryable, runId: string, subtaskKey?: string): Promise<void> {
   const res = await db.query(
@@ -801,11 +1006,13 @@ const toMessage = (r: MessageRow): MessageDto => ({
 
 export async function insertMessage(
   db: Queryable,
-  m: { conversationId: string; role: MessageRole; author?: MessageAuthor; text?: string | null; components?: Component[] },
+  m: { conversationId: string; role: MessageRole; author?: MessageAuthor; text?: string | null; components?: Component[]; key?: string },
 ): Promise<MessageDto> {
+  // With a key the message is written once: a retry returns the message that is already there.
   const { rows } = await db.query<MessageRow>(
-    `insert into messages (id, conversation_id, role, author, text, components) values ($1,$2,$3,$4,$5,$6) returning *`,
-    [newId("msg"), m.conversationId, m.role, m.author ?? null, m.text ?? null, JSON.stringify(m.components ?? [])],
+    `insert into messages (id, conversation_id, role, author, text, components, card_key) values ($1,$2,$3,$4,$5,$6,$7)
+     on conflict (card_key) do update set card_key = excluded.card_key returning *`,
+    [newId("msg"), m.conversationId, m.role, m.author ?? null, m.text ?? null, JSON.stringify(m.components ?? []), m.key ?? null],
   );
   await db.query("update conversations set updated_at = now() where id = $1", [m.conversationId]);
   const msg = toMessage(rows[0]!);
@@ -814,12 +1021,20 @@ export async function insertMessage(
 }
 
 /** Posts an orchestrator card, or updates it in place when a card with the same key exists. */
-export async function upsertCard(db: Queryable, conversationId: string, cardKey: string, card: OrchestratorCard): Promise<MessageDto> {
+export async function upsertCard(
+  db: Queryable,
+  conversationId: string,
+  cardKey: string,
+  card: OrchestratorCard,
+  /** `toEnd` moves an existing card to the end of its conversation, for a card that must stay next to what is being said. */
+  options: { toEnd?: boolean } = {},
+): Promise<MessageDto> {
   const { rows } = await db.query<MessageRow>(
     `insert into messages (id, conversation_id, role, components, card_key) values ($1,$2,'orchestrator',$3,$4)
-     on conflict (card_key) do update set components = excluded.components, version = nextval('message_version_seq'), updated_at = now()
+     on conflict (card_key) do update set components = excluded.components, version = nextval('message_version_seq'), updated_at = now(),
+       created_at = case when $5::boolean then now() else messages.created_at end
      returning *`,
-    [newId("msg"), conversationId, JSON.stringify([card]), cardKey],
+    [newId("msg"), conversationId, JSON.stringify([card]), cardKey, options.toEnd === true],
   );
   await db.query("update conversations set updated_at = now() where id = $1", [conversationId]);
   const msg = toMessage(rows[0]!);

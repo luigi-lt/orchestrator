@@ -1,12 +1,17 @@
 import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { ApplicationFailure } from "@temporalio/common";
 import { TestWorkflowEnvironment } from "@temporalio/testing";
 import { Worker } from "@temporalio/worker";
 import {
+  buildOrder,
   findingsToFix,
   mergeReview,
   type Analysis,
   type DeliveryRunInput,
+  type DesignTurnInput,
+  type DesignTurnResult,
+  type HandoffPlan,
   type Plan,
   type ReviewReport,
   type StepResult,
@@ -16,14 +21,6 @@ import {
 } from "@orch/contracts";
 
 const workflowsPath = fileURLToPath(new URL("../../dist/workflows/index.js", import.meta.url));
-const onePlan: Plan = { summary: "Add subtract", subtasks: [{ title: "Add subtract function", description: "d", acceptanceCriteria: ["works"] }] };
-const twoPlan: Plan = {
-  summary: "Add and document subtract",
-  subtasks: [
-    { title: "Add subtract function", description: "d1", acceptanceCriteria: ["works"] },
-    { title: "Document subtract", description: "d2", acceptanceCriteria: ["documented"] },
-  ],
-};
 
 const analysis: Analysis = {
   ready: true,
@@ -43,7 +40,24 @@ const analysis: Analysis = {
   approach: "Create subtract.js",
 };
 const analysed: StepResult = { status: "succeeded", summary: "analysis", analysis };
-const planned = (plan: Plan): StepResult => ({ status: "succeeded", summary: "plan", assessment: { ready: true, questions: [], plan } });
+
+/** A hand-off plan across two products; the page is listed first but depends on the library. */
+const handoff: HandoffPlan = {
+  goal: "Show subtraction in the shop",
+  approach: "Add subtract to the library, then use it on the page",
+  outOfScope: [],
+  risks: [],
+  assumptions: [],
+  constraints: ["Do not change add()"],
+  definitionOfDone: [],
+  contracts: [{ name: "subtract(a, b)", description: "Returns a - b for numbers", providers: ["lib"], consumers: ["page"] }],
+  rollout: "Library first",
+  subtasks: [
+    { key: "page", title: "Use subtract on the page", description: "d2", acceptanceCriteria: ["shown"], product: "shop", repository: "acme/web", likelyFiles: [], dependsOn: ["lib"], size: "S" },
+    { key: "lib", title: "Add subtract function", description: "d1", acceptanceCriteria: ["works"], product: "calc", repository: "acme/demo", likelyFiles: ["subtract.js"], dependsOn: [], size: "S" },
+  ],
+};
+const handoffChanged: HandoffPlan = { ...handoff, constraints: [...handoff.constraints, "Numbers only"] };
 
 const clean: ReviewReport = { verdict: "approve", summary: "Looks right", criteria: [{ criterion: "works", met: true }], findings: [], earlier: [] };
 const major: ReviewReport = {
@@ -63,7 +77,6 @@ interface Scenario {
   /** What the track rules decide; the workflow must follow it, whatever the analyst proposed. */
   track?: Track;
   repositories?: string[];
-  plan?: Plan;
   /** One report per review round, in the order the reviews run (across sub-tasks). The last one repeats. */
   reviews?: ReviewReport[];
   /** Why the finished change is beyond the fast track. */
@@ -71,17 +84,36 @@ interface Scenario {
   risk?: boolean;
   implementFails?: boolean;
   prStates?: ("open" | "merged" | "closed")[];
+  /** Silence after which the design session's workspace is saved and shut down. */
+  designIdleSeconds?: number;
+  /** How many times the session workspace is lost while a turn runs. */
+  loseWorkspace?: number;
+}
+
+/**
+ * The architect, as the tests play it: the opening turn drafts the plan; a message with "change" submits a
+ * changed plan; a message with "approval" puts the plan up for approval; anything else is only answered.
+ */
+function architectReply(turn: DesignTurnInput): Partial<DesignTurnResult> {
+  const text = turn.messages.join(" ");
+  if (turn.opening) return { text: "Here is a first draft.", plan: handoff };
+  if (/change/.test(text)) return { text: "Changed.", plan: handoffChanged };
+  if (/approval/.test(text)) return { text: "Use the Approve button.", proposed: true };
+  return { text: "Answered." };
 }
 
 function mockActivities(s: Scenario) {
   const calls: { name: string; args: unknown }[] = [];
-  const waiters = new Map<string, () => void>();
-  const reached = (name: string) => new Promise<void>((resolve) => waiters.set(name, resolve));
+  const waiters = new Map<string, { count: number; resolve: () => void }>();
+  /** Resolves once the activity has been called `count` more times. */
+  const reached = (name: string, count = 1) => new Promise<void>((resolve) => waiters.set(name, { count, resolve }));
   const record = (name: string, args: unknown) => {
     calls.push({ name, args });
     const waiter = waiters.get(name);
-    waiters.delete(name);
-    waiter?.();
+    if (waiter && --waiter.count <= 0) {
+      waiters.delete(name);
+      waiter.resolve();
+    }
   };
   const analysisResults = s.analysisResults ?? [analysed];
   const reviews = s.reviews ?? [clean];
@@ -91,10 +123,24 @@ function mockActivities(s: Scenario) {
   let prIndex = 0;
   let prNumber = 6;
   let decisions = 0;
+  // Design session
+  let workspaceUp = false;
+  let workspaces = 0;
+  let losses = s.loseWorkspace ?? 0;
+  let planVersion = 0;
+  let proposedVersion = 0;
+  let currentPlan: HandoffPlan | null = null;
+
   const activities = {
     recordEvent: async (a: unknown) => record("recordEvent", a),
     initRun: async (a: unknown) => (
-      record("initRun", a), { conversationId: "conv_run", homeProduct: "calc", catalogHash: "cat1", settings: { maxFixRounds: 2, prPollSeconds: 60 } }
+      record("initRun", a),
+      {
+        conversationId: "conv_run",
+        homeProduct: "calc",
+        catalogHash: "cat1",
+        settings: { maxFixRounds: 2, prPollSeconds: 60, designIdleSeconds: s.designIdleSeconds ?? 3600 },
+      }
     ),
     recordAnalysis: async (a: unknown) => {
       record("recordAnalysis", a);
@@ -108,7 +154,6 @@ function mockActivities(s: Scenario) {
     updateProgress: async (a: unknown) => record("updateProgress", a),
     askQuestions: async (a: unknown) => (record("askQuestions", a), { approvalId: "apr_q1" }),
     recordTicketAnswer: async (a: unknown) => record("recordTicketAnswer", a),
-    requestPlanApproval: async (a: unknown) => (record("requestPlanApproval", a), { approvalId: "apr_plan", hash: "h" }),
     requestRiskApproval: async (a: unknown) => (record("requestRiskApproval", a), { approvalId: "apr_risk", hash: "h" }),
     requestFindingsDecision: async (a: unknown) => (record("requestFindingsDecision", a), { approvalId: `apr_findings_${++decisions}`, hash: "h" }),
     requestLimitsDecision: async (a: unknown) => (record("requestLimitsDecision", a), { approvalId: "apr_limits", hash: "h" }),
@@ -125,6 +170,66 @@ function mockActivities(s: Scenario) {
     postPullRequestCard: async (a: unknown) => record("postPullRequestCard", a),
     postNotice: async (a: unknown) => record("postNotice", a),
     closeOutApprovals: async (a: unknown) => record("closeOutApprovals", a),
+
+    // --- Design session: a workspace that can be saved, lost and replaced; plan versions; the approval ---
+    prepareDesignWorkspace: async (a: unknown) => {
+      record("prepareDesignWorkspace", a);
+      if (workspaceUp) return { stepId: `d${workspaces}`, fresh: false, expired: false, resumed: false };
+      workspaceUp = true;
+      return { stepId: `d${++workspaces}`, fresh: true, expired: false, resumed: workspaces > 1 };
+    },
+    awaitDesignTurn: async (a: { turn: DesignTurnInput; stepId: string }): Promise<DesignTurnResult> => {
+      record("awaitDesignTurn", a);
+      if (losses > 0) {
+        losses--;
+        workspaceUp = false;
+        throw ApplicationFailure.nonRetryable("The design session workspace was lost", "WorkspaceLost");
+      }
+      return { turnId: a.turn.turnId, status: "succeeded", text: "", components: [], proposed: false, session: "continued", ...architectReply(a.turn) };
+    },
+    suspendDesignWorkspace: async (a: unknown) => {
+      record("suspendDesignWorkspace", a);
+      workspaceUp = false;
+      return { stepId: `d${workspaces}`, saved: true };
+    },
+    closeDesignSession: async (a: unknown) => {
+      record("closeDesignSession", a);
+      const stepId = workspaceUp ? `d${workspaces}` : null;
+      workspaceUp = false;
+      return { stepId };
+    },
+    // Plan versions as the store keeps them: a new version voids the approval asked for an older one.
+    recordDesignTurn: async (a: { result: DesignTurnResult }) => {
+      record("recordDesignTurn", a);
+      let created = false;
+      let voidedApproval = false;
+      if (a.result.plan) {
+        planVersion++;
+        created = true;
+        currentPlan = a.result.plan;
+        voidedApproval = proposedVersion > 0;
+        proposedVersion = 0;
+      }
+      let proposedApprovalId: string | null = null;
+      if (a.result.proposed && proposedVersion !== planVersion) {
+        proposedVersion = planVersion;
+        proposedApprovalId = `apr_plan_${planVersion}`;
+      }
+      return { version: planVersion || null, created, changes: created && planVersion > 1 ? 1 : 0, voidedApproval, proposedApprovalId };
+    },
+    finalizePlan: async (a: unknown) => (record("finalizePlan", a), { plan: currentPlan!, order: buildOrder(currentPlan!)!.map((st) => st.key) }),
+    mirrorPlanOnTicket: async (a: { order: string[]; plan: HandoffPlan }) => (
+      record("mirrorPlanOnTicket", a),
+      {
+        subIssues: a.order.map((key, i) => {
+          const [owner, name] = a.plan.subtasks.find((st) => st.key === key)!.repository.split("/") as [string, string];
+          return { key, repo: { owner, name }, number: 40 + i, url: `https://example/${owner}/${name}/issues/${40 + i}` };
+        }),
+        attached: a.order.length,
+      }
+    ),
+    closeSubIssue: async (a: unknown) => record("closeSubIssue", a),
+
     lookupContext: async (a: unknown) => (
       record("lookupContext", a), { defaultBranch: "main", branch: "agent/1-add-subtract-abc123", commitAuthor: { name: "T", email: "t@x" } }
     ),
@@ -143,7 +248,6 @@ function mockActivities(s: Scenario) {
       const kind = (calls.filter((c) => c.name === "prepareStep").pop()?.args as { kind: string }).kind;
       record("awaitStep", { stepId });
       if (kind === "analyse") return analysisResults[Math.min(analysisIndex++, analysisResults.length - 1)]!;
-      if (kind === "plan") return planned(s.plan ?? onePlan);
       if (kind === "review") return { status: "succeeded", summary: "review", review: reviews[Math.min(reviewIndex++, reviews.length - 1)]! };
       if (s.implementFails) return { status: "failed", summary: "The workspace failed", error: "model error" };
       return {
@@ -179,7 +283,6 @@ type StepPrep = {
   subtaskKey?: string;
   round?: number;
   plan?: Plan;
-  analysis?: Analysis;
   findings?: TrackedFinding[];
   guidance?: string;
   questionRounds?: { answer: string }[];
@@ -193,6 +296,10 @@ interface Driver {
   signal: (name: string, arg: unknown) => Promise<void>;
   /** Signals the workflow of one sub-task: decisions on its cards go there. */
   signalSubtask: (key: string, name: string, arg: unknown) => Promise<void>;
+  /** A message of the requester in the run's conversation while the design session is open. */
+  say: (text: string) => Promise<void>;
+  /** The Approve button on the plan card. */
+  approvePlan: (approvalId: string) => Promise<void>;
 }
 
 describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
@@ -242,10 +349,14 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     const main = workers[0]!.runUntil(async () => {
       try {
         const handle = await env.client.workflow.start("deliveryRunWorkflow", { taskQueue: "orchestration", workflowId: `wf-${runId}`, args: [input] });
+        const design = () => env.client.workflow.getHandle(`design:${runId}`);
+        let said = 0;
         await drive(
           {
             signal: (name, arg) => handle.signal(name, arg),
             signalSubtask: (key, name, arg) => env.client.workflow.getHandle(`subtask:${runId}:${key}`).signal(name, arg),
+            say: (text) => design().signal("requesterMessage", { messageId: `msg_${++said}`, text }),
+            approvePlan: (approvalId) => design().signal("approval", { approvalId, decision: "approve" }),
           },
           m,
         );
@@ -258,13 +369,22 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     return { state: result[0] as string, m };
   }
 
+  /** The usual design session: the architect opens with a draft, the requester asks for approval and approves. */
+  const designAndApprove = async (h: Driver, mock: Mock) => {
+    await mock.reached("recordDesignTurn");
+    const proposed = mock.reached("recordDesignTurn");
+    await h.say("Put it up for approval");
+    await proposed;
+    await h.approvePlan("apr_plan_1");
+  };
+
   // --- Fast track -------------------------------------------------------------------
 
   it("fast track: analysis, implementation, a clean AI review and a pull request, with no approval", async () => {
     const { state, m } = await runScenario({});
     expect(state).toBe("completed");
     expect(kinds(m)).toEqual(["analyse", "implement", "review"]);
-    expect(m.of("requestPlanApproval")).toHaveLength(0);
+    expect(m.of("recordDesignTurn")).toHaveLength(0);
     expect(m.of("requestFindingsDecision")).toHaveLength(0);
     expect(m.of<{ track: string }>("setTrackLabel")[0]!.track).toBe("fast");
     expect(m.of<{ originConversationId: string }>("initRun")[0]!.originConversationId).toBe("conv_chat");
@@ -371,25 +491,29 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     expect(events(m)).toEqual(expect.arrayContaining(["track.limits_exceeded", "track.limits_decided"]));
   });
 
-  it("switches to the guided track when the requester chooses it for a change that is too big", async () => {
+  it("starts a design session when the requester switches a too-big fast-track change to the guided track", async () => {
     const { state, m } = await runScenario({ limits: ["The change touches 9 files (the fast-track limit is 5)"] }, async (h, mock) => {
       await mock.reached("requestLimitsDecision");
+      const opened = mock.reached("recordDesignTurn");
       await h.signalSubtask("change", "approval", { approvalId: "apr_limits", decision: "guided" });
-      await mock.reached("requestPlanApproval");
+      await opened;
       // Nothing of the fast-track change was pushed.
       expect(mock.of("pushBranch")).toHaveLength(0);
-      await h.signal("approval", { approvalId: "apr_plan", decision: "approve" });
+      const proposed = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await proposed;
+      await h.approvePlan("apr_plan_1");
     });
     expect(state).toBe("completed");
     expect(m.of<{ track: string }>("setTrackLabel").map((l) => l.track)).toEqual(["fast", "guided"]);
     expect(events(m)).toContain("track.changed");
-    expect(kinds(m)).toEqual(["analyse", "implement", "review", "plan", "implement", "review"]);
-    // The guided sub-task gets its own conversation and is not held to the fast-track limits.
+    // The sub-tasks of the plan are not held to the fast-track limits.
     expect(m.of<{ key: string; ownConversation: boolean }>("initSubtask").map((i) => [i.key, i.ownConversation])).toEqual([
       ["change", false],
-      ["s1", true],
+      ["lib", true],
+      ["page", true],
     ]);
-    expect(m.of<{ checkLimits: boolean }>("inspectChanges").map((i) => i.checkLimits)).toEqual([true, false]);
+    expect(m.of<{ checkLimits: boolean }>("inspectChanges").map((i) => i.checkLimits)).toEqual([true, false, false]);
   });
 
   it("requires approval for high-risk changes on the fast track too, and pushes nothing when rejected", async () => {
@@ -430,14 +554,6 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     expect(m.of("recordAnalysis")).toHaveLength(0);
   });
 
-  it("stops after the analysis when the work spans several repositories, changing nothing", async () => {
-    const { state, m } = await runScenario({ track: "guided", repositories: ["acme/demo", "acme/web"] });
-    expect(state).toBe("closed");
-    expect(m.of("initSubtask")).toHaveLength(0);
-    expect(m.of("pushBranch")).toHaveLength(0);
-    expect(finalNotice(m)).toMatch(/2 repositories \(acme\/demo, acme\/web\)/);
-  });
-
   it("builds in the repository the analysis found, even when the ticket was filed elsewhere", async () => {
     const { state, m } = await runScenario({ repositories: ["acme/web"] });
     expect(state).toBe("completed");
@@ -453,53 +569,142 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     expect(m.of<{ repo: unknown }>("claimIssue")[0]!.repo).toEqual({ owner: "acme", name: "demo" });
   });
 
-  // --- Guided track -----------------------------------------------------------------
+  // --- Guided track: the design session, the plan, sub-tasks across products ------------------
 
-  it("guided track: each sub-task has its own branch, conversation, review and pull request, one after the other", async () => {
-    const { state, m } = await runScenario({ track: "guided", plan: twoPlan }, async (h, mock) => {
-      await mock.reached("requestPlanApproval");
+  it("guided track: the architect opens the session, the requester approves a plan version, and each sub-task is built in its repository in dependency order", async () => {
+    const { state, m } = await runScenario({ track: "guided", repositories: ["acme/demo", "acme/web"] }, async (h, mock) => {
+      // The session opens by itself, with a first draft; nothing is built before the approval.
+      await mock.reached("recordDesignTurn");
+      expect(mock.of<{ turn: DesignTurnInput }>("awaitDesignTurn")[0]!.turn).toMatchObject({ opening: true, messages: [] });
+      const proposed = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await proposed;
       expect(mock.of("initSubtask")).toHaveLength(0);
-      await h.signal("approval", { approvalId: "apr_plan", decision: "approve" });
+      await h.approvePlan("apr_plan_1");
     });
     expect(state).toBe("completed");
-    expect(kinds(m)).toEqual(["analyse", "plan", "implement", "review", "implement", "review"]);
-    expect(m.of<{ key: string; ownConversation: boolean; branch: string }>("initSubtask").map((i) => [i.key, i.ownConversation, i.branch])).toEqual([
-      ["s1", true, "agent/1-add-subtract-abc123-s1"],
-      ["s2", true, "agent/1-add-subtract-abc123-s2"],
+    expect(kinds(m)).toEqual(["analyse", "implement", "review", "implement", "review"]);
+    // The session workspace gets the repositories the analysis named, is created once as a session and closed on approval.
+    expect(m.of<{ repositories: string[] }>("prepareDesignWorkspace")[0]!.repositories).toEqual(["acme/demo", "acme/web"]);
+    expect(m.of<{ session?: boolean }>("createWorkspace").filter((w) => w.session)).toHaveLength(1);
+    expect(m.of("closeDesignSession")).toHaveLength(1);
+    expect(m.of<{ version: number }>("finalizePlan")[0]!.version).toBe(1);
+    // The plan is mirrored on the ticket before anything is built; each sub-task gets its sub-issue.
+    const order = m.calls.map((c) => c.name).filter((n) => n === "mirrorPlanOnTicket" || n === "initSubtask");
+    expect(order).toEqual(["mirrorPlanOnTicket", "initSubtask", "initSubtask"]);
+    // The library first, although the plan lists the page first: the page depends on it.
+    const subtasks = m.of<{ key: string; ownConversation: boolean; branch: string; repo: { name: string }; ticket?: { number: number } }>("initSubtask");
+    expect(subtasks.map((i) => [i.key, i.repo.name, i.branch, i.ticket?.number, i.ownConversation])).toEqual([
+      ["lib", "demo", "agent/1-add-subtract-abc123-lib", 40, true],
+      ["page", "web", "agent/1-add-subtract-abc123-page", 41, true],
     ]);
     // The second sub-task starts only after the pull request of the first one is merged.
-    const order = m.calls.map((c) => c.name).filter((n) => n === "prepareSubtaskRepo" || n === "getPullRequestState");
-    expect(order).toEqual(["prepareSubtaskRepo", "getPullRequestState", "prepareSubtaskRepo", "getPullRequestState"]);
-    const prs = m.of<{ title: string; body: string }>("openPullRequest");
+    const sequence = m.calls.map((c) => c.name).filter((n) => n === "prepareSubtaskRepo" || n === "getPullRequestState");
+    expect(sequence).toEqual(["prepareSubtaskRepo", "getPullRequestState", "prepareSubtaskRepo", "getPullRequestState"]);
+    const prs = m.of<{ repo: { name: string }; title: string; body: string }>("openPullRequest");
+    expect(prs.map((p) => p.repo.name)).toEqual(["demo", "web"]);
     expect(prs[0]!.title).toContain("(1/2): Add subtract function");
     expect(prs[0]!.body).toContain("Part of #1");
-    expect(prs[0]!.body).not.toContain("Closes #1");
-    expect(prs[1]!.body).toContain("Closes #1");
-    // Each sub-task's cards go to its own conversation.
-    expect(m.of<{ conversationId: string }>("postPullRequestCard").map((c) => c.conversationId)).toEqual(expect.arrayContaining(["conv_s1", "conv_s2"]));
+    expect(prs[0]!.body).toContain("Closes #40");
+    expect(prs[0]!.body).not.toContain("Closes #1\n");
+    expect(prs[1]!.body).toContain("Closes acme/demo#1");
+    expect(prs[1]!.body).toContain("Closes #41");
+    // What the implementers build from carries the plan's constraints and the contract between the products.
+    const implement = m.of<StepPrep>("prepareStep").find((p) => p.kind === "implement")!;
+    expect(implement.plan!.summary).toContain("Do not change add()");
+    expect(implement.plan!.summary).toContain("subtract(a, b): Returns a - b for numbers (provided by: Add subtract function; used by: Use subtract on the page)");
+    expect(implement.plan!.subtasks.map((st) => st.title)).toEqual(["Add subtract function", "Use subtract on the page"]);
+    expect(m.of<{ number: number }>("closeSubIssue").map((c) => c.number)).toEqual([40, 41]);
+    expect(events(m)).toEqual(expect.arrayContaining(["design.opened", "plan.version_created", "plan.proposed", "design.closed", "plan.approved", "ticket.subtasks_created"]));
     expect(finalNotice(m)).toBe("All 2 sub-tasks are merged. Done.");
   });
 
-  it("guided track: stops when a sub-task's pull request is closed, without starting the next one", async () => {
-    const { state, m } = await runScenario({ track: "guided", plan: twoPlan, prStates: ["closed"] }, async (h, mock) => {
-      await mock.reached("requestPlanApproval");
-      await h.signal("approval", { approvalId: "apr_plan", decision: "approve" });
+  it("guided track: a newer plan version voids the approval asked for the older one", async () => {
+    const { state, m } = await runScenario({ track: "guided" }, async (h, mock) => {
+      await mock.reached("recordDesignTurn");
+      let next = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await next;
+      // The requester asks for a change after the proposal: version 2 replaces version 1.
+      next = mock.reached("recordDesignTurn");
+      await h.say("Please change it: numbers only");
+      await next;
+      // An approval of the old version arrives late: it must not start anything.
+      next = mock.reached("recordDesignTurn");
+      await h.approvePlan("apr_plan_1");
+      await h.say("One more question");
+      await next;
+      expect(mock.of("finalizePlan")).toHaveLength(0);
+      next = mock.reached("recordDesignTurn");
+      await h.say("Now put it up for approval");
+      await next;
+      await h.approvePlan("apr_plan_2");
     });
+    expect(state).toBe("completed");
+    expect(m.of<{ version: number }>("finalizePlan").map((f) => f.version)).toEqual([2]);
+    expect(events(m)).toContain("plan.approval_voided");
+    expect(m.of<StepPrep>("prepareStep").find((p) => p.kind === "implement")!.plan!.summary).toContain("Numbers only");
+    // Five turns: the opening and four messages, each delivered once.
+    expect(m.of<{ turn: DesignTurnInput }>("awaitDesignTurn").map((t) => t.turn.messages.join())).toEqual([
+      "",
+      "Put it up for approval",
+      "Please change it: numbers only",
+      "One more question",
+      "Now put it up for approval",
+    ]);
+  });
+
+  it("guided track: saves the session after a silence and resumes it in a new workspace on the next message", async () => {
+    const { state, m } = await runScenario({ track: "guided", designIdleSeconds: 2 }, async (h, mock) => {
+      await mock.reached("recordDesignTurn");
+      await mock.reached("suspendDesignWorkspace");
+      const proposed = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await proposed;
+      await h.approvePlan("apr_plan_1");
+    });
+    expect(state).toBe("completed");
+    // Two session workspaces: the one that was saved, and the one the next message started.
+    const sessions = m.of<{ stepId: string; session?: boolean }>("createWorkspace").filter((w) => w.session);
+    expect(sessions.map((w) => w.stepId)).toEqual(["d1", "d2"]);
+    expect(events(m)).toEqual(expect.arrayContaining(["design.suspended", "design.resumed"]));
+    expect(m.of("createWorkspace")).toHaveLength(m.of("destroyWorkspace").length);
+  });
+
+  it("guided track: a lost session workspace is replaced and gets the same turn again", async () => {
+    const { state, m } = await runScenario({ track: "guided", loseWorkspace: 1 }, designAndApprove);
+    expect(state).toBe("completed");
+    const turns = m.of<{ turn: DesignTurnInput; stepId: string }>("awaitDesignTurn");
+    expect(turns.slice(0, 2).map((t) => [t.turn.turnId, t.stepId])).toEqual([
+      [turns[0]!.turn.turnId, "d1"],
+      [turns[0]!.turn.turnId, "d2"],
+    ]);
+    // The reply is recorded once.
+    expect(m.of<{ turn: DesignTurnInput }>("recordDesignTurn").filter((r) => r.turn.opening)).toHaveLength(1);
+  });
+
+  it("guided track: stops when a sub-task's pull request is closed, without starting the next one", async () => {
+    const { state, m } = await runScenario({ track: "guided", prStates: ["closed"] }, designAndApprove);
     expect(state).toBe("closed");
     expect(m.of("initSubtask")).toHaveLength(1);
+    expect(m.of("closeSubIssue")).toHaveLength(0);
     expect(finalNotice(m)).toMatch(/Sub-task 1: Pull request closed without merging\. The remaining 1 sub-task\(s\) were not started\./);
   });
 
-  it("guided track: cancels without pushing when the plan is rejected", async () => {
+  // --- Cancelling --------------------------------------------------------------------
+
+  it("cancels the run during the design session: the session is closed and nothing is built", async () => {
     const { state, m } = await runScenario({ track: "guided" }, async (h, mock) => {
-      await mock.reached("requestPlanApproval");
-      await h.signal("approval", { approvalId: "apr_plan", decision: "reject" });
+      await mock.reached("recordDesignTurn");
+      await h.signal("cancel", { reason: "test" });
     });
     expect(state).toBe("cancelled");
+    expect(m.of("closeDesignSession")).toHaveLength(1);
     expect(m.of("initSubtask")).toHaveLength(0);
+    expect(m.of("mirrorPlanOnTicket")).toHaveLength(0);
+    expect(m.of("createWorkspace")).toHaveLength(m.of("destroyWorkspace").length);
+    expect(m.of<{ outcome: string }>("finalizeIssue")[0]!.outcome).toBe("cancelled");
   });
-
-  // --- Cancelling --------------------------------------------------------------------
 
   it("cancels the run and its sub-task while the sub-task waits for a decision", async () => {
     const { state, m } = await runScenario({ reviews: [major, still(["r1-1"]), still(["r2-1"])] }, async (h, mock) => {

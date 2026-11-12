@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import type { ApprovalDto, ProgressDto, RunDto, RunEventDto, StepDto, SubtaskDto, TicketDto } from "@orch/contracts";
+import type { ApprovalDto, PlanVersionDto, ProgressDto, RunDto, RunEventDto, StepDto, SubtaskDto, TicketDto } from "@orch/contracts";
 import { api, post, subscribe } from "../api";
 import { useApp } from "../App";
 import { Checks, FindingList } from "../components/Cards";
@@ -13,6 +13,9 @@ interface RunDetailData {
   /** The ticket this run belongs to, with all its runs. */
   ticket: TicketDto | null;
   subtasks: SubtaskDto[];
+  /** Every version of the hand-off plan, oldest first. */
+  plans: PlanVersionDto[];
+  design: { state: string; repositories: string[] } | null;
 }
 
 const FINAL = new Set(["completed", "closed", "cancelled", "failed"]);
@@ -56,7 +59,7 @@ export function RunDetail() {
 
   if (error) return <div className="page error-banner">{error}</div>;
   if (!data) return <div className="page muted">Loading…</div>;
-  const { run, events, pending, ticket, subtasks } = data;
+  const { run, events, pending, ticket, subtasks, plans, design } = data;
   const ordinal = ticket?.runs.find((r) => r.runId === run.id)?.ordinal;
   const otherRuns = ticket?.runs.filter((r) => r.runId !== run.id) ?? [];
 
@@ -145,10 +148,32 @@ export function RunDetail() {
           ) : (
             <p className="muted">Not analysed yet.</p>
           )}
+          {design && (
+            <>
+              <h2>Design session</h2>
+              <p className="small">
+                <span className={`badge ${design.state === "active" ? "running" : design.state === "closed" ? "completed" : "pending"}`}>{design.state}</span>{" "}
+                <span className="muted">Repositories opened: {design.repositories.join(", ") || "—"}</span>
+              </p>
+              <ul className="plan-versions">
+                {plans.map((v) => (
+                  <li key={v.version}>
+                    <span className={`badge ${v.status}`}>{v.status}</span> Version {v.version} <code>{v.hash}</code>{" "}
+                    <span className="muted small">
+                      {v.plan.subtasks.length} sub-task(s) · written by {v.author}
+                      {v.changes.length ? ` · ${v.changes.length} change(s)` : ""}
+                      {v.promptedBy ? ` · asked: "${v.promptedBy.slice(0, 80)}"` : ""}
+                    </span>
+                  </li>
+                ))}
+                {plans.length === 0 && <li className="muted">No plan version yet.</li>}
+              </ul>
+            </>
+          )}
           <h2>Plan</h2>
           {run.plan ? (
             <>
-              <p>{run.plan.summary}</p>
+              <p className="plan-summary">{run.plan.summary}</p>
               <ol>
                 {run.plan.subtasks.map((s, i) => (
                   <li key={i}>{s.title}</li>
