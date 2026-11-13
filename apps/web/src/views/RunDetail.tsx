@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import type { ApprovalDto, PlanVersionDto, ProgressDto, RunDto, RunEventDto, StepDto, SubtaskDto, TicketDto } from "@orch/contracts";
 import { api, post, subscribe } from "../api";
 import { useApp } from "../App";
-import { Checks, FindingList } from "../components/Cards";
+import { Checks, FindingList, SUBTASK_STATE_LABEL } from "../components/Cards";
 
 interface RunDetailData {
   run: RunDto;
@@ -188,7 +188,7 @@ export function RunDetail() {
           {subtasks.map((st) => (
             <div key={st.key} className="subtask-detail">
               <div>
-                <span className={`badge ${st.state}`}>{st.state.replace(/_/g, " ")}</span> <strong>{st.title}</strong>
+                <span className={`badge ${st.state}`}>{SUBTASK_STATE_LABEL[st.state] ?? st.state.replace(/_/g, " ")}</span> <strong>{st.title}</strong>
               </div>
               <div className="meta">
                 {st.repository && <span>{st.repository}</span>}
@@ -198,8 +198,31 @@ export function RunDetail() {
                     Pull request #{st.prNumber}
                   </a>
                 )}
+                {st.ticketUrl && (
+                  <a href={st.ticketUrl} target="_blank" rel="noreferrer">
+                    Sub-issue #{st.ticketNumber}
+                  </a>
+                )}
                 {st.conversationId && <Link to={`/chat/${st.conversationId}`}>Conversation</Link>}
               </div>
+              {(st.dependsOn.length > 0 || st.headCommit) && (
+                <p className="muted small">
+                  {st.dependsOn.length > 0 && `Depends on: ${st.dependsOn.map((k) => subtasks.find((x) => x.key === k)?.title ?? k).join("; ")}. `}
+                  {st.stackedOn && `Branch stacked on: ${subtasks.find((x) => x.key === st.stackedOn)?.title ?? st.stackedOn}. `}
+                  {st.headCommit && (
+                    <>
+                      Commit <code>{st.headCommit.slice(0, 10)}</code>
+                      {st.changedFiles ? `, ${st.changedFiles.length} file(s)` : ""}
+                      {st.checkRounds ? `, changes requested ${st.checkRounds} time(s)` : ""}.
+                    </>
+                  )}
+                </p>
+              )}
+              {st.warnings.map((w) => (
+                <p key={w} className="story-warning small">
+                  ⚠ {w}
+                </p>
+              ))}
               {st.review ? (
                 <>
                   <p className="small">
@@ -209,7 +232,7 @@ export function RunDetail() {
                   {st.review.resolved.length > 0 && <p className="muted small">Fixed during the review: {st.review.resolved.map((f) => f.title).join("; ")}</p>}
                 </>
               ) : (
-                <p className="muted small">Not reviewed yet.</p>
+                st.state !== "planned" && st.state !== "dropped" && <p className="muted small">Not reviewed yet.</p>
               )}
               <Checks verification={st.verification} />
             </div>

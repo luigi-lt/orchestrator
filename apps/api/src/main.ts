@@ -9,6 +9,8 @@ import Fastify, { type FastifyReply } from "fastify";
 import { z } from "zod";
 import { config, errorMessage, log } from "@orch/common";
 import {
+  ChangeDecision,
+  DependentsDecision,
   FindingsDecision,
   LimitsDecision,
   PlanDecision,
@@ -280,6 +282,32 @@ async function main(): Promise<void> {
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
     await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
     await updateCard(conversationId, `run:${run.id}:limits:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
+    return { ok: true };
+  });
+
+  // The requester's check of a sub-task's change before its pull request opens (FR-R4). The decision is bound
+  // to the commit on the card: exactly that commit is published (AD-40).
+  app.post<{ Params: { id: string } }>("/api/approvals/:id/change", async (req) => {
+    const body = ChangeDecision.parse(req.body);
+    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "change");
+    if (body.hash !== approval.hash) throw new UserError("The change differs from the one you looked at; reload and decide on the commit shown now");
+    if (body.decision === "changes" && !body.feedback?.trim()) throw new UserError("Say what should change");
+    const feedback = body.decision === "changes" ? body.feedback : undefined;
+    await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision, feedback });
+    await resolveApproval(db, approval.id, { decision: body.decision, feedback: feedback ?? null, by: me.login });
+    const status = body.decision === "approve" ? "approved" : body.decision === "drop" ? "dropped" : "changes";
+    await updateCard(conversationId, `run:${run.id}:change:${approval.id}`, { status, feedback } as Partial<OrchestratorCard>);
+    return { ok: true };
+  });
+
+  // Sub-tasks that depend on one that was not delivered: drop them too, build them anyway, or cancel the run (FR-R4).
+  app.post<{ Params: { id: string } }>("/api/approvals/:id/dependents", async (req) => {
+    const body = DependentsDecision.parse(req.body);
+    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "dependents");
+    if (body.hash !== approval.hash) throw new UserError("The sub-tasks changed since you looked; reload and decide again");
+    await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
+    await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
+    await updateCard(conversationId, `run:${run.id}:dependents:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 

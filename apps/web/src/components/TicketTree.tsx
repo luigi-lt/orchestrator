@@ -1,5 +1,6 @@
 import { useState } from "react";
 import type { ConversationDto, TicketDto, TicketRunDto } from "@orch/contracts";
+import { SUBTASK_STATE_LABEL } from "./Cards";
 
 const label = (state: string) => state.replace(/_/g, " ");
 
@@ -76,7 +77,7 @@ export function TicketTree({
                     <button
                       key={st.key}
                       className={`run-row subtask-row ${st.conversationId === currentId ? "active" : ""}`}
-                      title={`${st.title} · ${label(st.state)}`}
+                      title={`${st.title} · ${SUBTASK_STATE_LABEL[st.state] ?? label(st.state)}`}
                       onClick={() => onOpen(st.conversationId)}
                     >
                       <span className="title">
@@ -85,7 +86,7 @@ export function TicketTree({
                       {st.pending > 0 ? (
                         <span className="dot" title={`${st.pending} waiting for you`} />
                       ) : (
-                        <span className="muted small subtask-state">{label(st.state)}</span>
+                        <span className="muted small subtask-state">{SUBTASK_STATE_LABEL[st.state] ?? label(st.state)}</span>
                       )}
                     </button>
                   ))}

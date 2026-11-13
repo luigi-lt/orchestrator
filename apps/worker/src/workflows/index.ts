@@ -7,7 +7,9 @@
  * - designSessionWorkflow: the design session of a guided run, as a child of its run: turns of the
  *   architect agent with the requester, plan versions, the plan's approval.
  * - subTaskWorkflow: one sub-task, as a child of its run: implement, AI review with fix rounds,
- *   the requester's decisions, checks, pull request, merge.
+ *   the requester's check of the change (guided track), checks, pull request, merge. A sub-task that
+ *   depends on another starts once that one's pull request is open: stacked on its branch in the same
+ *   repository, with its change readable in another one (AD-41).
  */
 import {
   ApplicationFailure,
@@ -15,17 +17,23 @@ import {
   condition,
   defineSignal,
   executeChild,
+  getExternalWorkflowHandle,
   isCancellation,
   proxyActivities,
   setHandler,
   sleep,
+  startChild,
+  workflowInfo,
 } from "@temporalio/workflow";
 import type {
   Analysis,
   AnswerSignal,
   ApprovalSignal,
   CancelSignal,
+  CriterionEvidence,
   DeliveryRunInput,
+  DependencyRef,
+  PlanSubtask,
   DesignTurnInput,
   DesignTurnResult,
   HandoffPlan,
@@ -37,6 +45,7 @@ import type {
   StepKind,
   StepResult,
   Subtask,
+  SubtaskPublishedSignal,
   SubtaskReview,
   SubtaskState,
   Track,
@@ -53,6 +62,7 @@ export const approvalSignal = defineSignal<[ApprovalSignal]>("approval");
 export const answerSignal = defineSignal<[AnswerSignal]>("answer");
 export const cancelSignal = defineSignal<[CancelSignal]>("cancel");
 export const requesterMessageSignal = defineSignal<[RequesterMessageSignal]>("requesterMessage");
+export const subtaskPublishedSignal = defineSignal<[SubtaskPublishedSignal]>("subtaskPublished");
 
 const orch = proxyActivities<typeof Orchestration>({
   taskQueue: "orchestration",
@@ -85,7 +95,7 @@ const MAX_RUN_MS = 30 * 24 * 60 * 60 * 1000;
 const REMINDER_MS = 24 * 60 * 60 * 1000;
 const TICKET_POLL = "2 minutes";
 
-type ProgressStatus = "pending" | "running" | "done" | "failed";
+type ProgressStatus = "pending" | "running" | "done" | "failed" | "skipped";
 interface ProgressItem {
   title: string;
   status: ProgressStatus;
@@ -136,12 +146,20 @@ export interface SubTaskInput {
   closesIssue: boolean;
   /** The sub-issue that mirrors this sub-task on the ticket (FR-P5). */
   ticket?: { repo: RepoRef; number: number; url: string };
+  /** Guided track: the requester checks the change before its pull request opens (FR-R4). */
+  diffCheck: boolean;
+  /** Same repository: the sub-task whose approved change this one's branch starts from (AD-41). */
+  stackedOn?: DependencyRef;
+  /** Other repositories: approved changes this sub-task builds on, readable in its workspaces. */
+  references: DependencyRef[];
+  /** Every sub-task this one depends on whose pull request is still open: the merge order (FR-M5). */
+  mergeAfter: DependencyRef[];
   maxFixRounds: number;
   prPollSeconds: number;
 }
 
 export interface SubTaskResult {
-  status: "merged" | "closed" | "handed_over" | "cancelled_by_requester" | "switch_to_guided" | "failed";
+  status: "merged" | "closed" | "handed_over" | "dropped" | "cancelled_by_requester" | "switch_to_guided" | "failed";
   /** Why, in words for the requester. */
   note?: string;
   progress: ProgressItem[];
@@ -159,11 +177,15 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
   let conversationId = input.runConversationId;
   let runState: RunState = "executing";
   let stepCounter = 0;
+  /** The commit the sub-task's own change starts from, and the commit that holds it. */
+  let baseCommit = "";
+  let headCommit = "";
 
   const progress: ProgressItem[] = [
     ...input.progressPrefix.map((p) => ({ ...p })),
     { title: "Implementation", status: "pending" },
     { title: "AI review", status: "pending" },
+    ...(input.diffCheck ? [{ title: "Your check", status: "pending" as ProgressStatus }] : []),
     { title: "Pull request", status: "pending" },
     { title: "Review and merge", status: "pending" },
   ];
@@ -221,6 +243,8 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       commitAuthor: input.commitAuthor,
       plan: input.plan,
       subtaskIndex: input.index,
+      changeBase: baseCommit,
+      references: input.references,
       ...extra,
     });
     await emit("step.started", { stepId, kind, title, subtask: key });
@@ -236,7 +260,7 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
 
   /** Ends the sub-task without a merged pull request: its state, its open decisions and the steps still running. */
   const end = async (status: SubTaskResult["status"], state: SubtaskState, note: string): Promise<SubTaskResult> => {
-    for (const p of progress) if (p.status === "running") p.status = "failed";
+    for (const p of progress) if (p.status === "running") p.status = state === "dropped" ? "skipped" : "failed";
     // The sub-task's own progress card shows how the sub-task ended; the run's card is finished by the run workflow.
     if (input.ownConversation) runState = state === "failed" ? "failed" : state === "cancelled" ? "cancelled" : "closed";
     await orch.patchSubtask({ runId, key, patch: { state } });
@@ -247,9 +271,11 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
   };
 
   const findingText = (f: TrackedFinding) => `- **${f.severity}**: ${f.title}${f.file ? ` (\`${f.file}${f.line ? `:${f.line}` : ""}\`)` : ""}`;
+  /** A pull request of this story as it is written in another pull request or on the ticket. */
+  const prRef = (d: DependencyRef) => `${slug(d.repo).toLowerCase() === slug(repo).toLowerCase() ? "" : slug(d.repo)}#${d.prNumber}`;
 
-  /** The pull request description: the change, the AI review and what the product's commands reported (FR-R3). */
-  const pullRequestBody = (review: SubtaskReview, verification: Verification | undefined, fixRounds: number, unresolved: boolean): string => {
+  /** The pull request description: the change, the AI review and what the product's commands reported (FR-R3, FR-M5). */
+  const pullRequestBody = (review: SubtaskReview, verification: Verification | undefined, fixRounds: number, unresolved: boolean, stacked: DependencyRef | null): string => {
     const sameRepo = slug(repo).toLowerCase() === slug(workItem.repo).toLowerCase();
     const issue = `${sameRepo ? "" : slug(workItem.repo)}#${workItem.number}`;
     const blocking = review.open.filter((f) => f.severity !== "minor");
@@ -260,6 +286,12 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       input.closesIssue ? `Closes ${issue}` : `Part of ${issue}`,
       ...(input.ticket ? [`Closes ${slug(input.ticket.repo).toLowerCase() === slug(repo).toLowerCase() ? "" : slug(input.ticket.repo)}#${input.ticket.number}`] : []),
       ...(total > 1 ? [`Sub-task ${input.index + 1} of ${total}: ${subtask.title}`] : []),
+      ...(input.mergeAfter.length
+        ? ["", "### Merge order", ...input.mergeAfter.map((d) => `- Merge after ${prRef(d)} (${d.title}).`)]
+        : []),
+      ...(stacked
+        ? [`This pull request builds on ${prRef(stacked)} and targets its branch \`${stacked.branch}\`, so it shows only its own change. When ${prRef(stacked)} is merged, it moves to \`${input.defaultBranch}\`.`]
+        : []),
       "",
       "### AI review",
       review.summary,
@@ -281,8 +313,29 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       "",
       "---",
       `🤖 Generated by the orchestrator (run \`${runId}\`, ${input.track} track) on behalf of @${workItem.requester.login}.`,
-      "The review above was written by an AI reviewer agent; this pull request still needs a person's review.",
+      input.diffCheck
+        ? `@${workItem.requester.login} checked this change in the orchestrator before it was opened. The review above was written by an AI reviewer agent; this pull request still needs a person's review of the code.`
+        : "The review above was written by an AI reviewer agent; this pull request still needs a person's review.",
     ].join("\n");
+  };
+
+  /** A warning for the story view and the sub-task's conversation. */
+  const warn = async (noticeKey: string, text: string) => {
+    await orch.addStoryWarning({ runId, key, text });
+    await orch.postNotice({ runId, conversationId, noticeKey: `${noticeKey}-${key}`, level: "warning", text });
+    await emit("story.warning", { subtask: key, text });
+  };
+
+  /** Merges the default branch into the sub-task's branch, once the pull request it was stacked on has merged (AD-41). */
+  const bringUpToDate = async (push: boolean) => {
+    const updated = await steps.updateBranchFromDefault({ runId, subtaskKey: key, repo, defaultBranch: input.defaultBranch, branch, commitAuthor: input.commitAuthor });
+    if (updated.status === "conflict") {
+      await warn("uptodate", `The branch ${branch} could not be brought up to date with ${input.defaultBranch}: the merge conflicts. Resolve the conflict in the pull request.`);
+    } else if (updated.status === "merged") {
+      headCommit = updated.headCommit;
+      await orch.patchSubtask({ runId, key, patch: { headCommit } });
+      if (push) await integ.pushBranch({ runId, subtaskKey: key, repo, branch });
+    }
   };
 
   const body = async (): Promise<SubTaskResult> => {
@@ -299,10 +352,19 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       ownConversation: input.ownConversation,
       runConversationId: input.runConversationId,
       ticket: input.ticket ? { number: input.ticket.number, url: input.ticket.url } : undefined,
+      stackedOn: input.stackedOn?.key,
     });
     conversationId = init.conversationId;
-    await emit("subtask.started", { subtask: key, title: subtask.title, repository: slug(repo), branch }, { branch });
-    const { baseCommit } = await steps.prepareSubtaskRepo({ runId, subtaskKey: key, repo, defaultBranch: input.defaultBranch, branch });
+    await emit("subtask.started", { subtask: key, title: subtask.title, repository: slug(repo), branch, stackedOn: input.stackedOn?.key ?? null }, { branch });
+    const prepared = await steps.prepareSubtaskRepo({
+      runId,
+      subtaskKey: key,
+      repo,
+      defaultBranch: input.defaultBranch,
+      branch,
+      stackedOn: input.stackedOn ? { branch: input.stackedOn.branch, commit: input.stackedOn.headCommit } : undefined,
+    });
+    baseCommit = prepared.baseCommit;
     await orch.patchSubtask({ runId, key, patch: { baseCommit } });
 
     // Implementation in a sandbox, on the sub-task's own branch.
@@ -317,102 +379,179 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
     await steps.applyStepResult({ runId, subtaskKey: key, stepId: attempt.stepId, branch });
     let summary = attempt.result.summary;
     let verification = attempt.result.verification;
+    let evidence: CriterionEvidence[] = attempt.result.evidence ?? [];
     setProgress("Implementation", "done");
 
-    // AI review of every change, with bounded fix rounds (FR-R1, FR-R2). The reviewer starts from a clean workspace.
+    /** Implementation rounds after the first: fix rounds of the AI review, and changes the requester asked for. */
+    let round = 0;
     let fixRounds = 0;
+    let checkRounds = 0;
     let budget = input.maxFixRounds;
     let earlier: TrackedFinding[] = [];
     let guidance: string | undefined;
     let review: SubtaskReview;
     let unresolved = false;
     let openPullRequest = true;
-    for (;;) {
-      setProgress("AI review", "running");
-      await setState("reviewing", "reviewing", fixRounds ? `AI review after fix round ${fixRounds}` : "AI review");
-      const reviewed = await runStep("review", fixRounds ? `Review after fix round ${fixRounds}` : "Review", {
-        round: fixRounds,
-        findings: earlier,
-        implementerSummary: summary,
-        verification,
-      });
-      if (reviewed.result.status !== "succeeded" || !reviewed.result.review) {
-        throw ApplicationFailure.nonRetryable(`The AI review failed: ${reviewed.result.error ?? reviewed.result.summary}`);
-      }
-      const outcome = await orch.recordReview({ runId, key, conversationId, report: reviewed.result.review, verification: verification ?? null, fixRounds, budget });
-      review = outcome.review;
-      await emit("review.completed", { subtask: key, round: fixRounds, open: review.open.length, toFix: outcome.toFix.length });
-      if (outcome.toFix.length === 0) break;
+    let risk: { reasons: string[]; files: string[] } = { reasons: [], files: [] };
 
-      if (fixRounds >= budget) {
-        // Still blocking after the fix rounds: the requester decides (FR-R2).
-        await setState("awaiting_decision", "awaiting_approval", "Waiting for your decision on the review findings");
-        const { approvalId } = await orch.requestFindingsDecision({ runId, key, conversationId, findings: outcome.toFix, fixRounds });
-        await emit("review.unresolved", { subtask: key, approvalId, findings: outcome.toFix.length, fixRounds });
-        const decision = await waitForApproval(approvalId);
-        await emit("review.decided", { subtask: key, approvalId, decision: decision.decision });
-        if (decision.decision === "cancel") return end("cancelled_by_requester", "cancelled", "Cancelled by your decision on the review findings; nothing was pushed.");
-        if (decision.decision === "open" || decision.decision === "take_over") {
-          unresolved = true;
-          openPullRequest = decision.decision === "open";
-          await orch.setReviewStatus({ runId, key, conversationId, status: "accepted_with_findings" });
+    // One pass per version of the change: AI review with its fix rounds, the checks, then on the guided
+    // track the requester's own check. Changes the requester asks for start another pass.
+    for (;;) {
+      // AI review of every change, with bounded fix rounds (FR-R1, FR-R2). The reviewer starts from a clean workspace.
+      for (;;) {
+        setProgress("AI review", "running");
+        await setState("reviewing", "reviewing", round ? `AI review (round ${round + 1})` : "AI review");
+        const reviewed = await runStep("review", round ? `Review (round ${round + 1})` : "Review", {
+          round,
+          findings: earlier,
+          implementerSummary: summary,
+          verification,
+        });
+        if (reviewed.result.status !== "succeeded" || !reviewed.result.review) {
+          throw ApplicationFailure.nonRetryable(`The AI review failed: ${reviewed.result.error ?? reviewed.result.summary}`);
+        }
+        const outcome = await orch.recordReview({ runId, key, conversationId, report: reviewed.result.review, verification: verification ?? null, fixRounds, budget });
+        review = outcome.review;
+        await emit("review.completed", { subtask: key, round, open: review.open.length, toFix: outcome.toFix.length });
+        if (outcome.toFix.length === 0) {
+          unresolved = false;
           break;
         }
-        // Guide and retry: one more fix round with the requester's guidance.
-        guidance = decision.feedback;
-        budget += 1;
-        await orch.setReviewStatus({ runId, key, conversationId, status: "fixing" });
+
+        if (fixRounds >= budget) {
+          // Still blocking after the fix rounds: the requester decides (FR-R2).
+          await setState("awaiting_decision", "awaiting_approval", "Waiting for your decision on the review findings");
+          const { approvalId } = await orch.requestFindingsDecision({ runId, key, conversationId, findings: outcome.toFix, fixRounds });
+          await emit("review.unresolved", { subtask: key, approvalId, findings: outcome.toFix.length, fixRounds });
+          const decision = await waitForApproval(approvalId);
+          await emit("review.decided", { subtask: key, approvalId, decision: decision.decision });
+          if (decision.decision === "cancel") return end("cancelled_by_requester", "cancelled", "Cancelled by your decision on the review findings; nothing was pushed.");
+          if (decision.decision === "open" || decision.decision === "take_over") {
+            unresolved = true;
+            openPullRequest = decision.decision === "open";
+            await orch.setReviewStatus({ runId, key, conversationId, status: "accepted_with_findings" });
+            break;
+          }
+          // Guide and retry: one more fix round with the requester's guidance.
+          guidance = decision.feedback;
+          budget += 1;
+          await orch.setReviewStatus({ runId, key, conversationId, status: "fixing" });
+        }
+
+        fixRounds++;
+        round++;
+        setProgress("Implementation", "running");
+        await setState("implementing", "executing", `Fixing the review findings (round ${fixRounds})`);
+        await emit("review.fix_requested", { subtask: key, round: fixRounds, findings: outcome.toFix.length });
+        const fix = await runStep("implement", `Fix round ${fixRounds}: ${subtask.title}`, { round, findings: outcome.toFix, guidance });
+        if (fix.result.status !== "succeeded") throw ApplicationFailure.nonRetryable(`Fix round ${fixRounds} failed: ${fix.result.error ?? fix.result.summary}`);
+        await steps.applyStepResult({ runId, subtaskKey: key, stepId: fix.stepId, branch });
+        await orch.patchSubtask({ runId, key, patch: { fixRounds } });
+        summary = fix.result.summary;
+        verification = fix.result.verification ?? verification;
+        evidence = fix.result.evidence ?? evidence;
+        earlier = outcome.toFix;
+        guidance = undefined;
+        setProgress("Implementation", "done");
+      }
+      setProgress("AI review", "done");
+
+      // Checks before anything leaves the orchestrator. They do not depend on what any agent said.
+      await setState("publishing", "publishing", "Checking the change");
+      const squashed = await steps.squashSubtask({
+        runId,
+        subtaskKey: key,
+        branch,
+        baseCommit,
+        title: subtask.title,
+        summary,
+        requester: workItem.requester.login,
+        commitAuthor: input.commitAuthor,
+      });
+      headCommit = squashed.headCommit;
+      await orch.patchSubtask({ runId, key, patch: { headCommit } });
+      const inspection = await steps.inspectChanges({ runId, subtaskKey: key, repo, branch, baseCommit, checkLimits: input.track === "fast" && openPullRequest });
+      if (inspection.changedFiles.length === 0) throw ApplicationFailure.nonRetryable("The agents produced no changes");
+      if (inspection.secrets.length) {
+        const where = inspection.secrets.map((s) => `${s.kind} in ${s.file}:${s.line}`).join("; ");
+        throw ApplicationFailure.nonRetryable(`Possible secrets in the changes (${where}); nothing was pushed`);
+      }
+      risk = inspection.risk;
+      if (inspection.limits.length) {
+        // The analysis was an estimate: the change is bigger than the fast track allows (FR-A2).
+        await setState("awaiting_decision", "awaiting_approval", "The change is bigger than the fast track allows; waiting for your decision");
+        const { approvalId } = await orch.requestLimitsDecision({ runId, key, conversationId, reasons: inspection.limits, files: inspection.changedFiles });
+        await emit("track.limits_exceeded", { subtask: key, approvalId, reasons: inspection.limits });
+        const decision = await waitForApproval(approvalId);
+        await emit("track.limits_decided", { subtask: key, approvalId, decision: decision.decision });
+        if (decision.decision === "guided") return end("switch_to_guided", "cancelled", "Switched to the guided track; the fast-track change was set aside and nothing was pushed.");
+        if (decision.decision === "cancel") return end("cancelled_by_requester", "cancelled", "Cancelled by your decision; nothing was pushed.");
+      }
+      // A branch the requester takes over is theirs to judge: no check of the change here.
+      if (!input.diffCheck || !openPullRequest) break;
+
+      // The requester's check of the change, bound to its commit (FR-R4, AD-40).
+      setProgress("Your check", "running");
+      await setState("awaiting_check", "awaiting_approval", "Waiting for your check of the change");
+      const { approvalId } = await orch.requestChangeCheck({
+        runId,
+        key,
+        conversationId,
+        commit: headCommit,
+        repository: slug(repo),
+        branch,
+        round: checkRounds,
+        summary,
+        acceptanceCriteria: subtask.acceptanceCriteria,
+        evidence,
+        files: inspection.files,
+        verification: verification ?? null,
+        review,
+        fixRounds,
+        buildsOn: [...(input.stackedOn ? [input.stackedOn.title] : []), ...input.references.map((d) => d.title)],
+      });
+      await emit("change.check_requested", { subtask: key, approvalId, commit: headCommit, round: checkRounds });
+      const decision = await waitForApproval(approvalId);
+      await emit("change.decided", { subtask: key, approvalId, decision: decision.decision, commit: headCommit });
+      if (decision.decision === "approve") {
+        setProgress("Your check", "done");
+        break;
+      }
+      if (decision.decision === "drop") {
+        // Closed as not done: nothing was pushed; the run decides about the sub-tasks that depend on it.
+        if (input.ticket) await integ.closeSubIssue({ repo: input.ticket.repo, number: input.ticket.number, dropped: true });
+        await integ.commentOnIssue({
+          repo: workItem.repo,
+          number: workItem.number,
+          key: `run=${runId}:dropped:${key}`,
+          body: `🤖 Sub-task ${input.index + 1} of ${total} (${subtask.title}) was dropped by @${workItem.requester.login}; nothing was pushed for it.`,
+        });
+        return end("dropped", "dropped", "Dropped by your decision; nothing was pushed.");
       }
 
-      fixRounds++;
+      // Changes requested: another implementation round with the requester's words, reviewed again.
+      checkRounds++;
+      round++;
+      setProgress("Your check", "pending");
+      setProgress("AI review", "pending");
       setProgress("Implementation", "running");
-      await setState("implementing", "executing", `Fixing the review findings (round ${fixRounds})`);
-      await emit("review.fix_requested", { subtask: key, round: fixRounds, findings: outcome.toFix.length });
-      const fix = await runStep("implement", `Fix round ${fixRounds}: ${subtask.title}`, { round: fixRounds, findings: outcome.toFix, guidance });
-      if (fix.result.status !== "succeeded") throw ApplicationFailure.nonRetryable(`Fix round ${fixRounds} failed: ${fix.result.error ?? fix.result.summary}`);
-      await steps.applyStepResult({ runId, subtaskKey: key, stepId: fix.stepId, branch });
-      await orch.patchSubtask({ runId, key, patch: { fixRounds } });
-      summary = fix.result.summary;
-      verification = fix.result.verification ?? verification;
-      earlier = outcome.toFix;
-      guidance = undefined;
+      await setState("implementing", "executing", "Making the changes you asked for");
+      const changed = await runStep("implement", `Changes requested (${checkRounds}): ${subtask.title}`, { round, findings: [], guidance: decision.feedback });
+      if (changed.result.status !== "succeeded") throw ApplicationFailure.nonRetryable(`The requested changes failed: ${changed.result.error ?? changed.result.summary}`);
+      await steps.applyStepResult({ runId, subtaskKey: key, stepId: changed.stepId, branch });
+      summary = changed.result.summary;
+      verification = changed.result.verification ?? verification;
+      evidence = changed.result.evidence ?? evidence;
+      // The reviewer looks again at what was still open, and the new version gets its own fix rounds.
+      earlier = review.open;
+      budget = fixRounds + input.maxFixRounds;
       setProgress("Implementation", "done");
     }
-    setProgress("AI review", "done");
 
-    // Checks before anything leaves the orchestrator. They do not depend on what any agent said.
     setProgress("Pull request", "running");
-    await setState("publishing", "publishing", "Checking the change");
-    const squashed = await steps.squashSubtask({
-      runId,
-      subtaskKey: key,
-      branch,
-      baseCommit,
-      title: subtask.title,
-      summary,
-      requester: workItem.requester.login,
-      commitAuthor: input.commitAuthor,
-    });
-    await orch.patchSubtask({ runId, key, patch: { headCommit: squashed.headCommit } });
-    const inspection = await steps.inspectChanges({ runId, subtaskKey: key, repo, branch, baseCommit, checkLimits: input.track === "fast" && openPullRequest });
-    if (inspection.changedFiles.length === 0) throw ApplicationFailure.nonRetryable("The agents produced no changes");
-    if (inspection.secrets.length) {
-      const where = inspection.secrets.map((s) => `${s.kind} in ${s.file}:${s.line}`).join("; ");
-      throw ApplicationFailure.nonRetryable(`Possible secrets in the changes (${where}); nothing was pushed`);
-    }
-    if (inspection.limits.length) {
-      // The analysis was an estimate: the change is bigger than the fast track allows (FR-A2).
-      await setState("awaiting_decision", "awaiting_approval", "The change is bigger than the fast track allows; waiting for your decision");
-      const { approvalId } = await orch.requestLimitsDecision({ runId, key, conversationId, reasons: inspection.limits, files: inspection.changedFiles });
-      await emit("track.limits_exceeded", { subtask: key, approvalId, reasons: inspection.limits });
-      const decision = await waitForApproval(approvalId);
-      await emit("track.limits_decided", { subtask: key, approvalId, decision: decision.decision });
-      if (decision.decision === "guided") return end("switch_to_guided", "cancelled", "Switched to the guided track; the fast-track change was set aside and nothing was pushed.");
-      if (decision.decision === "cancel") return end("cancelled_by_requester", "cancelled", "Cancelled by your decision; nothing was pushed.");
-    }
-    if (inspection.risk.reasons.length) {
-      const { approvalId } = await orch.requestRiskApproval({ runId, conversationId, subtaskKey: key, reasons: inspection.risk.reasons, files: inspection.risk.files });
-      await emit("approval.requested", { kind: "risk", approvalId, reasons: inspection.risk.reasons, subtask: key });
+    if (risk.reasons.length) {
+      const { approvalId } = await orch.requestRiskApproval({ runId, conversationId, subtaskKey: key, reasons: risk.reasons, files: risk.files });
+      await emit("approval.requested", { kind: "risk", approvalId, reasons: risk.reasons, subtask: key });
       await setState("awaiting_decision", "awaiting_approval", "Waiting for approval of a high-risk change");
       const decision = await waitForApproval(approvalId);
       if (decision.decision !== "approve") {
@@ -422,7 +561,13 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       await emit("risk.approved", { approvalId, subtask: key });
     }
 
+    // Where the pull request goes: the default branch, or the branch this one is stacked on while that one is open (AD-41).
     await setState("publishing", "publishing", "Publishing the change");
+    let stacked: DependencyRef | null = null;
+    if (input.stackedOn && openPullRequest) {
+      if ((await integ.getPullRequestState({ repo, number: input.stackedOn.prNumber })) === "merged") await bringUpToDate(false);
+      else stacked = input.stackedOn;
+    }
     await integ.pushBranch({ runId, subtaskKey: key, repo, branch });
     await emit("scm.branch_pushed", { subtask: key, repository: slug(repo), branch });
     if (!openPullRequest) {
@@ -434,12 +579,16 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
     const pr = await integ.openPullRequest({
       repo,
       branch,
-      base: input.defaultBranch,
+      base: stacked ? stacked.branch : input.defaultBranch,
       title: clip(title, 250),
-      body: pullRequestBody(review, verification, fixRounds, unresolved),
+      body: pullRequestBody(review, verification, fixRounds, unresolved, stacked),
     });
     await orch.patchSubtask({ runId, key, patch: { prNumber: pr.number, prUrl: pr.url } });
-    await emit("scm.pr_opened", { subtask: key, number: pr.number, url: pr.url, repository: slug(repo), unresolved }, { prNumber: pr.number, prUrl: pr.url });
+    await emit(
+      "scm.pr_opened",
+      { subtask: key, number: pr.number, url: pr.url, repository: slug(repo), unresolved, base: stacked ? stacked.branch : input.defaultBranch },
+      { prNumber: pr.number, prUrl: pr.url },
+    );
     await orch.postPullRequestCard({ runId, conversationId, subtaskKey: key, number: pr.number, url: pr.url, title: pr.title, state: "open" });
     await integ.commentOnIssue({
       repo: workItem.repo,
@@ -450,6 +599,9 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
     setProgress("Pull request", "done");
     setProgress("Review and merge", "running");
     await setState("pr_open", "awaiting_merge", "Waiting for review and merge on GitHub");
+    // The run can start the sub-tasks that build on this one: its change is approved and its branch is pushed.
+    const parent = workflowInfo().parent;
+    if (parent) await getExternalWorkflowHandle(parent.workflowId).signal(subtaskPublishedSignal, { key, branch, headCommit, prNumber: pr.number, prUrl: pr.url });
 
     // Human review and merge happen on GitHub; poll until the pull request is merged or closed.
     for (;;) {
@@ -457,11 +609,42 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       const prState = await integ.getPullRequestState({ repo, number: pr.number });
       if (prState === "open") {
         if (expired()) throw ApplicationFailure.nonRetryable("The pull request was not merged within 30 days");
+        if (stacked) {
+          const below = await integ.getPullRequestState({ repo, number: stacked.prNumber });
+          if (below === "merged") {
+            // The pull request below merged: this one moves to the default branch and is brought up to date.
+            const moved = await integ.retargetPullRequest({ repo, number: pr.number, base: input.defaultBranch });
+            if (moved) {
+              await emit("scm.pr_retargeted", { subtask: key, number: pr.number, base: input.defaultBranch });
+              await bringUpToDate(true);
+            }
+            stacked = null;
+          } else if (below === "closed") {
+            await warn("below", `The pull request this one builds on (${prRef(stacked)}, ${stacked.title}) was closed without merging; this pull request still targets its branch.`);
+            stacked = null;
+          }
+        }
         continue;
       }
       await orch.postPullRequestCard({ runId, conversationId, subtaskKey: key, number: pr.number, url: pr.url, title: pr.title, state: prState });
       await emit(prState === "merged" ? "scm.pr_merged" : "scm.pr_closed", { subtask: key, number: pr.number });
       if (prState !== "merged") return end("closed", "closed", "Pull request closed without merging.");
+
+      // Merge order (FR-M5): advice the orchestrator watches. Merged before a pull request it depends on is flagged.
+      const early: DependencyRef[] = [];
+      for (const dep of input.mergeAfter) {
+        if ((await integ.getPullRequestState({ repo: dep.repo, number: dep.prNumber })) !== "merged") early.push(dep);
+      }
+      if (early.length) {
+        const below = stacked && early.find((d) => d.key === stacked!.key);
+        const text = below
+          ? `Pull request #${pr.number} (${subtask.title}) was merged into the branch of ${prRef(below)} (${below.title}), which is not merged yet: the change reaches ${input.defaultBranch} when that pull request is merged.`
+          : `Pull request #${pr.number} (${subtask.title}) was merged before ${early.map((d) => `${prRef(d)} (${d.title})`).join(" and ")}, which it depends on.`;
+        await orch.addStoryWarning({ runId, key, text });
+        await emit("story.merged_out_of_order", { subtask: key, before: early.map((d) => d.key) });
+        await integ.commentOnIssue({ repo: workItem.repo, number: workItem.number, key: `run=${runId}:order:${key}`, body: `🤖 ⚠️ Merge order: ${text}` });
+      }
+
       setProgress("Review and merge", "done");
       if (input.ownConversation) runState = "completed";
       await orch.patchSubtask({ runId, key, patch: { state: "merged" } });
@@ -476,7 +659,7 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
     return await body();
   } catch (err) {
     if (isCancellation(err)) {
-      // The run was cancelled: record it, then let the cancellation reach the run workflow.
+      // The run was cancelled or stopped: record it, then let the cancellation reach the run workflow.
       await CancellationScope.nonCancellable(async () => {
         await orch.patchSubtask({ runId, key, patch: { state: "cancelled" } });
         await orch.closeOutApprovals({ runId, subtaskKey: key });
@@ -641,6 +824,11 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
   const answers = new Map<string, AnswerSignal>();
 
   const main = new CancellationScope();
+  // The sub-task workflows of the run. Several can be alive at once: one being built, others waiting for their merge.
+  let kids: CancellationScope | undefined;
+  const children: Promise<unknown>[] = [];
+  const published = new Map<string, SubtaskPublishedSignal>();
+  setHandler(subtaskPublishedSignal, (p) => void published.set(p.key, p));
   setHandler(approvalSignal, (s) => void approvals.set(s.approvalId, s));
   setHandler(answerSignal, (s) => void answers.set(s.approvalId, s));
   setHandler(cancelSignal, (s) => {
@@ -726,11 +914,11 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
   // Endings ---------------------------------------------------------------------
   // Ticket write-back happens before the final state is recorded, so "completed" means everything is done.
   // A write-back failure is reported but never prevents the run from reaching its final state.
-  const finish = async (final: "completed" | "closed" | "cancelled" | "failed", text: string, level: "success" | "info" | "warning" | "error") => {
+  const finish = async (final: "completed" | "closed" | "cancelled" | "failed", text: string, level: "success" | "info" | "warning" | "error", closeTicket = false) => {
     state = final;
     let writeBackError: string | null = null;
     try {
-      await integ.finalizeIssue({ repo, number: workItem.number, outcome: final });
+      await integ.finalizeIssue({ repo, number: workItem.number, outcome: final, close: closeTicket });
       if (final !== "completed") {
         await integ.commentOnIssue({ repo, number: workItem.number, key: `run=${runId}:${final}`, body: `🤖 Run \`${runId}\` ended: ${text}` });
       }
@@ -740,7 +928,7 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
     if (conversationId) await orch.closeOutApprovals({ runId });
     await emit(`run.${final}`, { text, writeBackError }, { state: final, ...(final === "failed" ? { error: text } : {}) });
     if (conversationId) {
-      for (const p of progress) if (p.status === "running") p.status = final === "completed" ? "done" : "failed";
+      for (const p of progress) if (p.status === "running" || (p.status === "pending" && final !== "completed")) p.status = final === "completed" ? "done" : p.status === "pending" ? "skipped" : "failed";
       await pushProgress(text);
       await orch.postNotice({ runId, conversationId, noticeKey: "final", level, text });
       if (writeBackError) {
@@ -833,37 +1021,60 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
       return { owner, name };
     };
 
-    /** Runs one sub-task as a child workflow, in the repository it changes, and waits for how it ended. */
-    const runSubtask = async (
+    /** Starts one sub-task as a child workflow, in the repository it changes; resolves with how it ended. */
+    kids = new CancellationScope();
+    const startSubtask = async (
       plan: Plan,
       index: number,
-      opts: { key: string; repo: RepoRef; branchSuffix: string; ownConversation: boolean; closesIssue: boolean; prefix: ProgressItem[]; ticket?: { repo: RepoRef; number: number; url: string } },
-    ) => {
+      opts: {
+        key: string;
+        repo: RepoRef;
+        branchSuffix: string;
+        ownConversation: boolean;
+        closesIssue: boolean;
+        prefix: ProgressItem[];
+        ticket?: { repo: RepoRef; number: number; url: string };
+        diffCheck: boolean;
+        stackedOn?: DependencyRef;
+        references?: DependencyRef[];
+        mergeAfter?: DependencyRef[];
+      },
+    ): Promise<{ result: Promise<SubTaskResult> }> => {
       const context = await integ.lookupContext({ runId, workItem, repo: opts.repo });
-      return executeChild(subTaskWorkflow, {
-        workflowId: `subtask:${runId}:${opts.key}`,
-        args: [
-          {
-            runId,
-            workItem,
-            track,
-            key: opts.key,
-            index,
-            plan,
-            repo: opts.repo,
-            defaultBranch: context.defaultBranch,
-            branch: `${context.branch}${opts.branchSuffix}`,
-            commitAuthor: context.commitAuthor,
-            runConversationId: conversationId,
-            ownConversation: opts.ownConversation,
-            progressPrefix: opts.prefix,
-            closesIssue: opts.closesIssue,
-            ticket: opts.ticket,
-            maxFixRounds: init.settings.maxFixRounds,
-            prPollSeconds,
-          },
-        ],
-      });
+      const handle = await kids!.run(() =>
+        startChild(subTaskWorkflow, {
+          workflowId: `subtask:${runId}:${opts.key}`,
+          args: [
+            {
+              runId,
+              workItem,
+              track,
+              key: opts.key,
+              index,
+              plan,
+              repo: opts.repo,
+              defaultBranch: context.defaultBranch,
+              branch: `${context.branch}${opts.branchSuffix}`,
+              commitAuthor: context.commitAuthor,
+              runConversationId: conversationId,
+              ownConversation: opts.ownConversation,
+              progressPrefix: opts.prefix,
+              closesIssue: opts.closesIssue,
+              ticket: opts.ticket,
+              diffCheck: opts.diffCheck,
+              stackedOn: opts.stackedOn,
+              references: opts.references ?? [],
+              mergeAfter: opts.mergeAfter ?? [],
+              maxFixRounds: init.settings.maxFixRounds,
+              prPollSeconds,
+            },
+          ],
+        }),
+      );
+      // Wrapped: an async function that returned the promise itself would wait for the sub-task to end.
+      const result = handle.result();
+      children.push(result.catch(() => undefined));
+      return { result };
     };
 
     // The rules allow the fast track only for one repository; anything else is designed first.
@@ -882,7 +1093,8 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
       };
       await emit("plan.derived", { subtasks: 1 }, { plan });
       state = "executing";
-      const result = await runSubtask(plan, 0, { key: "change", repo: repoOf(repositories[0]!), branchSuffix: "", ownConversation: false, closesIssue: true, prefix: progress });
+      const change = await startSubtask(plan, 0, { key: "change", repo: repoOf(repositories[0]!), branchSuffix: "", ownConversation: false, closesIssue: true, prefix: progress, diffCheck: false });
+      const result = await change.result;
       progress = result.progress;
       if (result.status === "merged") return finish("completed", "Pull request merged. Done.", "success");
       if (result.status === "closed") return finish("closed", result.note ?? "Pull request closed without merging.", "info");
@@ -930,12 +1142,7 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
       ),
       subtasks: ordered.map((st) => ({
         title: st.title,
-        description: [
-          st.description,
-          `Repository: ${st.repository}`,
-          ...(st.dependsOn.length ? [`Builds on: ${st.dependsOn.map(titleOf).join("; ")} (already merged)`] : []),
-          ...(st.likelyFiles.length ? [`Likely files: ${st.likelyFiles.join(", ")}`] : []),
-        ].join("\n"),
+        description: [st.description, `Repository: ${st.repository}`, ...(st.likelyFiles.length ? [`Likely files: ${st.likelyFiles.join(", ")}`] : [])].join("\n"),
         acceptanceCriteria: st.acceptanceCriteria,
       })),
     };
@@ -944,44 +1151,223 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
     // The plan on the ticket: a summary and one sub-issue per sub-task, in the repository it changes (FR-P5).
     const mirrored = await integ.mirrorPlanOnTicket({ runId, workItem, plan: handoff, version: design.version, order: design.order });
     await emit("ticket.subtasks_created", { count: mirrored.subIssues.length, attached: mirrored.attached });
-
-    // Sub-tasks, one at a time and in build order, each on its own branch in its repository, with its own
-    // pull request and conversation (FR-B1, FR-C2, FR-M4). Until sub-tasks can build on each other's approved
-    // changes (increment 4), the next one starts once the previous pull request is merged.
-    const count = ordered.length;
-    const titles = ordered.map((st, i) => `${i + 1}. ${st.title}`);
-    progress.push(...titles.map((title) => ({ title, status: "pending" as ProgressStatus })));
-    for (let i = 0; i < count; i++) {
-      const st = ordered[i]!;
-      setProgress(titles[i]!, "running");
-      await setState("executing", `Sub-task ${i + 1} of ${count}`);
-      const result = await runSubtask(plan, i, {
+    // The story view: every sub-task is there from the start, as planned (FR-R7).
+    await orch.planSubtasks({
+      runId,
+      items: ordered.map((st, i) => ({
         key: st.key,
-        repo: repoOf(st.repository),
-        branchSuffix: `-${st.key}`,
-        ownConversation: true,
-        closesIssue: i === count - 1,
-        prefix: [],
+        title: st.title,
+        description: plan.subtasks[i]!.description,
+        acceptanceCriteria: st.acceptanceCriteria,
+        repository: st.repository,
+        dependsOn: st.dependsOn,
         ticket: mirrored.subIssues.find((si) => si.key === st.key),
-      });
-      if (result.status === "merged") {
-        setProgress(titles[i]!, "done");
-        continue;
-      }
-      setProgress(titles[i]!, "failed");
-      const rest = count - i - 1;
-      const notStarted = rest ? ` The remaining ${rest} sub-task(s) were not started.` : "";
-      if (result.status === "failed") throw ApplicationFailure.nonRetryable(`Sub-task ${i + 1} failed: ${result.note ?? "unknown error"}`);
-      const text = `Sub-task ${i + 1}: ${result.note ?? result.status}${notStarted}`;
-      if (result.status === "cancelled_by_requester") return finish("cancelled", text, "warning");
-      return finish("closed", text, "info");
+      })),
+    });
+
+    // Sub-tasks are built one at a time, in build order, each on its own branch in its repository, with its
+    // own pull request and conversation (FR-B1, FR-C2, FR-M4). The next one starts when the one before has
+    // passed the requester's check and its pull request is open, not when it is merged (AD-41): its pull
+    // request then waits for its merge while the others are built.
+    interface Slot {
+      st: PlanSubtask;
+      index: number;
+      title: string;
+      phase: "planned" | "building" | "ended";
+      /** How it ended. */
+      result?: SubTaskResult;
+      /** The sub-task its branch is stacked on. */
+      stackedOn?: string;
     }
-    await finish("completed", count > 1 ? `All ${count} sub-tasks are merged. Done.` : "Pull request merged. Done.", "success");
+    const count = ordered.length;
+    const slots = ordered.map((st, index): Slot => ({ st, index, title: `${index + 1}. ${st.title}`, phase: "planned" }));
+    const slotOf = (k: string) => slots.find((s) => s.st.key === k);
+    progress.push(...slots.map((s) => ({ title: s.title, status: "pending" as ProgressStatus })));
+
+    const isOpen = (s: Slot) => s.phase === "building" && published.has(s.st.key);
+    const merged = (s: Slot) => s.result?.status === "merged";
+    /** Ended without its change being merged: dropped, declined on GitHub, or taken over by the requester. */
+    const notDelivered = (s: Slot) => s.phase === "ended" && !merged(s);
+    /** A failure or a cancellation by the requester ends the whole run. */
+    const stopper = () => slots.find((s) => s.result?.status === "failed" || s.result?.status === "cancelled_by_requester");
+    const sameRepo = (a: Slot, b: Slot) => a.st.repository.toLowerCase() === b.st.repository.toLowerCase();
+    const refOf = (s: Slot): DependencyRef => {
+      const p = published.get(s.st.key)!;
+      return { key: s.st.key, title: s.st.title, repo: repoOf(s.st.repository), branch: p.branch, headCommit: p.headCommit, prNumber: p.prNumber, prUrl: p.prUrl };
+    };
+    const dependencies = (s: Slot) => s.st.dependsOn.map(slotOf).filter((d): d is Slot => !!d).sort((a, b) => a.index - b.index);
+    /** The sub-tasks whose approved changes a branch contains, by the way of the branches it is stacked on. */
+    const stack = (s: Slot): Set<string> => {
+      const keys = new Set<string>();
+      for (let below = s.stackedOn ? slotOf(s.stackedOn) : undefined; below && !keys.has(below.st.key); below = below.stackedOn ? slotOf(below.stackedOn) : undefined) keys.add(below.st.key);
+      return keys;
+    };
+
+    const stopAll = async () => {
+      kids!.cancel();
+      await Promise.allSettled(children);
+    };
+    const reflected = new Set<string>();
+    /** Shows on the run's progress card how sub-tasks ended. */
+    const reflect = async () => {
+      let changed = false;
+      for (const s of slots) {
+        if (s.phase !== "ended" || reflected.has(s.st.key)) continue;
+        reflected.add(s.st.key);
+        setProgress(s.title, merged(s) ? "done" : s.result?.status === "dropped" ? "skipped" : "failed");
+        changed = true;
+      }
+      if (changed) await pushProgress(`${slots.filter(merged).length} of ${count} sub-tasks merged`);
+    };
+
+    const decided = new Set<string>();
+    const undecided = () => slots.some((s) => notDelivered(s) && !decided.has(s.st.key));
+    const STATE_OF: Record<string, SubtaskState> = { dropped: "dropped", closed: "closed", handed_over: "handed_over" };
+    /**
+     * A sub-task that was not delivered, with sub-tasks that depend on it and have not started: the requester
+     * decides whether those are dropped too, built without it, or the run is cancelled (FR-R4).
+     */
+    const settle = async (): Promise<"continue" | "cancel"> => {
+      for (const s of slots) {
+        if (!notDelivered(s) || decided.has(s.st.key)) continue;
+        decided.add(s.st.key);
+        const waiting: Slot[] = [];
+        for (const candidate of slots) {
+          if (candidate.phase === "planned" && candidate.st.dependsOn.some((k) => k === s.st.key || waiting.some((w) => w.st.key === k))) waiting.push(candidate);
+        }
+        if (!waiting.length) continue;
+        const { approvalId } = await orch.requestDependentsDecision({
+          runId,
+          conversationId,
+          subtask: { key: s.st.key, title: s.st.title, state: STATE_OF[s.result!.status] ?? "closed" },
+          dependents: waiting.map((w) => ({ key: w.st.key, title: w.st.title })),
+        });
+        await emit("story.dependents_asked", { approvalId, subtask: s.st.key, dependents: waiting.map((w) => w.st.key) });
+        await setState("awaiting_approval", "Waiting for your decision on the sub-tasks that depend on one that was not delivered");
+        const decision = await waitForApproval(approvalId);
+        await emit("story.dependents_decided", { approvalId, decision: decision.decision });
+        if (decision.decision === "cancel") return "cancel";
+        if (decision.decision === "drop") {
+          for (const w of waiting) {
+            w.phase = "ended";
+            w.result = { status: "dropped", note: `Dropped with "${s.st.title}", which it depends on.`, progress: [] };
+            decided.add(w.st.key);
+            const ticket = mirrored.subIssues.find((si) => si.key === w.st.key);
+            if (ticket) await integ.closeSubIssue({ repo: ticket.repo, number: ticket.number, dropped: true });
+          }
+          await orch.dropSubtasks({ runId, keys: waiting.map((w) => w.st.key) });
+        }
+        // Build anyway: they start as planned, and are told that the change they depended on is not there.
+      }
+      return "continue";
+    };
+
+    /** Waits until something happened, then deals with a run-ending result or a sub-task that was not delivered. */
+    const waitUntil = async (ready: () => boolean): Promise<"ready" | "stopped"> => {
+      for (;;) {
+        await condition(() => ready() || !!stopper() || undecided());
+        const stopped = stopper();
+        if (stopped) {
+          await CancellationScope.nonCancellable(stopAll);
+          if (stopped.result!.status === "failed") throw ApplicationFailure.nonRetryable(`Sub-task ${stopped.index + 1} failed: ${stopped.result!.note ?? "unknown error"}`);
+          await finish("cancelled", `Sub-task ${stopped.index + 1}: ${stopped.result!.note ?? "cancelled by your decision"}`, "warning");
+          return "stopped";
+        }
+        await reflect();
+        if ((await settle()) === "cancel") {
+          await CancellationScope.nonCancellable(stopAll);
+          await finish("cancelled", "Cancelled by your decision on the sub-tasks that depend on one that was not delivered.", "warning");
+          return "stopped";
+        }
+        await reflect();
+        if (ready()) return "ready";
+      }
+    };
+
+    for (const slot of slots) {
+      if (slot.phase === "ended") continue; // dropped together with a sub-task it depends on
+      const deps = dependencies(slot);
+      // In the same repository the branch is stacked on the latest dependency that is still open. When that one
+      // does not contain the other open ones, the sub-task waits for their merges and starts from the default branch.
+      let stackedOn: Slot | undefined;
+      for (;;) {
+        const open = deps.filter((d) => isOpen(d) && sameRepo(d, slot));
+        const top = open[open.length - 1];
+        if (!top || open.every((d) => d === top || stack(top).has(d.st.key))) {
+          stackedOn = top;
+          break;
+        }
+        await setState("awaiting_merge", `Sub-task ${slot.index + 1} waits for the merge of the pull requests it builds on`);
+        if ((await waitUntil(() => open.some((d) => d.phase === "ended"))) === "stopped") return;
+      }
+      // While it waited, the requester may have dropped it with a sub-task it depends on.
+      if ((slot.phase as Slot["phase"]) === "ended") continue;
+
+      const builds = deps.map((d) => {
+        const where = sameRepo(d, slot) ? "" : ` (in ${d.st.repository})`;
+        if (merged(d)) return `- "${d.st.title}"${where} is merged${where ? ": the repository is checked out read-only in your workspace" : ": your branch starts from it"}.`;
+        if (isOpen(d) && sameRepo(d, slot)) return `- "${d.st.title}" is approved but not merged yet: your branch starts from its change.`;
+        if (isOpen(d)) return `- "${d.st.title}"${where} is approved but not merged yet: its change is checked out read-only in your workspace.`;
+        return `- "${d.st.title}"${where} was not delivered: its change is not available, build without it.`;
+      });
+      const own: Plan = {
+        ...plan,
+        subtasks: plan.subtasks.map((p, i) => (i === slot.index && builds.length ? { ...p, description: [p.description, "", "Builds on:", ...builds].join("\n") } : p)),
+      };
+      slot.stackedOn = stackedOn?.st.key;
+      slot.phase = "building";
+      setProgress(slot.title, "running");
+      await setState("executing", `Sub-task ${slot.index + 1} of ${count}`);
+      const started = await startSubtask(own, slot.index, {
+        key: slot.st.key,
+        repo: repoOf(slot.st.repository),
+        branchSuffix: `-${slot.st.key}`,
+        ownConversation: true,
+        // A story with several sub-tasks is closed by the run when the last pull request merges, whichever that is.
+        closesIssue: count === 1,
+        prefix: [],
+        ticket: mirrored.subIssues.find((si) => si.key === slot.st.key),
+        diffCheck: true,
+        stackedOn: stackedOn ? refOf(stackedOn) : undefined,
+        references: deps.filter((d) => !sameRepo(d, slot) && published.has(d.st.key) && (isOpen(d) || merged(d))).map(refOf),
+        mergeAfter: deps.filter(isOpen).map(refOf),
+      });
+      void started.result.then(
+        (r) => {
+          slot.result = r;
+          slot.phase = "ended";
+        },
+        (err: unknown) => {
+          slot.result = { status: "failed", note: rootMessage(err), progress: [] };
+          slot.phase = "ended";
+        },
+      );
+      // One at a time: the next sub-task starts when this one's pull request is open, or when it ended.
+      if ((await waitUntil(() => slot.phase === "ended" || published.has(slot.st.key))) === "stopped") return;
+    }
+
+    // Everything is started: the story is complete when every sub-task that was not dropped is merged (FR-R7).
+    if ((await waitUntil(() => slots.every((s) => s.phase === "ended"))) === "stopped") return;
+    const done = slots.filter(merged).length;
+    const dropped = slots.filter((s) => s.result?.status === "dropped").length;
+    const others = slots.filter((s) => !merged(s) && s.result?.status !== "dropped");
+    if (!others.length && done > 0) {
+      const text = done === count ? (count > 1 ? `All ${count} sub-tasks are merged. Done.` : "Pull request merged. Done.") : `${done} sub-task(s) merged, ${dropped} dropped. Done.`;
+      return finish("completed", text, "success", count > 1);
+    }
+    if (!others.length) return finish("closed", "Every sub-task was dropped; nothing was built.", "info");
+    const why = others.map((s) => `${s.index + 1}. ${s.st.title}: ${s.result?.note ?? s.result?.status}`).join(" ");
+    await finish("closed", `${done} of ${count} sub-tasks merged. Not delivered: ${why}`, "info");
   };
 
   try {
     await main.run(deliver);
   } catch (err) {
+    // The sub-tasks still alive end with the run: each records that it was cancelled before the run reports its end.
+    await CancellationScope.nonCancellable(async () => {
+      kids?.cancel();
+      await Promise.allSettled(children);
+    });
     if (isCancellation(err) && cancel.reason) {
       const reason = cancel.reason;
       await CancellationScope.nonCancellable(() => finish("cancelled", `Cancelled: ${reason}`, "warning"));

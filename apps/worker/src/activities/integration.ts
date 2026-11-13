@@ -156,16 +156,37 @@ export async function mirrorPlanOnTicket(input: { runId: string; workItem: WorkI
   return { subIssues, attached };
 }
 
-/** Closes the sub-issue of a sub-task once its pull request is merged. */
-export async function closeSubIssue(input: { repo: RepoRef; number: number }): Promise<void> {
-  await gh((c) => c.closeIssue(input.repo, input.number));
+/** Closes the sub-issue of a sub-task: as completed once its pull request is merged, as not planned when it was dropped. */
+export async function closeSubIssue(input: { repo: RepoRef; number: number; dropped?: boolean }): Promise<void> {
+  await gh((c) => c.closeIssue(input.repo, input.number, input.dropped ? "not_planned" : "completed"));
 }
 
-export async function finalizeIssue(input: { repo: RepoRef; number: number; outcome: "completed" | "closed" | "cancelled" | "failed" }): Promise<void> {
+/**
+ * Labels of the ticket at the end of a run. `close` also closes the ticket: a story with several sub-tasks is
+ * complete when the last of its pull requests merges, whichever that is, so no pull request closes it (FR-R7).
+ */
+export async function finalizeIssue(input: { repo: RepoRef; number: number; outcome: "completed" | "closed" | "cancelled" | "failed"; close?: boolean }): Promise<void> {
   await gh((c) => c.removeLabel(input.repo, input.number, LABEL_IN_PROGRESS));
   // Never leave the trigger label behind, or the issue would be picked up again in a loop.
   await gh((c) => c.removeLabel(input.repo, input.number, config.triggerLabel()));
-  if (input.outcome === "completed") await gh((c) => c.addLabels(input.repo, input.number, [LABEL_DONE]));
+  if (input.outcome === "completed") {
+    await gh((c) => c.addLabels(input.repo, input.number, [LABEL_DONE]));
+    if (input.close) await gh((c) => c.closeIssue(input.repo, input.number, "completed"));
+  }
+}
+
+/**
+ * Points a stacked pull request at the default branch, once the pull request below it has merged (AD-41).
+ * Returns false when GitHub refuses, e.g. because the pull request was merged or closed in the meantime.
+ */
+export async function retargetPullRequest(input: { repo: RepoRef; number: number; base: string }): Promise<boolean> {
+  try {
+    await gh((c) => c.updatePullRequestBase(input.repo, input.number, input.base));
+    return true;
+  } catch (err) {
+    if (err instanceof ApplicationFailure && err.nonRetryable) return false;
+    throw err;
+  }
 }
 
 /** Pushes a sub-task's branch. Only agent branches ever leave the orchestrator. */

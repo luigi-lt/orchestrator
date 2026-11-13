@@ -247,6 +247,11 @@ export class GitHubClient {
     );
     return { number: data!.number, url: data!.html_url, title: data!.title, state: data!.state, merged: data!.merged };
   }
+
+  /** Points an open pull request at another base branch: a stacked pull request moves to the default branch once the one below it merged. */
+  async updatePullRequestBase(repo: RepoRef, number: number, base: string): Promise<void> {
+    await this.request("PATCH", `${this.repoPath(repo)}/pulls/${number}`, { body: { base } });
+  }
 }
 
 /** Builds a clone URL from a template such as `https://github.com/{owner}/{repo}.git`. */

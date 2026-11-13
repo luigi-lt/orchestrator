@@ -1,24 +1,7 @@
-import type { Component, MessageAuthor, MessageDto } from "@orch/contracts";
+import type { Component, MessageAuthor, MessageDto, OrchestratorCard } from "@orch/contracts";
 import { FormBlock, TableBlock } from "./AgentBlocks";
 import { OrchestratorCardView } from "./Cards";
 import { SafeMarkdown } from "./SafeMarkdown";
-
-const SYSTEM = new Set([
-  "work_item",
-  "run_link",
-  "analysis",
-  "progress",
-  "plan",
-  "questions",
-  "risk",
-  "subtask",
-  "review",
-  "findings",
-  "limits",
-  "story",
-  "pull_request",
-  "notice",
-]);
 
 /** Every agent message says which agent wrote it (AD-38). */
 const AGENT_NAMES: Record<MessageAuthor, string> = { "front-door": "Assistant", architect: "Architect agent" };
@@ -37,7 +20,10 @@ export function MessageView({ message, onSubmitForm }: { message: MessageDto; on
         <div className="origin" title="Posted by the orchestrator from its own records, not by the agent">
           ◆ Orchestrator
         </div>
-        {message.components.map((c, i) => (SYSTEM.has(c.type) ? <OrchestratorCardView key={i} card={c as never} /> : null))}
+        {/* Only orchestrator cards are drawn here: the card view knows every type and draws nothing for anything else. */}
+        {message.components.map((c, i) => (
+          <OrchestratorCardView key={i} card={c as OrchestratorCard} />
+        ))}
       </div>
     );
   }

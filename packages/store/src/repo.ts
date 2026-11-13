@@ -1,5 +1,7 @@
 import { newId } from "@orch/common";
 import type {
+  ChangedFile,
+  CriterionEvidence,
   Analysis,
   ApprovalDto,
   ApprovalKind,
@@ -451,6 +453,12 @@ interface SubtaskRow {
   review: SubtaskReview | null;
   verification: Verification | null;
   fix_rounds: number;
+  depends_on: string[];
+  stacked_on: string | null;
+  evidence: CriterionEvidence[] | null;
+  changed_files: ChangedFile[] | null;
+  check_rounds: number;
+  warnings: string[];
   created_at: Date;
   updated_at: Date;
 }
@@ -476,6 +484,12 @@ const toSubtask = (r: SubtaskRow): SubtaskDto => ({
   review: r.review,
   verification: r.verification,
   fixRounds: r.fix_rounds,
+  dependsOn: r.depends_on ?? [],
+  stackedOn: r.stacked_on,
+  evidence: r.evidence,
+  changedFiles: r.changed_files,
+  checkRounds: r.check_rounds,
+  warnings: r.warnings ?? [],
   createdAt: iso(r.created_at)!,
   updatedAt: iso(r.updated_at)!,
 });
@@ -491,15 +505,43 @@ export interface NewSubtask {
   product?: string | null;
   repository?: string | null;
   branch?: string | null;
+  dependsOn?: string[];
+  ticketNumber?: number | null;
+  ticketUrl?: string | null;
 }
 
+/** Records a sub-task; one that is already recorded (planned at the plan's approval) is left as it is. */
 export async function insertSubtask(db: Queryable, st: NewSubtask): Promise<void> {
   await db.query(
-    `insert into subtasks (run_id, key, idx, title, description, acceptance_criteria, state, product, repository, branch)
-     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) on conflict (run_id, key) do nothing`,
-    [st.runId, st.key, st.index, st.title, st.description, JSON.stringify(st.acceptanceCriteria), st.state, st.product ?? null, st.repository ?? null, st.branch ?? null],
+    `insert into subtasks (run_id, key, idx, title, description, acceptance_criteria, state, product, repository, branch, depends_on, ticket_number, ticket_url)
+     values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) on conflict (run_id, key) do nothing`,
+    [
+      st.runId,
+      st.key,
+      st.index,
+      st.title,
+      st.description,
+      JSON.stringify(st.acceptanceCriteria),
+      st.state,
+      st.product ?? null,
+      st.repository ?? null,
+      st.branch ?? null,
+      JSON.stringify(st.dependsOn ?? []),
+      st.ticketNumber ?? null,
+      st.ticketUrl ?? null,
+    ],
   );
   await notify(db, { t: "run", r: st.runId });
+}
+
+/** Adds a warning to a sub-task for the story view; the same text is kept once. */
+export async function addSubtaskWarning(db: Queryable, runId: string, key: string, text: string): Promise<void> {
+  await db.query(
+    `update subtasks set warnings = warnings || to_jsonb($3::text), updated_at = now()
+     where run_id = $1 and key = $2 and not warnings @> to_jsonb($3::text)`,
+    [runId, key, text],
+  );
+  await notify(db, { t: "run", r: runId });
 }
 
 export interface SubtaskPatch {
@@ -515,8 +557,14 @@ export interface SubtaskPatch {
   review?: SubtaskReview;
   verification?: Verification;
   fixRounds?: number;
+  description?: string;
+  stackedOn?: string;
+  evidence?: CriterionEvidence[];
+  changedFiles?: ChangedFile[];
+  checkRounds?: number;
 }
 
+const SUBTASK_JSON_FIELDS = new Set<keyof SubtaskPatch>(["review", "verification", "evidence", "changedFiles"]);
 const SUBTASK_PATCH_COLUMNS: Record<keyof SubtaskPatch, string> = {
   state: "state",
   branch: "branch",
@@ -530,6 +578,11 @@ const SUBTASK_PATCH_COLUMNS: Record<keyof SubtaskPatch, string> = {
   review: "review",
   verification: "verification",
   fixRounds: "fix_rounds",
+  description: "description",
+  stackedOn: "stacked_on",
+  evidence: "evidence",
+  changedFiles: "changed_files",
+  checkRounds: "check_rounds",
 };
 
 export async function updateSubtask(db: Queryable, runId: string, key: string, patch: SubtaskPatch): Promise<void> {
@@ -537,7 +590,7 @@ export async function updateSubtask(db: Queryable, runId: string, key: string, p
   const values: unknown[] = [runId, key];
   for (const [field, column] of Object.entries(SUBTASK_PATCH_COLUMNS) as [keyof SubtaskPatch, string][]) {
     if (patch[field] === undefined) continue;
-    values.push(field === "review" || field === "verification" ? JSON.stringify(patch[field]) : patch[field]);
+    values.push(SUBTASK_JSON_FIELDS.has(field) ? JSON.stringify(patch[field]) : patch[field]);
     sets.push(`${column} = $${values.length}`);
   }
   if (!sets.length) return;
@@ -912,6 +965,8 @@ export async function listPendingApprovals(db: Queryable): Promise<ApprovalDto[]
     risk: "Approve high-risk change",
     findings: "Decide on review findings",
     limits: "Decide on a change beyond the fast track",
+    change: "Check a change before its pull request",
+    dependents: "Decide on sub-tasks that depend on one that was not delivered",
   };
   return rows.map((r) => ({
     id: r.id,

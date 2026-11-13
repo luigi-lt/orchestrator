@@ -37,10 +37,18 @@ export function remoteFor(repo: RepoRef): { url: string; env: Record<string, str
 }
 
 /**
- * Clones the repository for a sub-task (once) and puts its branch on the current head of the default branch.
- * Returns the commit the sub-task starts from.
+ * Clones the repository for a sub-task (once) and creates its branch: on the current head of the default
+ * branch, or, for a sub-task stacked on another one of the same repository, on that one's approved commit (AD-41).
+ * Returns the commit the sub-task's own change starts from.
  */
-export async function ensureWorkRepo(runId: string, subtaskKey: string, repo: RepoRef, defaultBranch: string, branch: string): Promise<{ dir: string; baseCommit: string }> {
+export async function ensureWorkRepo(
+  runId: string,
+  subtaskKey: string,
+  repo: RepoRef,
+  defaultBranch: string,
+  branch: string,
+  stackedOn?: { branch: string; commit: string },
+): Promise<{ dir: string; baseCommit: string }> {
   const dir = workRepoDir(runId, subtaskKey);
   const { url, env } = remoteFor(repo);
   if (!existsSync(join(dir, ".git"))) {
@@ -48,10 +56,50 @@ export async function ensureWorkRepo(runId: string, subtaskKey: string, repo: Re
     await git(["clone", "--no-tags", "--single-branch", "--branch", defaultBranch, url, dir], { env });
   }
   const local = await git(["branch", "--list", branch], { cwd: dir });
-  if (!local.trim()) await git(["checkout", "-B", branch, `origin/${defaultBranch}`], { cwd: dir });
-  else await git(["checkout", branch], { cwd: dir });
-  const baseCommit = (await git(["merge-base", branch, `origin/${defaultBranch}`], { cwd: dir })).trim();
+  if (!local.trim()) {
+    let start = `origin/${defaultBranch}`;
+    if (stackedOn) {
+      // The branch below was pushed when its pull request opened; the approved commit must be on it.
+      await git(["fetch", "--no-tags", url, `+refs/heads/${stackedOn.branch}:refs/remotes/origin/${stackedOn.branch}`], { cwd: dir, env });
+      await git(["merge-base", "--is-ancestor", stackedOn.commit, `origin/${stackedOn.branch}`], { cwd: dir });
+      start = stackedOn.commit;
+    }
+    await git(["checkout", "-B", branch, start], { cwd: dir });
+  } else await git(["checkout", branch], { cwd: dir });
+  const baseCommit = stackedOn ? stackedOn.commit : (await git(["merge-base", branch, `origin/${defaultBranch}`], { cwd: dir })).trim();
   return { dir, baseCommit };
+}
+
+/**
+ * Brings a sub-task's branch up to date with the default branch by merging it in. Used when the pull request
+ * a branch was stacked on has merged. A conflict leaves the branch as it was.
+ */
+export async function mergeDefaultBranch(
+  runId: string,
+  subtaskKey: string,
+  repo: RepoRef,
+  defaultBranch: string,
+  branch: string,
+  author: { name: string; email: string },
+): Promise<{ status: "up_to_date" | "merged" | "conflict"; headCommit: string }> {
+  const cwd = workRepoDir(runId, subtaskKey);
+  const { url, env } = remoteFor(repo);
+  await git(["fetch", "--no-tags", url, `+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}`], { cwd, env });
+  await git(["checkout", branch], { cwd });
+  const head = async () => (await git(["rev-parse", "HEAD"], { cwd })).trim();
+  const contained = await git(["merge-base", "--is-ancestor", `origin/${defaultBranch}`, "HEAD"], { cwd }).then(
+    () => true,
+    () => false,
+  );
+  if (contained) return { status: "up_to_date", headCommit: await head() };
+  const identity = ["-c", `user.name=${author.name}`, "-c", `user.email=${author.email}`];
+  try {
+    await git([...identity, "merge", "--no-edit", "--no-verify", "-m", `Merge ${defaultBranch} into ${branch}`, `origin/${defaultBranch}`], { cwd });
+  } catch {
+    await git(["merge", "--abort"], { cwd }).catch(() => undefined);
+    return { status: "conflict", headCommit: await head() };
+  }
+  return { status: "merged", headCommit: await head() };
 }
 
 // One git operation at a time per mirror: concurrent fetches into the same repository fight over ref locks.

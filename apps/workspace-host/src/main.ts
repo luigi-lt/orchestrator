@@ -25,6 +25,7 @@ import { GUIDANCE_FILES, analyst, architect, implementer, reviewer, type AgentPr
 import {
   Analysis,
   HandoffPlan,
+  CriterionEvidence,
   ReviewReport,
   StepBrief,
   repoSlug,
@@ -231,7 +232,7 @@ function repositoriesSection(canRequestMore: boolean): string[] {
     "## Repositories in this workspace",
     ...checkouts.map(
       (c) =>
-        `- ${c.dir} — ${repoSlug(c.entry.repo)} (product ${c.entry.product}, ${c.entry.role}, ${c.entry.mode === "writable" ? "writable" : "read-only"})`,
+        `- ${c.dir} — ${repoSlug(c.entry.repo)} (product ${c.entry.product}, ${c.entry.role}, ${c.entry.mode === "writable" ? "writable" : "read-only"})${c.entry.note ? `\n  ${c.entry.note}` : ""}`,
     ),
     ...(canRequestMore ? ["Other repositories of the catalog can be opened read-only with request_repository."] : []),
   ];
@@ -306,7 +307,7 @@ function subtaskSection(brief: StepBrief): string[] {
     "",
     "## Plan",
     plan.summary,
-    ...plan.subtasks.map((s, i) => `${i + 1}. ${s.title}${i < index ? " (done)" : i === index ? " (current)" : ""}`),
+    ...plan.subtasks.map((s, i) => `${i + 1}. ${s.title}${i === index ? " (current)" : ""}`),
     "",
     `## The sub-task (${index + 1} of ${plan.subtasks.length}): ${sub.title}`,
     sub.description,
@@ -317,7 +318,9 @@ function subtaskSection(brief: StepBrief): string[] {
 }
 
 function implementPrompt(brief: StepBrief): string {
-  const fixing = brief.round > 0 || brief.findings.length > 0;
+  const fixing = brief.findings.length > 0;
+  // The requester asked for changes at the check of the change: their words, with no findings of a reviewer.
+  const changing = !fixing && brief.round > 0;
   return [
     ...ticketSection(brief),
     ...subtaskSection(brief),
@@ -330,11 +333,19 @@ function implementPrompt(brief: StepBrief): string {
           ...(brief.guidance ? ["", "## Guidance from the requester", brief.guidance] : []),
         ]
       : []),
+    ...(changing
+      ? [
+          "",
+          "## Changes requested by the requester",
+          "The requester looked at the change that is already on this branch and asks for this. Do exactly this, on top of that change:",
+          brief.guidance?.trim() || "(no details given: re-check the change against the acceptance criteria)",
+        ]
+      : []),
     ...repositoriesSection(false),
     ...commandsSection(brief),
     ...guidanceSection(),
     "",
-    fixing ? "Fix the findings now, then call submit_result." : "Implement this sub-task now, then call submit_result.",
+    fixing ? "Fix the findings now, then call submit_result." : changing ? "Make the requested changes now, then call submit_result." : "Implement this sub-task now, then call submit_result.",
   ].join("\n");
 }
 
@@ -368,6 +379,7 @@ interface AgentOutcome {
   analysis?: Analysis;
   review?: ReviewReport;
   summary?: string;
+  evidence?: CriterionEvidence[];
   lastMessage?: string;
   verification?: Verification;
 }
@@ -433,12 +445,18 @@ function analystTools(brief: StepBrief, outcome: AgentOutcome) {
 function implementerTools(outcome: AgentOutcome) {
   return [
     defineTool("submit_result", {
-      description: "Report that the sub-task is finished, with a short summary of the changes and how you verified them.",
-      parameters: z.object({ summary: z.string().min(1).describe("What changed and how it was verified") }),
+      description: "Report that the sub-task is finished: a short summary of the changes and how you verified them, and your evidence for each acceptance criterion.",
+      parameters: z.object({
+        summary: z.string().min(1).describe("What changed and how it was verified"),
+        evidence: z.array(CriterionEvidence).max(20).optional().describe("One entry per acceptance criterion of the sub-task: what shows that it is met"),
+      }),
       skipPermission: true,
       isTerminal: true,
-      handler: async ({ summary }: { summary: string }) => {
+      handler: async ({ summary, evidence }: { summary: string; evidence?: CriterionEvidence[] }) => {
         outcome.summary = summary;
+        // Evidence is a claim shown to the reviewer's reader and the requester; a malformed list is dropped, not fatal.
+        const parsed = z.array(CriterionEvidence).max(20).safeParse(evidence ?? []);
+        outcome.evidence = parsed.success ? parsed.data : [];
         return "Result recorded.";
       },
     }),
@@ -796,8 +814,9 @@ async function main(): Promise<StepResult> {
   if (brief.kind === "design") return runDesignSession(brief);
 
   if (brief.kind === "review") {
-    // The reviewer sees the change as a diff from the base commit of the default branch, in a checkout it cannot hand back.
-    const base = primary.entry.baseCommit ?? primary.entry.commit;
+    // The reviewer sees the sub-task's own change: the diff from the commit it started from (the approved change it
+    // is stacked on, or the default branch), in a checkout it cannot hand back.
+    const base = primary.entry.changeBase ?? primary.entry.baseCommit ?? primary.entry.commit;
     const files = await git(["diff", "--stat", `${base}..HEAD`], primary.dir).catch(() => "");
     const outcome = await runAgent(brief, reviewer, primary.dir, { prompt: reviewPrompt(brief, { base, files }) });
     if (!outcome.review) return { status: "failed", summary: "The reviewer did not submit a review", error: outcome.lastMessage?.slice(0, 500) };
@@ -841,7 +860,7 @@ async function main(): Promise<StepResult> {
   await git(["add", "-A"], repo);
   const dirty = (await git(["status", "--porcelain"], repo)).trim().length > 0;
   if (dirty) {
-    const subject = brief.round > 0 ? `Fix review findings (round ${brief.round}): ${sub.title}` : sub.title;
+    const subject = brief.round > 0 ? `${brief.findings.length ? "Fix review findings" : "Changes requested"} (round ${brief.round}): ${sub.title}` : sub.title;
     const message = `${subject.slice(0, 200)}\n\n${summary}\n\nAgent-Run: ${brief.runId}\nRequested-By: ${brief.workItem.requester.login}`;
     await git(["commit", "--quiet", "--no-verify", "-m", message], repo);
   }
@@ -858,7 +877,7 @@ async function main(): Promise<StepResult> {
     } as RequestInit);
     if (!upload.ok) throw new Error(`Uploading the result bundle failed: ${upload.status}`);
   }
-  return { status: "succeeded", summary: commits ? summary : `No changes were needed. ${summary}`, commits, verification: outcome.verification };
+  return { status: "succeeded", summary: commits ? summary : `No changes were needed. ${summary}`, commits, verification: outcome.verification, evidence: outcome.evidence };
 }
 
 const heartbeat = setInterval(() => {

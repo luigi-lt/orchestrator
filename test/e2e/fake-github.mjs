@@ -124,8 +124,9 @@ const server = http.createServer(async (req, res) => {
         const [o, r] = (url.searchParams.get("repo") ?? REPOS[0]).split("/");
         const branch = url.searchParams.get("name");
         const bare = join(GIT_ROOT, `${o}/${r}.git`);
-        // Against the pull request's base as it was when the branch was made (main may have moved on by a merge).
-        const base = git(["merge-base", "main", branch], bare).trim();
+        // Against the pull request's base as it was when the branch was made (main may have moved on by a merge);
+        // `base` names another branch for a stacked pull request.
+        const base = git(["merge-base", url.searchParams.get("base") ?? "main", branch], bare).trim();
         const range = base === git(["rev-parse", branch], bare).trim() ? `${branch}~1..${branch}` : `${base}..${branch}`;
         const log = git(["log", "--format=%H %an <%ae> %s%n%b", range], bare);
         const files = git(["diff", "--name-only", range], bare);
@@ -217,6 +218,18 @@ const server = http.createServer(async (req, res) => {
     if (kind === "pulls" && n && m === "GET") {
       const pr = state.pulls.find((x) => x.repo === `${o}/${r}` && x.number === Number(n));
       return pr ? send(res, 200, pr) : send(res, 404, { message: "no pr" });
+    }
+    // Retargeting: only an open pull request can move to another base branch, as on GitHub.
+    if (kind === "pulls" && n && m === "PATCH") {
+      const pr = state.pulls.find((x) => x.repo === `${o}/${r}` && x.number === Number(n));
+      if (!pr) return send(res, 404, { message: "no pr" });
+      const b = await readBody(req);
+      if (b.base) {
+        if (pr.state !== "open") return send(res, 422, { message: "Cannot change the base branch of a closed pull request." });
+        pr.base = b.base;
+        pr.retargeted = (pr.retargeted ?? 0) + 1;
+      }
+      return send(res, 200, pr);
     }
     return send(res, 404, { message: `not implemented: ${m} ${url.pathname}` });
   } catch (err) {

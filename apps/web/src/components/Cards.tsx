@@ -29,12 +29,22 @@ export function OrchestratorCardView({ card }: { card: OrchestratorCard }) {
       return <FindingsCard card={card} />;
     case "limits":
       return <LimitsCard card={card} />;
+    case "change":
+      return <ChangeCard card={card} />;
+    case "dependents":
+      return <DependentsCard card={card} />;
     case "story":
       return <StoryCard card={card} />;
     case "pull_request":
       return <PullRequestCard card={card} />;
     case "notice":
       return <div className={`card notice ${card.level}`}>{card.text}</div>;
+    default: {
+      // A card type without a view fails the build here; anything that is not an orchestrator card draws nothing.
+      const unknown: never = card;
+      void unknown;
+      return null;
+    }
   }
 }
 
@@ -166,7 +176,7 @@ function ListBlock({ title, items }: { title: string; items: string[] }) {
   );
 }
 
-const ICON = { pending: "○", running: "◐", done: "●", failed: "✕" } as const;
+const ICON = { pending: "○", running: "◐", done: "●", failed: "✕", skipped: "–" } as const;
 
 function ProgressCard({ card }: { card: CardOf<"progress"> }) {
   return (
@@ -627,33 +637,228 @@ function LimitsCard({ card }: { card: CardOf<"limits"> }) {
   );
 }
 
-/** The sub-tasks of a guided run; each has its own conversation. */
-function StoryCard({ card }: { card: CardOf<"story"> }) {
+const CHANGE_DECISION = { approved: "approved", changes: "changes requested", dropped: "dropped" } as const;
+
+/**
+ * The requester's check of a sub-task's change before its pull request opens. Everything on the card comes from the
+ * orchestrator's records: the implementer's summary and evidence are claims, the reviewer's judgment is an agent's,
+ * the files and the checks were computed by the orchestrator. The code itself is read in the pull request.
+ */
+function ChangeCard({ card }: { card: CardOf<"change"> }) {
+  const { busy, error, run } = useDecision();
+  const [feedback, setFeedback] = useState("");
+  const pending = card.status === "pending";
+  const decide = (decision: "approve" | "changes" | "drop") =>
+    run(() => post(`/api/approvals/${card.approvalId}/change`, { decision, hash: card.hash, feedback: decision === "changes" ? feedback : undefined }));
+  const added = card.files.reduce((n, f) => n + (f.added ?? 0), 0);
+  const removed = card.files.reduce((n, f) => n + (f.removed ?? 0), 0);
   return (
-    <div className="card">
+    <div className={`card change ${pending ? "needs-action" : ""}`}>
       <div className="card-head">
-        <span className="kicker">Sub-tasks · each has its own conversation</span>
+        <span className="kicker">
+          Check of the change{card.round > 0 ? ` · after your request for changes (${card.round})` : ""}
+          {pending ? " · your decision is needed" : ""}
+        </span>
+        <StatusBadge status={card.status === "pending" || card.status === "expired" ? card.status : CHANGE_DECISION[card.status]} />
+      </div>
+      <p className="muted small">
+        Nothing is pushed yet. Your approval opens the pull request with exactly this commit: <code>{card.hash.slice(0, 10)}</code> on <code>{card.branch}</code> in {card.repository}.
+      </p>
+      <div className="section-label">What the implementer agent says it did</div>
+      <p>{card.summary}</p>
+      {card.buildsOn.length > 0 && <p className="muted small">Builds on the approved change of: {card.buildsOn.join("; ")}</p>}
+      <div className="section-label">Acceptance criteria</div>
+      {card.criteria.length === 0 && <p className="muted small">The sub-task has no acceptance criteria.</p>}
+      <ul className="criteria-evidence">
+        {card.criteria.map((c, i) => (
+          <li key={i} className={c.met === false ? "unmet" : c.met ? "met" : ""}>
+            <div>
+              <span className="mark" aria-hidden>
+                {c.met === null ? "?" : c.met ? "✓" : "✕"}
+              </span>
+              <strong>{c.criterion}</strong>
+            </div>
+            <div className="small">
+              <span className="muted">Implementer's evidence: </span>
+              {c.evidence ?? <em className="muted">none given</em>}
+            </div>
+            <div className="small">
+              <span className="muted">Reviewer agent: </span>
+              {c.met === null ? <em className="muted">not judged</em> : c.met ? "met" : "not met"}
+              {c.note ? ` — ${c.note}` : ""}
+            </div>
+          </li>
+        ))}
+      </ul>
+      <div className="section-label">
+        Files changed: {card.files.length} <span className="lines added">+{added}</span> <span className="lines removed">−{removed}</span>
+      </div>
+      <ul className="changed-files">
+        {card.files.map((f) => (
+          <li key={f.path}>
+            <code>{f.path}</code>
+            {f.added === null ? <span className="muted small">binary</span> : (
+              <span className="small">
+                <span className="lines added">+{f.added}</span> <span className="lines removed">−{f.removed}</span>
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p className="muted small">The code itself is not shown here. You read it in the pull request, which opens when you approve.</p>
+      <Checks verification={card.verification} />
+      <div className="section-label">AI review</div>
+      <p>{card.review.summary}</p>
+      <p className="muted small">
+        {card.review.rounds} review round(s), {card.review.fixRounds} fix round(s) · {card.review.resolved} finding(s) fixed ·{" "}
+        {card.review.blocking ? <strong className="error">{card.review.blocking} blocking or major finding(s) still open</strong> : "no blocking or major finding open"}
+        {card.review.minor ? ` · ${card.review.minor} minor note(s)` : ""}. The review card above has the details.
+      </p>
+      {card.status === "changes" && card.feedback && <blockquote className="answer">You asked: {card.feedback}</blockquote>}
+      {pending && (
+        <div className="actions column">
+          <div className="actions">
+            <button className="primary" disabled={busy} onClick={() => void decide("approve")}>
+              Approve and open the pull request
+            </button>
+            <button className="danger ghost" disabled={busy} onClick={() => void decide("drop")} title="Close this sub-task as not done; nothing is pushed">
+              Drop the sub-task
+            </button>
+          </div>
+          <textarea value={feedback} onChange={(e) => setFeedback(e.target.value)} rows={3} placeholder="Or say what should change; the implementer does another round and the change is reviewed again" />
+          <button disabled={busy || !feedback.trim()} onClick={() => void decide("changes")}>
+            Request changes
+          </button>
+        </div>
+      )}
+      {error && <p className="error small">{error}</p>}
+    </div>
+  );
+}
+
+const NOT_DELIVERED = { dropped: "was dropped", closed: "had its pull request closed without merging", handed_over: "was taken over by you" } as const;
+const DEPENDENTS_DECISION = { drop: "dropped too", build: "built without it", cancel: "run cancelled" } as const;
+
+/** A sub-task was not delivered and sub-tasks that have not started depend on it. */
+function DependentsCard({ card }: { card: CardOf<"dependents"> }) {
+  const { busy, error, run } = useDecision();
+  const pending = card.status === "pending";
+  const decide = (decision: "drop" | "build" | "cancel") => run(() => post(`/api/approvals/${card.approvalId}/dependents`, { decision, hash: card.hash }));
+  const how = NOT_DELIVERED[card.subtask.state as keyof typeof NOT_DELIVERED] ?? "was not delivered";
+  return (
+    <div className={`card ${pending ? "needs-action" : ""}`}>
+      <div className="card-head">
+        <span className="kicker">Sub-tasks that depend on one that was not delivered{pending ? " · your decision is needed" : ""}</span>
+        <StatusBadge status={card.status === "pending" || card.status === "expired" ? card.status : DEPENDENTS_DECISION[card.status]} />
+      </div>
+      <p>
+        <strong>{card.subtask.title}</strong> {how}. These sub-tasks build on it and have not started:
+      </p>
+      <ul>
+        {card.dependents.map((d) => (
+          <li key={d.key}>{d.title}</li>
+        ))}
+      </ul>
+      {pending && (
+        <div className="actions">
+          <button className="primary" disabled={busy} onClick={() => void decide("drop")} title="Close them as not done">
+            Drop them too
+          </button>
+          <button disabled={busy} onClick={() => void decide("build")} title="They are built without the change they depended on">
+            Build them anyway
+          </button>
+          <button className="danger ghost" disabled={busy} onClick={() => void decide("cancel")}>
+            Cancel the run
+          </button>
+        </div>
+      )}
+      {error && <p className="error small">{error}</p>}
+    </div>
+  );
+}
+
+/** What a sub-task state means for the requester, in the words of the story view (FR-R7). */
+export const SUBTASK_STATE_LABEL: Record<string, string> = {
+  planned: "planned",
+  implementing: "in progress",
+  reviewing: "AI review",
+  awaiting_decision: "awaiting your decision",
+  awaiting_check: "awaiting your check",
+  publishing: "publishing",
+  pr_open: "pull request open",
+  merged: "merged",
+  closed: "pull request closed",
+  handed_over: "taken over",
+  dropped: "dropped",
+  cancelled: "cancelled",
+  failed: "failed",
+};
+
+/** The story view: every sub-task of the plan, grouped by product, in build order, with its state, links and merge order. */
+function StoryCard({ card }: { card: CardOf<"story"> }) {
+  const groups = [...new Set(card.subtasks.map((st) => st.product ?? ""))];
+  const numberOf = (key: string) => (card.subtasks.find((st) => st.key === key)?.index ?? -1) + 1;
+  const done = card.subtasks.filter((st) => st.state === "merged").length;
+  const dropped = card.subtasks.filter((st) => st.state === "dropped").length;
+  return (
+    <div className="card story-card">
+      <div className="card-head">
+        <span className="kicker">
+          Story ·{" "}
+          {dropped === card.subtasks.length
+            ? `all ${dropped} sub-task(s) dropped`
+            : `${done} of ${card.subtasks.length - dropped} sub-task(s) merged${dropped ? ` · ${dropped} dropped` : ""}`}
+        </span>
         <Link className="small" to={`/ops/runs/${card.runId}`}>
           Run details
         </Link>
       </div>
-      <ol className="story">
-        {card.subtasks.map((st) => (
-          <li key={st.key}>
-            <span className={`badge ${st.state}`}>{st.state.replace(/_/g, " ")}</span>{" "}
-            {st.conversationId ? <Link to={`/chat/${st.conversationId}`}>{st.title}</Link> : st.title}
-            {st.prUrl && (
-              <>
-                {" · "}
-                <a href={st.prUrl} target="_blank" rel="noreferrer">
-                  pull request #{st.prNumber}
-                </a>
-              </>
-            )}
-          </li>
-        ))}
-      </ol>
-      <p className="muted small">A sub-task starts once the pull request of the one before it is merged.</p>
+      {groups.map((product) => (
+        <div key={product} className="plan-product">
+          {groups.length > 1 && <div className="plan-product-name">{card.products[product] ?? (product || "Other")}</div>}
+          <ol className="story">
+            {card.subtasks
+              .filter((st) => (st.product ?? "") === product)
+              .map((st) => (
+                <li key={st.key} value={st.index + 1}>
+                  <div>
+                    <span className={`badge ${st.state}`}>{SUBTASK_STATE_LABEL[st.state] ?? st.state.replace(/_/g, " ")}</span>{" "}
+                    {st.conversationId ? <Link to={`/chat/${st.conversationId}`}>{st.title}</Link> : st.title}
+                  </div>
+                  <div className="muted small story-meta">
+                    {st.repository}
+                    {st.dependsOn.length > 0 && ` · merge after ${st.dependsOn.map(numberOf).filter(Boolean).join(", ")}`}
+                    {st.stackedOn && st.state !== "merged" && ` · its branch builds on ${numberOf(st.stackedOn)}`}
+                    {st.prUrl && (
+                      <>
+                        {" · "}
+                        <a href={st.prUrl} target="_blank" rel="noreferrer">
+                          pull request #{st.prNumber}
+                        </a>
+                      </>
+                    )}
+                    {st.ticketUrl && (
+                      <>
+                        {" · "}
+                        <a href={st.ticketUrl} target="_blank" rel="noreferrer">
+                          sub-issue #{st.ticketNumber}
+                        </a>
+                      </>
+                    )}
+                  </div>
+                  {st.warnings.map((w) => (
+                    <div key={w} className="story-warning small">
+                      ⚠ {w}
+                    </div>
+                  ))}
+                </li>
+              ))}
+          </ol>
+        </div>
+      ))}
+      <p className="muted small">
+        Sub-tasks are built one at a time. Each starts when the one before it passed your check and its pull request is open. The story is complete when every pull request is merged.
+      </p>
     </div>
   );
 }

@@ -58,6 +58,15 @@ const handoff: HandoffPlan = {
   ],
 };
 const handoffChanged: HandoffPlan = { ...handoff, constraints: [...handoff.constraints, "Numbers only"] };
+/** Two sub-tasks in the same repository, the second building on the first, and a third that needs neither. */
+const handoffStacked: HandoffPlan = {
+  ...handoff,
+  contracts: [],
+  subtasks: [
+    { key: "api", title: "Add subtract function", description: "d1", acceptanceCriteria: ["works"], product: "calc", repository: "acme/demo", likelyFiles: [], dependsOn: [], size: "S" },
+    { key: "docs", title: "Document subtract", description: "d2", acceptanceCriteria: ["documented"], product: "calc", repository: "acme/demo", likelyFiles: [], dependsOn: ["api"], size: "S" },
+  ],
+};
 
 const clean: ReviewReport = { verdict: "approve", summary: "Looks right", criteria: [{ criterion: "works", met: true }], findings: [], earlier: [] };
 const major: ReviewReport = {
@@ -83,7 +92,19 @@ interface Scenario {
   limits?: string[];
   risk?: boolean;
   implementFails?: boolean;
-  prStates?: ("open" | "merged" | "closed")[];
+  /** The sub-task whose implementation fails. */
+  failSubtask?: string;
+  /** The plan the architect drafts (the plan across two products by default). */
+  plan?: HandoffPlan;
+  /** The state a pull request is in when it is polled, until the test changes it with pr(). Merged by default. */
+  prInitial?: "open" | "merged" | "closed";
+  /**
+   * The requester's decisions at the check of a change, per sub-task and in order; approve by default.
+   * "manual" leaves the decisions to the test.
+   */
+  changeDecisions?: Record<string, ("approve" | "changes" | "drop")[]> | "manual";
+  /** What bringing a branch up to date with the default branch does. */
+  branchUpdate?: "up_to_date" | "merged" | "conflict";
   /** Silence after which the design session's workspace is saved and shut down. */
   designIdleSeconds?: number;
   /** How many times the session workspace is lost while a turn runs. */
@@ -94,9 +115,9 @@ interface Scenario {
  * The architect, as the tests play it: the opening turn drafts the plan; a message with "change" submits a
  * changed plan; a message with "approval" puts the plan up for approval; anything else is only answered.
  */
-function architectReply(turn: DesignTurnInput): Partial<DesignTurnResult> {
+function architectReply(turn: DesignTurnInput, plan: HandoffPlan): Partial<DesignTurnResult> {
   const text = turn.messages.join(" ");
-  if (turn.opening) return { text: "Here is a first draft.", plan: handoff };
+  if (turn.opening) return { text: "Here is a first draft.", plan };
   if (/change/.test(text)) return { text: "Changed.", plan: handoffChanged };
   if (/approval/.test(text)) return { text: "Use the Approve button.", proposed: true };
   return { text: "Answered." };
@@ -120,9 +141,15 @@ function mockActivities(s: Scenario) {
   const reviewState = new Map<string, SubtaskReview>();
   let analysisIndex = 0;
   let reviewIndex = 0;
-  let prIndex = 0;
   let prNumber = 6;
   let decisions = 0;
+  let commits = 0;
+  // Pull requests keep their own state: several are open at once on the guided track.
+  const prStates = new Map<number, "open" | "merged" | "closed">();
+  const pr = (number: number, state: "open" | "merged" | "closed") => void prStates.set(number, state);
+  // The requester's decisions at the check of a change; the run scenario says how they reach the sub-task's workflow.
+  const hooks: { decide?: (subtaskKey: string, approvalId: string, decision: string, feedback?: string) => Promise<void> } = {};
+  const checks = new Map<string, number>();
   // Design session
   let workspaceUp = false;
   let workspaces = 0;
@@ -157,6 +184,21 @@ function mockActivities(s: Scenario) {
     requestRiskApproval: async (a: unknown) => (record("requestRiskApproval", a), { approvalId: "apr_risk", hash: "h" }),
     requestFindingsDecision: async (a: unknown) => (record("requestFindingsDecision", a), { approvalId: `apr_findings_${++decisions}`, hash: "h" }),
     requestLimitsDecision: async (a: unknown) => (record("requestLimitsDecision", a), { approvalId: "apr_limits", hash: "h" }),
+    requestChangeCheck: async (a: { key: string; commit: string }) => {
+      const n = (checks.get(a.key) ?? 0) + 1;
+      checks.set(a.key, n);
+      const approvalId = `apr_change_${a.key}_${n}`;
+      if (s.changeDecisions !== "manual") {
+        const decision = s.changeDecisions?.[a.key]?.[n - 1] ?? "approve";
+        await hooks.decide?.(a.key, approvalId, decision, decision === "changes" ? "Handle zero as well" : undefined);
+      }
+      record("requestChangeCheck", a);
+      return { approvalId, hash: a.commit };
+    },
+    requestDependentsDecision: async (a: unknown) => (record("requestDependentsDecision", a), { approvalId: `apr_dependents_${++decisions}`, hash: "h" }),
+    planSubtasks: async (a: unknown) => record("planSubtasks", a),
+    dropSubtasks: async (a: unknown) => record("dropSubtasks", a),
+    addStoryWarning: async (a: unknown) => record("addStoryWarning", a),
     initSubtask: async (a: { key: string; ownConversation: boolean }) => (record("initSubtask", a), { conversationId: a.ownConversation ? `conv_${a.key}` : "conv_run" }),
     patchSubtask: async (a: unknown) => record("patchSubtask", a),
     // The real review logic: what must be fixed follows from the severities, across rounds.
@@ -185,7 +227,7 @@ function mockActivities(s: Scenario) {
         workspaceUp = false;
         throw ApplicationFailure.nonRetryable("The design session workspace was lost", "WorkspaceLost");
       }
-      return { turnId: a.turn.turnId, status: "succeeded", text: "", components: [], proposed: false, session: "continued", ...architectReply(a.turn) };
+      return { turnId: a.turn.turnId, status: "succeeded", text: "", components: [], proposed: false, session: "continued", ...architectReply(a.turn, s.plan ?? handoff) };
     },
     suspendDesignWorkspace: async (a: unknown) => {
       record("suspendDesignWorkspace", a);
@@ -240,16 +282,18 @@ function mockActivities(s: Scenario) {
     finalizeIssue: async (a: unknown) => record("finalizeIssue", a),
     pushBranch: async (a: unknown) => record("pushBranch", a),
     openPullRequest: async (a: unknown) => (record("openPullRequest", a), { number: ++prNumber, url: `https://example/pr/${prNumber}`, title: "[agent] x" }),
-    getPullRequestState: async (a: unknown) => (record("getPullRequestState", a), s.prStates?.[Math.min(prIndex++, (s.prStates?.length ?? 1) - 1)] ?? "merged"),
+    getPullRequestState: async (a: { number: number }) => (record("getPullRequestState", a), prStates.get(a.number) ?? s.prInitial ?? "merged"),
+    retargetPullRequest: async (a: unknown) => (record("retargetPullRequest", a), true),
+    updateBranchFromDefault: async (a: unknown) => (record("updateBranchFromDefault", a), { status: s.branchUpdate ?? "merged", headCommit: "head-updated" }),
     discoverAndStart: async () => 0,
     prepareSubtaskRepo: async (a: unknown) => (record("prepareSubtaskRepo", a), { baseCommit: "base000" }),
     prepareStep: async (a: unknown) => record("prepareStep", a),
     awaitStep: async ({ stepId }: { stepId: string }): Promise<StepResult> => {
-      const kind = (calls.filter((c) => c.name === "prepareStep").pop()?.args as { kind: string }).kind;
+      const { kind, subtaskKey } = calls.filter((c) => c.name === "prepareStep").pop()?.args as { kind: string; subtaskKey?: string };
       record("awaitStep", { stepId });
       if (kind === "analyse") return analysisResults[Math.min(analysisIndex++, analysisResults.length - 1)]!;
       if (kind === "review") return { status: "succeeded", summary: "review", review: reviews[Math.min(reviewIndex++, reviews.length - 1)]! };
-      if (s.implementFails) return { status: "failed", summary: "The workspace failed", error: "model error" };
+      if (s.implementFails || (s.failSubtask && s.failSubtask === subtaskKey)) return { status: "failed", summary: "The workspace failed", error: "model error" };
       return {
         status: "succeeded",
         summary: "Added subtract.js",
@@ -258,11 +302,12 @@ function mockActivities(s: Scenario) {
       };
     },
     applyStepResult: async (a: unknown) => (record("applyStepResult", a), { commits: 1 }),
-    squashSubtask: async (a: unknown) => (record("squashSubtask", a), { headCommit: "head111" }),
+    squashSubtask: async (a: unknown) => (record("squashSubtask", a), { headCommit: `head${++commits}` }),
     inspectChanges: async (a: { checkLimits: boolean }) => (
       record("inspectChanges", a),
       {
         changedFiles: ["subtract.js", ...(s.risk ? [".github/workflows/ci.yml"] : [])],
+        files: [{ path: "subtract.js", added: 3, removed: 0 }],
         secrets: [],
         risk: s.risk ? { reasons: ["Changes CI/CD configuration"], files: [".github/workflows/ci.yml"] } : { reasons: [], files: [] },
         limits: a.checkLimits ? (s.limits ?? []) : [],
@@ -272,7 +317,7 @@ function mockActivities(s: Scenario) {
     destroyWorkspace: async (a: unknown) => record("destroyWorkspace", a),
   };
   const of = <T>(name: string) => calls.filter((c) => c.name === name).map((c) => c.args as T);
-  return { activities, calls, reached, of };
+  return { activities, calls, reached, of, pr, hooks };
 }
 
 type Mock = ReturnType<typeof mockActivities>;
@@ -286,6 +331,8 @@ type StepPrep = {
   findings?: TrackedFinding[];
   guidance?: string;
   questionRounds?: { answer: string }[];
+  changeBase?: string;
+  references?: { key: string; branch: string; headCommit: string; prNumber: number }[];
 };
 const kinds = (m: Mock) => m.of<StepPrep>("prepareStep").map((p) => p.kind);
 const events = (m: Mock) => m.of<{ type: string }>("recordEvent").map((e) => e.type);
@@ -351,6 +398,7 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
         const handle = await env.client.workflow.start("deliveryRunWorkflow", { taskQueue: "orchestration", workflowId: `wf-${runId}`, args: [input] });
         const design = () => env.client.workflow.getHandle(`design:${runId}`);
         let said = 0;
+        m.hooks.decide = (key, approvalId, decision, feedback) => env.client.workflow.getHandle(`subtask:${runId}:${key}`).signal("approval", { approvalId, decision, feedback });
         await drive(
           {
             signal: (name, arg) => handle.signal(name, arg),
@@ -572,7 +620,7 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
   // --- Guided track: the design session, the plan, sub-tasks across products ------------------
 
   it("guided track: the architect opens the session, the requester approves a plan version, and each sub-task is built in its repository in dependency order", async () => {
-    const { state, m } = await runScenario({ track: "guided", repositories: ["acme/demo", "acme/web"] }, async (h, mock) => {
+    const { state, m } = await runScenario({ track: "guided", repositories: ["acme/demo", "acme/web"], prInitial: "open" }, async (h, mock) => {
       // The session opens by itself, with a first draft; nothing is built before the approval.
       await mock.reached("recordDesignTurn");
       expect(mock.of<{ turn: DesignTurnInput }>("awaitDesignTurn")[0]!.turn).toMatchObject({ opening: true, messages: [] });
@@ -580,7 +628,13 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
       await h.say("Put it up for approval");
       await proposed;
       expect(mock.of("initSubtask")).toHaveLength(0);
+      const bothOpen = mock.reached("openPullRequest", 2);
       await h.approvePlan("apr_plan_1");
+      // The second sub-task is built while the pull request of the first one is still open (AD-41).
+      await bothOpen;
+      expect(mock.of<{ patch: { state?: string } }>("patchSubtask").some((p) => p.patch.state === "merged")).toBe(false);
+      mock.pr(7, "merged");
+      mock.pr(8, "merged");
     });
     expect(state).toBe("completed");
     expect(kinds(m)).toEqual(["analyse", "implement", "review", "implement", "review"]);
@@ -589,34 +643,171 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     expect(m.of<{ session?: boolean }>("createWorkspace").filter((w) => w.session)).toHaveLength(1);
     expect(m.of("closeDesignSession")).toHaveLength(1);
     expect(m.of<{ version: number }>("finalizePlan")[0]!.version).toBe(1);
-    // The plan is mirrored on the ticket before anything is built; each sub-task gets its sub-issue.
-    const order = m.calls.map((c) => c.name).filter((n) => n === "mirrorPlanOnTicket" || n === "initSubtask");
-    expect(order).toEqual(["mirrorPlanOnTicket", "initSubtask", "initSubtask"]);
-    // The library first, although the plan lists the page first: the page depends on it.
-    const subtasks = m.of<{ key: string; ownConversation: boolean; branch: string; repo: { name: string }; ticket?: { number: number } }>("initSubtask");
-    expect(subtasks.map((i) => [i.key, i.repo.name, i.branch, i.ticket?.number, i.ownConversation])).toEqual([
-      ["lib", "demo", "agent/1-add-subtract-abc123-lib", 40, true],
-      ["page", "web", "agent/1-add-subtract-abc123-page", 41, true],
+    // The plan is mirrored on the ticket and every sub-task is recorded as planned before anything is built.
+    const order = m.calls.map((c) => c.name).filter((n) => n === "mirrorPlanOnTicket" || n === "planSubtasks" || n === "initSubtask");
+    expect(order).toEqual(["mirrorPlanOnTicket", "planSubtasks", "initSubtask", "initSubtask"]);
+    expect(m.of<{ items: { key: string; dependsOn: string[]; ticket?: { number: number } }[] }>("planSubtasks")[0]!.items.map((i) => [i.key, i.dependsOn.join(), i.ticket?.number])).toEqual([
+      ["lib", "", 40],
+      ["page", "lib", 41],
     ]);
-    // The second sub-task starts only after the pull request of the first one is merged.
-    const sequence = m.calls.map((c) => c.name).filter((n) => n === "prepareSubtaskRepo" || n === "getPullRequestState");
-    expect(sequence).toEqual(["prepareSubtaskRepo", "getPullRequestState", "prepareSubtaskRepo", "getPullRequestState"]);
-    const prs = m.of<{ repo: { name: string }; title: string; body: string }>("openPullRequest");
-    expect(prs.map((p) => p.repo.name)).toEqual(["demo", "web"]);
+    // The library first, although the plan lists the page first: the page depends on it.
+    const subtasks = m.of<{ key: string; ownConversation: boolean; branch: string; repo: { name: string }; ticket?: { number: number }; stackedOn?: string }>("initSubtask");
+    expect(subtasks.map((i) => [i.key, i.repo.name, i.branch, i.ticket?.number, i.ownConversation, i.stackedOn])).toEqual([
+      ["lib", "demo", "agent/1-add-subtract-abc123-lib", 40, true, undefined],
+      ["page", "web", "agent/1-add-subtract-abc123-page", 41, true, undefined],
+    ]);
+    // The requester checked each change before its pull request opened; the approval is bound to the commit.
+    const checksAsked = m.of<{ key: string; commit: string; round: number; files: { path: string }[] }>("requestChangeCheck");
+    expect(checksAsked.map((c) => [c.key, c.commit, c.round])).toEqual([
+      ["lib", "head1", 0],
+      ["page", "head2", 0],
+    ]);
+    const published = m.calls.map((c) => c.name).filter((n) => n === "requestChangeCheck" || n === "pushBranch" || n === "openPullRequest");
+    expect(published).toEqual(["requestChangeCheck", "pushBranch", "openPullRequest", "requestChangeCheck", "pushBranch", "openPullRequest"]);
+    // Across repositories the page starts from its own default branch and can read the library's approved change.
+    expect(m.of<{ stackedOn?: unknown }>("prepareSubtaskRepo").map((p) => p.stackedOn)).toEqual([undefined, undefined]);
+    const pageSteps = m.of<StepPrep>("prepareStep").filter((p) => p.subtaskKey === "page");
+    expect(pageSteps[0]!.references).toEqual([expect.objectContaining({ key: "lib", branch: "agent/1-add-subtract-abc123-lib", headCommit: "head1", prNumber: 7 })]);
+    expect(pageSteps[0]!.plan!.subtasks[1]!.description).toContain('"Add subtract function" (in acme/demo) is approved but not merged yet: its change is checked out read-only');
+    const prs = m.of<{ repo: { name: string }; title: string; body: string; base: string }>("openPullRequest");
+    expect(prs.map((p) => [p.repo.name, p.base])).toEqual([
+      ["demo", "main"],
+      ["web", "main"],
+    ]);
     expect(prs[0]!.title).toContain("(1/2): Add subtract function");
     expect(prs[0]!.body).toContain("Part of #1");
     expect(prs[0]!.body).toContain("Closes #40");
-    expect(prs[0]!.body).not.toContain("Closes #1\n");
-    expect(prs[1]!.body).toContain("Closes acme/demo#1");
+    expect(prs[0]!.body).not.toContain("Merge order");
+    // No pull request closes the story: the run closes it when the last one is merged, whichever that is.
+    expect(prs[1]!.body).toContain("Part of acme/demo#1");
     expect(prs[1]!.body).toContain("Closes #41");
+    expect(prs[1]!.body).toContain("- Merge after acme/demo#7 (Add subtract function).");
+    expect(prs[1]!.body).toContain("@tester checked this change in the orchestrator before it was opened.");
+    expect(m.of<{ outcome: string; close?: boolean }>("finalizeIssue")[0]).toMatchObject({ outcome: "completed", close: true });
     // What the implementers build from carries the plan's constraints and the contract between the products.
     const implement = m.of<StepPrep>("prepareStep").find((p) => p.kind === "implement")!;
     expect(implement.plan!.summary).toContain("Do not change add()");
     expect(implement.plan!.summary).toContain("subtract(a, b): Returns a - b for numbers (provided by: Add subtract function; used by: Use subtract on the page)");
     expect(implement.plan!.subtasks.map((st) => st.title)).toEqual(["Add subtract function", "Use subtract on the page"]);
-    expect(m.of<{ number: number }>("closeSubIssue").map((c) => c.number)).toEqual([40, 41]);
-    expect(events(m)).toEqual(expect.arrayContaining(["design.opened", "plan.version_created", "plan.proposed", "design.closed", "plan.approved", "ticket.subtasks_created"]));
+    expect(m.of<{ number: number }>("closeSubIssue").map((c) => c.number).sort()).toEqual([40, 41]);
+    expect(m.of("addStoryWarning")).toHaveLength(0);
+    expect(events(m)).toEqual(
+      expect.arrayContaining(["design.opened", "plan.version_created", "plan.proposed", "design.closed", "plan.approved", "ticket.subtasks_created", "change.check_requested", "change.decided"]),
+    );
     expect(finalNotice(m)).toBe("All 2 sub-tasks are merged. Done.");
+  });
+
+  it("guided track: in one repository the next sub-task is stacked on the approved change, and its pull request moves to the default branch when the first one merges", async () => {
+    const { state, m } = await runScenario({ track: "guided", plan: handoffStacked, prInitial: "open" }, async (h, mock) => {
+      await designAndApprove(h, mock);
+      await mock.reached("openPullRequest", 2);
+      const moved = mock.reached("retargetPullRequest");
+      mock.pr(7, "merged");
+      await moved;
+      mock.pr(8, "merged");
+    });
+    expect(state).toBe("completed");
+    // The second branch starts from the approved commit of the first, on its pushed branch.
+    expect(m.of<{ subtaskKey: string; stackedOn?: { branch: string; commit: string } }>("prepareSubtaskRepo").map((p) => [p.subtaskKey, p.stackedOn])).toEqual([
+      ["api", undefined],
+      ["docs", { branch: "agent/1-add-subtract-abc123-api", commit: "head1" }],
+    ]);
+    expect(m.of<{ key: string; stackedOn?: string }>("initSubtask")[1]).toMatchObject({ key: "docs", stackedOn: "api" });
+    // Its reviewer sees only its own change, and no other repository is needed.
+    const docs = m.of<StepPrep>("prepareStep").filter((p) => p.subtaskKey === "docs");
+    expect(docs.map((p) => p.references)).toEqual([[], []]);
+    expect(docs[0]!.plan!.subtasks[1]!.description).toContain('"Add subtract function" is approved but not merged yet: your branch starts from its change.');
+    // The pull request targets the branch below while that one is open.
+    const prs = m.of<{ base: string; body: string }>("openPullRequest");
+    expect(prs.map((p) => p.base)).toEqual(["main", "agent/1-add-subtract-abc123-api"]);
+    expect(prs[1]!.body).toContain("- Merge after #7 (Add subtract function).");
+    expect(prs[1]!.body).toContain("builds on #7 and targets its branch `agent/1-add-subtract-abc123-api`");
+    // When the first pull request merged, the second moved to the default branch and was brought up to date.
+    expect(m.of<{ number: number; base: string }>("retargetPullRequest")).toEqual([expect.objectContaining({ number: 8, base: "main" })]);
+    expect(m.of<{ subtaskKey: string }>("updateBranchFromDefault").map((u) => u.subtaskKey)).toEqual(["docs"]);
+    expect(m.of<{ subtaskKey: string }>("pushBranch").map((p) => p.subtaskKey)).toEqual(["api", "docs", "docs"]);
+    expect(events(m)).toContain("scm.pr_retargeted");
+    expect(m.of("addStoryWarning")).toHaveLength(0);
+  });
+
+  it("guided track: the requester asks for changes at the check; the implementer does another round and the new commit is checked again", async () => {
+    const { state, m } = await runScenario({ track: "guided", changeDecisions: { lib: ["changes", "approve"] } }, designAndApprove);
+    expect(state).toBe("completed");
+    const lib = m.of<StepPrep>("prepareStep").filter((p) => p.subtaskKey === "lib");
+    expect(lib.map((p) => [p.kind, p.round])).toEqual([
+      ["implement", 0],
+      ["review", 0],
+      ["implement", 1],
+      ["review", 1],
+    ]);
+    // The requester's words reach the implementer; there are no reviewer findings to fix.
+    expect(lib[2]).toMatchObject({ guidance: "Handle zero as well", findings: [] });
+    expect(lib.every((p) => p.changeBase === "base000")).toBe(true);
+    // Two checks, each on its own commit; only the approved one is pushed.
+    expect(m.of<{ key: string; commit: string; round: number }>("requestChangeCheck").filter((c) => c.key === "lib").map((c) => [c.commit, c.round])).toEqual([
+      ["head1", 0],
+      ["head2", 1],
+    ]);
+    const firstPush = m.calls.findIndex((c) => c.name === "pushBranch");
+    expect(m.calls.slice(0, firstPush).filter((c) => c.name === "requestChangeCheck")).toHaveLength(2);
+    expect(events(m).filter((e) => e === "change.decided")).toHaveLength(3);
+  });
+
+  it("guided track: a dropped sub-task pushes nothing; the requester drops the sub-tasks that depend on it too", async () => {
+    const { state, m } = await runScenario({ track: "guided", changeDecisions: { lib: ["drop"] } }, async (h, mock) => {
+      const asked = mock.reached("requestDependentsDecision");
+      await designAndApprove(h, mock);
+      await asked;
+      expect(mock.of<{ subtask: { key: string; state: string }; dependents: { key: string }[] }>("requestDependentsDecision")[0]).toMatchObject({
+        subtask: { key: "lib", state: "dropped" },
+        dependents: [{ key: "page" }],
+      });
+      await h.signal("approval", { approvalId: "apr_dependents_1", decision: "drop" });
+    });
+    expect(state).toBe("closed");
+    expect(m.of("pushBranch")).toHaveLength(0);
+    expect(m.of("initSubtask")).toHaveLength(1);
+    expect(m.of<{ keys: string[] }>("dropSubtasks")[0]!.keys).toEqual(["page"]);
+    // Both sub-issues are closed as not planned, and the ticket says that the sub-task was dropped.
+    expect(m.of<{ number: number; dropped?: boolean }>("closeSubIssue")).toEqual([expect.objectContaining({ number: 40, dropped: true }), expect.objectContaining({ number: 41, dropped: true })]);
+    expect(m.of<{ key: string }>("commentOnIssue").some((c) => /:dropped:lib$/.test(c.key))).toBe(true);
+    expect(m.of<{ patch: { state?: string } }>("patchSubtask").some((p) => p.patch.state === "dropped")).toBe(true);
+    expect(finalNotice(m)).toBe("Every sub-task was dropped; nothing was built.");
+  });
+
+  it("guided track: sub-tasks that depend on a dropped one are built without it when the requester says so, and the story completes", async () => {
+    const { state, m } = await runScenario({ track: "guided", changeDecisions: { lib: ["drop"] } }, async (h, mock) => {
+      const asked = mock.reached("requestDependentsDecision");
+      await designAndApprove(h, mock);
+      await asked;
+      await h.signal("approval", { approvalId: "apr_dependents_1", decision: "build" });
+    });
+    expect(state).toBe("completed");
+    expect(m.of("dropSubtasks")).toHaveLength(0);
+    const page = m.of<StepPrep>("prepareStep").find((p) => p.subtaskKey === "page")!;
+    expect(page.references).toEqual([]);
+    expect(page.plan!.subtasks[1]!.description).toContain('"Add subtract function" (in acme/demo) was not delivered: its change is not available, build without it.');
+    expect(m.of<{ repo: { name: string }; body: string }>("openPullRequest").map((p) => p.repo.name)).toEqual(["web"]);
+    expect(m.of<{ body: string }>("openPullRequest")[0]!.body).not.toContain("Merge order");
+    expect(finalNotice(m)).toBe("1 sub-task(s) merged, 1 dropped. Done.");
+    expect(m.of<{ close?: boolean }>("finalizeIssue")[0]!.close).toBe(true);
+  });
+
+  it("guided track: a pull request merged before the one it depends on is flagged on the story and on the ticket", async () => {
+    const { state, m } = await runScenario({ track: "guided", prInitial: "open" }, async (h, mock) => {
+      await designAndApprove(h, mock);
+      await mock.reached("openPullRequest", 2);
+      const flagged = mock.reached("addStoryWarning");
+      mock.pr(8, "merged");
+      await flagged;
+      mock.pr(7, "merged");
+    });
+    expect(state).toBe("completed");
+    const warning = m.of<{ key: string; text: string }>("addStoryWarning")[0]!;
+    expect(warning.key).toBe("page");
+    expect(warning.text).toBe("Pull request #8 (Use subtract on the page) was merged before acme/demo#7 (Add subtract function), which it depends on.");
+    expect(m.of<{ key: string; body: string }>("commentOnIssue").find((c) => /:order:page$/.test(c.key))?.body).toContain("Merge order");
+    expect(events(m)).toContain("story.merged_out_of_order");
   });
 
   it("guided track: a newer plan version voids the approval asked for the older one", async () => {
@@ -683,12 +874,31 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     expect(m.of<{ turn: DesignTurnInput }>("recordDesignTurn").filter((r) => r.turn.opening)).toHaveLength(1);
   });
 
-  it("guided track: stops when a sub-task's pull request is closed, without starting the next one", async () => {
-    const { state, m } = await runScenario({ track: "guided", prStates: ["closed"] }, designAndApprove);
+  it("guided track: a pull request closed without merging does not stop the other sub-tasks; the run ends as closed", async () => {
+    const { state, m } = await runScenario({ track: "guided", prInitial: "open" }, async (h, mock) => {
+      await designAndApprove(h, mock);
+      await mock.reached("openPullRequest", 2);
+      mock.pr(7, "closed");
+      mock.pr(8, "merged");
+    });
     expect(state).toBe("closed");
-    expect(m.of("initSubtask")).toHaveLength(1);
-    expect(m.of("closeSubIssue")).toHaveLength(0);
-    expect(finalNotice(m)).toMatch(/Sub-task 1: Pull request closed without merging\. The remaining 1 sub-task\(s\) were not started\./);
+    expect(m.of("initSubtask")).toHaveLength(2);
+    expect(m.of<{ number: number }>("closeSubIssue").map((c) => c.number)).toEqual([41]);
+    expect(finalNotice(m)).toBe("1 of 2 sub-tasks merged. Not delivered: 1. Add subtract function: Pull request closed without merging.");
+    expect(m.of<{ outcome: string; close?: boolean }>("finalizeIssue")[0]).toMatchObject({ outcome: "closed", close: false });
+  });
+
+  it("guided track: a failed sub-task fails the run and ends the sub-tasks whose pull requests were still waiting", async () => {
+    const { state, m } = await runScenario({ track: "guided", prInitial: "open", failSubtask: "page" }, async (h, mock) => {
+      await designAndApprove(h, mock);
+      await mock.reached("openPullRequest");
+    });
+    // The first pull request is open; the implementation of the second sub-task then fails.
+    expect(state).toBe("failed");
+    expect(finalNotice(m)).toMatch(/Sub-task 2 failed/);
+    const states = m.of<{ key: string; patch: { state?: string } }>("patchSubtask");
+    expect(states.some((p) => p.key === "lib" && p.patch.state === "cancelled")).toBe(true);
+    expect(states.some((p) => p.key === "page" && p.patch.state === "failed")).toBe(true);
   });
 
   // --- Cancelling --------------------------------------------------------------------
@@ -704,6 +914,24 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     expect(m.of("mirrorPlanOnTicket")).toHaveLength(0);
     expect(m.of("createWorkspace")).toHaveLength(m.of("destroyWorkspace").length);
     expect(m.of<{ outcome: string }>("finalizeIssue")[0]!.outcome).toBe("cancelled");
+  });
+
+  it("cancels the run while one pull request waits for its merge and the next change waits for the requester's check", async () => {
+    const { state, m } = await runScenario({ track: "guided", prInitial: "open", changeDecisions: "manual" }, async (h, mock) => {
+      const first = mock.reached("requestChangeCheck");
+      await designAndApprove(h, mock);
+      await first;
+      const second = mock.reached("requestChangeCheck");
+      await h.signalSubtask("lib", "approval", { approvalId: "apr_change_lib_1", decision: "approve" });
+      await second;
+      await h.signal("cancel", { reason: "test" });
+    });
+    expect(state).toBe("cancelled");
+    expect(m.of("openPullRequest")).toHaveLength(1);
+    const states = m.of<{ key: string; patch: { state?: string } }>("patchSubtask");
+    expect(["lib", "page"].every((k) => states.some((p) => p.key === k && p.patch.state === "cancelled"))).toBe(true);
+    expect(m.of<{ outcome: string }>("finalizeIssue")[0]!.outcome).toBe("cancelled");
+    expect(m.of("createWorkspace")).toHaveLength(m.of("destroyWorkspace").length);
   });
 
   it("cancels the run and its sub-task while the sub-task waits for a decision", async () => {

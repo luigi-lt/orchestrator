@@ -249,9 +249,24 @@ table.tickets .badge.pending { margin-left: 8px; }
 
 /* Increment 2: sub-tasks, AI review, decisions */
 .badge.reviewing, .badge.implementing, .badge.pr_open { background: var(--accent-soft); color: var(--accent); }
-.badge.awaiting_decision, .badge.planned { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
+.badge.awaiting_decision, .badge.awaiting_check, .badge.planned { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }
 .badge.planned { background: var(--surface-2); color: var(--muted); }
-.badge.handed_over, .badge.closed { background: var(--surface-2); color: var(--muted); }
+.badge.handed_over, .badge.closed, .badge.dropped { background: var(--surface-2); color: var(--muted); }
+ol.story { padding-left: 1.7em !important; }
+ol.story > li { list-style: decimal outside; }
+.story-meta { margin-top: 2px; }
+.story-warning { margin-top: 4px; color: var(--warning); }
+.criteria-evidence, .changed-files { list-style: none; padding-left: 0 !important; }
+.criteria-evidence li { padding: 6px 0; border-top: 1px solid var(--border); }
+.criteria-evidence li:first-child { border-top: 0; }
+.criteria-evidence .mark { display: inline-block; width: 1.3em; color: var(--muted); }
+.criteria-evidence li.met .mark { color: var(--success); }
+.criteria-evidence li.unmet .mark { color: var(--danger); }
+.changed-files li { display: flex; justify-content: space-between; gap: 12px; padding: 2px 0; }
+.changed-files code { overflow-wrap: anywhere; }
+.lines.added { color: var(--success); }
+.lines.removed { color: var(--danger); }
+.progress-steps li.skipped { color: var(--muted); text-decoration: line-through; }
 .badge.severity.blocking { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 .badge.severity.major { background: color-mix(in srgb, var(--warning) 18%, transparent); color: var(--warning); }
 .badge.severity.minor { background: var(--surface-2); color: var(--muted); }

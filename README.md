@@ -22,7 +22,7 @@ Requires Docker, a GitHub fine-grained token and an Anthropic API key — detail
 open http://localhost:3000
 ```
 
-Label an issue `ai-ready` in a repository of your product catalog, or ask in the chat: "work on owner/repo#12". An analyst agent studies it and the orchestrator picks the fast or the guided track. On the fast track a reviewed pull request opens with no stops. On the guided track you shape the plan with an architect agent in the conversation and approve it before anything is built, also across several repositories.
+Label an issue `ai-ready` in a repository of your product catalog, or ask in the chat: "work on owner/repo#12". An analyst agent studies it and the orchestrator picks the fast or the guided track. On the fast track a reviewed pull request opens with no stops. On the guided track you shape the plan with an architect agent in the conversation and approve it before anything is built, also across several repositories; you then check each sub-task's change before its pull request opens, and a story view shows where everything stands.
 
 ## Repository layout
 

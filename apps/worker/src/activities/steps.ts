@@ -14,6 +14,8 @@ import {
   type Analysis,
   type BriefRepository,
   type Catalog,
+  type ChangedFile,
+  type DependencyRef,
   type DesignTurnInput,
   type DesignTurnResult,
   type Plan,
@@ -45,18 +47,41 @@ import {
   type StepRecord,
 } from "@orch/store";
 import { ctx, runCatalog } from "../context.js";
-import { bundleReadOnly, ensureWorkRepo, git, stepArtifactsDir, workRepoDir } from "../git.js";
+import { bundleReadOnly, ensureWorkRepo, git, mergeDefaultBranch, stepArtifactsDir, workRepoDir } from "../git.js";
 
-/** Clones the repository a sub-task changes and creates its branch; returns the commit the sub-task starts from. */
+/**
+ * Clones the repository a sub-task changes and creates its branch; returns the commit the sub-task's own change
+ * starts from: the head of the default branch, or the approved commit of the sub-task it is stacked on (AD-41).
+ */
 export async function prepareSubtaskRepo(input: {
   runId: string;
   subtaskKey: string;
   repo: RepoRef;
   defaultBranch: string;
   branch: string;
+  stackedOn?: { branch: string; commit: string };
 }): Promise<{ baseCommit: string }> {
-  const { baseCommit } = await ensureWorkRepo(input.runId, input.subtaskKey, input.repo, input.defaultBranch, input.branch);
-  return { baseCommit };
+  try {
+    const { baseCommit } = await ensureWorkRepo(input.runId, input.subtaskKey, input.repo, input.defaultBranch, input.branch, input.stackedOn);
+    return { baseCommit };
+  } catch (err) {
+    if (input.stackedOn && /is-ancestor|merge-base/.test(errorMessage(err))) {
+      throw ApplicationFailure.nonRetryable(`The approved change this sub-task builds on is no longer on the branch ${input.stackedOn.branch}`);
+    }
+    throw err;
+  }
+}
+
+/** Merges the default branch into a sub-task's branch, once the pull request it was stacked on has merged (AD-41). */
+export async function updateBranchFromDefault(input: {
+  runId: string;
+  subtaskKey: string;
+  repo: RepoRef;
+  defaultBranch: string;
+  branch: string;
+  commitAuthor: { name: string; email: string };
+}): Promise<{ status: "up_to_date" | "merged" | "conflict"; headCommit: string }> {
+  return mergeDefaultBranch(input.runId, input.subtaskKey, input.repo, input.defaultBranch, input.branch, input.commitAuthor);
 }
 
 export interface PrepareStepInput {
@@ -84,6 +109,10 @@ export interface PrepareStepInput {
   feedback?: string;
   plan?: Plan;
   subtaskIndex?: number;
+  /** The commit the sub-task's own change starts from; the reviewer's diff starts there. */
+  changeBase?: string;
+  /** Approved changes in other repositories that this sub-task builds on: checked out read-only (AD-41). */
+  references?: DependencyRef[];
 }
 
 const bundleName = (index: number) => `repo-${index}.bundle`;
@@ -145,10 +174,34 @@ export async function prepareStep(input: PrepareStepInput): Promise<void> {
       branch: input.branch,
       commit,
       baseCommit,
+      changeBase: input.changeBase ?? baseCommit,
       mode: input.kind === "implement" ? "writable" : "readonly",
       path: workspaceRepoPath(primaryEntry.product, input.primaryRepo),
       primary: true,
     });
+    for (const ref of input.references ?? []) {
+      if (repositories.length >= config.maxStepRepositories()) break;
+      const entry = findCatalogRepository(catalog, repoSlug(ref.repo));
+      if (!entry || repoSlug(ref.repo).toLowerCase() === primarySlug.toLowerCase()) continue;
+      const target = join(dir, bundleName(repositories.length));
+      // The approved commit on its pushed branch; once that branch is merged and gone, the default branch holds the change.
+      const bundled = await bundleReadOnly(ref.repo, ref.branch, target, ref.headCommit).then(
+        (b) => ({ ...b, note: `The approved change of the sub-task "${ref.title}" (pull request #${ref.prNumber}, not merged yet). Read it; you cannot change it.` }),
+        async () => ({ ...(await bundleReadOnly(ref.repo, await defaultBranchOf(ref.repo), target)), note: `Holds the merged change of the sub-task "${ref.title}". Read it; you cannot change it.` }),
+      );
+      repositories.push({
+        index: repositories.length,
+        product: entry.product,
+        repo: ref.repo,
+        role: entry.role,
+        branch: bundled.ref,
+        commit: bundled.commit,
+        mode: "readonly",
+        path: workspaceRepoPath(entry.product, ref.repo),
+        primary: false,
+        note: bundled.note,
+      });
+    }
   } else {
     repositories.push(await readOnlyRepository(input.stepId, catalog, primarySlug, 0, true));
     if (input.kind === "analyse") {
@@ -453,6 +506,8 @@ export async function squashSubtask(input: {
 
 export interface ChangeInspection {
   changedFiles: string[];
+  /** The same files with their line counts, for the requester's check of the change. */
+  files: ChangedFile[];
   secrets: SecretFinding[];
   risk: RiskAssessment;
   /** Why the change is beyond the fast track; empty when it is within the limits or the limits were not asked for. */
@@ -472,10 +527,17 @@ export async function inspectChanges(input: {
   const range = `${input.baseCommit}..${input.branch}`;
   const names = (await git(["diff", "--name-only", range], { cwd })).split("\n").filter(Boolean);
   const diff = await git(["diff", "--unified=0", range], { cwd });
+  const count = (text: string) => (text === "-" ? null : Number.parseInt(text, 10) || 0);
+  const files: ChangedFile[] = (await git(["diff", "--numstat", "--no-renames", range], { cwd }))
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => line.split("\t"))
+    .map(([added, removed, ...path]) => ({ path: path.join("\t"), added: count(added ?? "0"), removed: count(removed ?? "0") }));
   // The product's own high-risk paths add to the baseline rules; they can never relax them (D15).
   const entry = findCatalogRepository(await runCatalog(input.runId), repoSlug(input.repo));
   return {
     changedFiles: names,
+    files,
     secrets: scanDiffForSecrets(diff),
     risk: classifyRisk(names, entry?.highRiskPaths ?? []),
     // The analysis was an estimate; the fast track is checked again on what was really changed (FR-A2).

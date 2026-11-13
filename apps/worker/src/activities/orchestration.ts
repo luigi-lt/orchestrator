@@ -12,6 +12,8 @@ import {
   repoSlug,
   sanitizeAgentComponents,
   type Analysis,
+  type ChangedFile,
+  type CriterionEvidence,
   type DesignTurnInput,
   type DesignTurnResult,
   type HandoffPlan,
@@ -21,6 +23,7 @@ import {
   type ReviewReport,
   type RunState,
   type SubtaskReview,
+  type SubtaskState,
   type TrackDecision,
   type TrackedFinding,
   type Verification,
@@ -28,6 +31,7 @@ import {
 } from "@orch/contracts";
 import {
   addPlanVersion,
+  addSubtaskWarning,
   appendRunEvent,
   createApproval,
   createConversation,
@@ -192,7 +196,7 @@ export async function updateProgress(input: {
   subtaskKey?: string;
   state: RunState;
   headline: string;
-  steps: { title: string; status: "pending" | "running" | "done" | "failed" }[];
+  steps: { title: string; status: "pending" | "running" | "done" | "failed" | "skipped" }[];
 }): Promise<void> {
   const cardKey = input.subtaskKey ? key(input.runId, "st", input.subtaskKey, "progress") : key(input.runId, "progress");
   await upsertCard(ctx().db, input.conversationId, cardKey, {
@@ -369,26 +373,80 @@ export async function requestRiskApproval(input: {
 // Sub-tasks: their own conversation, review and decisions (FR-B1, FR-C2, FR-R1, FR-R2)
 // ---------------------------------------------------------------------------
 
-/** The sub-tasks of a guided run with their state, in the run's conversation (first form of the story view). */
+/** The key of the single change of the fast track; a plan cannot use it for a sub-task. */
+const FAST_TRACK_KEY = "change";
+
+/**
+ * The story view in the run's conversation (FR-R7): every sub-task of the approved plan in build order,
+ * with its product, state, links, what it builds on and its warnings.
+ */
 async function refreshStory(db: Db, runId: string): Promise<void> {
   const run = await getRun(db, runId);
   if (!run?.conversationId) return;
-  const subtasks = (await listSubtasks(db, runId)).filter((st) => st.conversationId);
+  const subtasks = (await listSubtasks(db, runId)).filter((st) => st.key !== FAST_TRACK_KEY);
   if (!subtasks.length) return;
+  const catalog = await runCatalog(runId);
   await upsertCard(db, run.conversationId, key(runId, "story"), {
     type: "story",
     runId,
+    products: Object.fromEntries(catalog.products.map((p) => [p.id, p.name])),
     subtasks: subtasks.map((st) => ({
       key: st.key,
       index: st.index,
       title: st.title,
       state: st.state,
+      product: st.product,
       repository: st.repository,
       conversationId: st.conversationId,
       prNumber: st.prNumber,
       prUrl: st.prUrl,
+      ticketNumber: st.ticketNumber,
+      ticketUrl: st.ticketUrl,
+      dependsOn: st.dependsOn,
+      stackedOn: st.stackedOn,
+      warnings: st.warnings,
     })),
   });
+}
+
+/** Records every sub-task of the approved plan as planned, in build order, and shows the story view. */
+export async function planSubtasks(input: {
+  runId: string;
+  items: { key: string; title: string; description: string; acceptanceCriteria: string[]; repository: string; dependsOn: string[]; ticket?: { number: number; url: string } }[];
+}): Promise<void> {
+  const { db } = ctx();
+  const catalog = await runCatalog(input.runId);
+  for (const [index, item] of input.items.entries()) {
+    await insertSubtask(db, {
+      runId: input.runId,
+      key: item.key,
+      index,
+      title: item.title,
+      description: item.description,
+      acceptanceCriteria: item.acceptanceCriteria,
+      state: "planned",
+      product: findCatalogRepository(catalog, item.repository)?.product ?? null,
+      repository: item.repository,
+      dependsOn: item.dependsOn,
+      ticketNumber: item.ticket?.number ?? null,
+      ticketUrl: item.ticket?.url ?? null,
+    });
+  }
+  await refreshStory(db, input.runId);
+}
+
+/** Closes sub-tasks that never started as not done: the requester dropped them with one they depend on (FR-R4). */
+export async function dropSubtasks(input: { runId: string; keys: string[] }): Promise<void> {
+  const { db } = ctx();
+  for (const subtaskKey of input.keys) await updateSubtask(db, input.runId, subtaskKey, { state: "dropped" });
+  await refreshStory(db, input.runId);
+}
+
+/** A warning on a sub-task in the story view, e.g. a pull request merged before one it depends on (FR-M5). */
+export async function addStoryWarning(input: { runId: string; key: string; text: string }): Promise<void> {
+  const { db } = ctx();
+  await addSubtaskWarning(db, input.runId, input.key, input.text);
+  await refreshStory(db, input.runId);
 }
 
 /**
@@ -409,6 +467,8 @@ export async function initSubtask(input: {
   runConversationId: string;
   /** The sub-issue that mirrors the sub-task on the ticket, when the plan was mirrored (FR-P5). */
   ticket?: { number: number; url: string };
+  /** The sub-task whose approved change this one's branch is stacked on (AD-41). */
+  stackedOn?: string;
 }): Promise<{ conversationId: string }> {
   const { db } = ctx();
   const slug = repoSlug(input.repo);
@@ -425,7 +485,13 @@ export async function initSubtask(input: {
     repository: slug,
     branch: input.branch,
   });
-  if (input.ticket) await updateSubtask(db, input.runId, input.key, { ticketNumber: input.ticket.number, ticketUrl: input.ticket.url });
+  // A sub-task of an approved plan is already recorded as planned; what is known only now is added.
+  await updateSubtask(db, input.runId, input.key, {
+    branch: input.branch,
+    description: input.description,
+    stackedOn: input.stackedOn,
+    ...(input.ticket ? { ticketNumber: input.ticket.number, ticketUrl: input.ticket.url } : {}),
+  });
   if (!input.ownConversation) return { conversationId: input.runConversationId };
   let conversationId = (await getSubtask(db, input.runId, input.key))?.conversationId ?? null;
   if (!conversationId) {
@@ -567,6 +633,108 @@ export async function requestLimitsDecision(input: {
   return { approvalId, hash };
 }
 
+/**
+ * The requester's check of a change before its pull request opens (FR-R4). The decision is bound to the
+ * commit (AD-40). The card describes the change: what the implementer says, the evidence per acceptance
+ * criterion with the reviewer's judgment, the files with their line counts, the checks and the review.
+ */
+export async function requestChangeCheck(input: {
+  runId: string;
+  key: string;
+  conversationId: string;
+  commit: string;
+  repository: string;
+  branch: string;
+  /** How many times the requester asked for changes before this check. */
+  round: number;
+  summary: string;
+  acceptanceCriteria: string[];
+  evidence: CriterionEvidence[];
+  files: ChangedFile[];
+  verification: Verification | null;
+  review: SubtaskReview;
+  fixRounds: number;
+  buildsOn: string[];
+}): Promise<{ approvalId: string; hash: string }> {
+  const { db } = ctx();
+  const approvalId = newId("apr");
+  const same = (a: string, b: string) => a.trim().toLowerCase() === b.trim().toLowerCase();
+  const byPosition = <T>(list: T[], i: number) => (list.length === input.acceptanceCriteria.length ? list[i] : undefined);
+  const criteria = input.acceptanceCriteria.map((criterion, i) => {
+    const claimed = input.evidence.find((e) => same(e.criterion, criterion)) ?? byPosition(input.evidence, i);
+    const judged = input.review.criteria.find((c) => same(c.criterion, criterion)) ?? byPosition(input.review.criteria, i);
+    return { criterion, evidence: claimed?.evidence ?? null, met: judged?.met ?? null, note: judged?.note ?? null };
+  });
+  await updateSubtask(db, input.runId, input.key, { evidence: input.evidence, changedFiles: input.files, checkRounds: input.round });
+  await createApproval(db, {
+    id: approvalId,
+    runId: input.runId,
+    kind: "change",
+    payload: { commit: input.commit, files: input.files.map((f) => f.path), round: input.round },
+    hash: input.commit,
+    workflowId: callingWorkflow(),
+    conversationId: input.conversationId,
+    subtaskKey: input.key,
+  });
+  await upsertCard(db, input.conversationId, key(input.runId, "change", approvalId), {
+    type: "change",
+    runId: input.runId,
+    subtaskKey: input.key,
+    approvalId,
+    hash: input.commit,
+    repository: input.repository,
+    branch: input.branch,
+    round: input.round,
+    summary: input.summary,
+    criteria,
+    files: input.files,
+    verification: input.verification,
+    review: {
+      summary: input.review.summary,
+      rounds: input.review.rounds,
+      fixRounds: input.fixRounds,
+      blocking: input.review.open.filter((f) => f.severity !== "minor").length,
+      minor: input.review.open.filter((f) => f.severity === "minor").length,
+      resolved: input.review.resolved.length,
+    },
+    buildsOn: input.buildsOn,
+    status: "pending",
+  });
+  await refreshStory(db, input.runId);
+  return { approvalId, hash: input.commit };
+}
+
+/** A sub-task was not delivered and others that have not started depend on it: the requester decides (FR-R4). */
+export async function requestDependentsDecision(input: {
+  runId: string;
+  conversationId: string;
+  subtask: { key: string; title: string; state: SubtaskState };
+  dependents: { key: string; title: string }[];
+}): Promise<{ approvalId: string; hash: string }> {
+  const { db } = ctx();
+  const approvalId = newId("apr");
+  const hash = hashOf({ runId: input.runId, subtask: input.subtask.key, dependents: input.dependents.map((d) => d.key) });
+  await createApproval(db, {
+    id: approvalId,
+    runId: input.runId,
+    kind: "dependents",
+    payload: { subtask: input.subtask.key, dependents: input.dependents.map((d) => d.key) },
+    hash,
+    workflowId: callingWorkflow(),
+    conversationId: input.conversationId,
+  });
+  await upsertCard(db, input.conversationId, key(input.runId, "dependents", approvalId), {
+    type: "dependents",
+    runId: input.runId,
+    approvalId,
+    hash,
+    subtask: input.subtask,
+    dependents: input.dependents,
+    status: "pending",
+  });
+  return { approvalId, hash };
+}
+
 export async function postPullRequestCard(input: {
   runId: string;
   conversationId: string;
@@ -602,7 +770,7 @@ export async function postNotice(input: {
   });
 }
 
-const DECISION_CARDS = new Set(["plan", "questions", "risk", "findings", "limits"]);
+const DECISION_CARDS = new Set(["plan", "questions", "risk", "findings", "limits", "change", "dependents"]);
 
 /**
  * Expires the pending decisions of a run (or of one sub-task) and marks their cards as expired,

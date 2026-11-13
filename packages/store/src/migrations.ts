@@ -235,4 +235,17 @@ create index design_turns_run_idx on design_turns (run_id, seq);
 alter table subtasks add column ticket_number int, add column ticket_url text;
 `,
   },
+  {
+    // Iteration 2, increment 4: the requester's check of a change, dependencies between sub-tasks, the story view.
+    version: 5,
+    sql: `
+alter table subtasks
+  add column depends_on jsonb not null default '[]',
+  add column stacked_on text,
+  add column evidence jsonb,
+  add column changed_files jsonb,
+  add column check_rounds int not null default 0,
+  add column warnings jsonb not null default '[]';
+`,
+  },
 ];

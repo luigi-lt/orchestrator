@@ -146,8 +146,13 @@ function implement(tools, messages) {
   if (!dir) return [{ type: "text", text: "No writable repository in the prompt." }];
   const file = /\[file:([\w.-]+)\]/.exec(first)?.[1] ?? "subtract.js";
   const fixing = /## Findings to fix/.test(first);
+  // The requester asked for changes at the check of the change; their words are in the prompt.
+  const requested = /## Changes requested by the requester\n[^\n]*\n([^\n]+)/.exec(first)?.[1];
   const repairing = /command failed on your change/.test(last);
-  const big = /\[big\]/.test(first) && !fixing && !repairing;
+  const big = /\[big\]/.test(first) && !fixing && !repairing && !requested;
+  // Each run writes its own content, so a file an earlier run already merged is still a change.
+  const ticket = /^# Work item #(\d+):/m.exec(first)?.[1] ?? "0";
+  const criteria = (/\nAcceptance criteria:\n((?:- .*\n?)+)/.exec(first)?.[1] ?? "").split("\n").filter((l) => l.startsWith("- ")).map((l) => l.slice(2).trim());
   const writes = since.length;
 
   // The shell can replace a file that already exists (a repair or a fix round); the create tool cannot.
@@ -166,13 +171,14 @@ function implement(tools, messages) {
 
   if (big && writes < 6) return write(`extra${writes + 1}.js`, `export const extra${writes + 1} = ${writes + 1};\n`);
   if (writes >= (big ? 7 : 1)) {
-    const summary = repairing ? `Repaired ${file} so the test command passes.` : fixing ? `Fixed the review findings in ${file}.` : `Added ${file}.`;
-    return [{ type: "tool_use", id: id("toolu"), name: "submit_result", input: { summary } }];
+    const summary = repairing ? `Repaired ${file} so the test command passes.` : fixing ? `Fixed the review findings in ${file}.` : requested ? `Changed ${file} as requested.` : `Added ${file}.`;
+    const evidence = criteria.filter((c) => c !== "(none given)").map((criterion) => ({ criterion, evidence: `See ${file}; the product's commands passed.` }));
+    return [{ type: "tool_use", id: id("toolu"), name: "submit_result", input: { summary, evidence } }];
   }
   if (file === "subtract.js") {
     return write(file, fixing ? SUBTRACT_CHECKED : /\[broken\]/.test(first) && !repairing ? SUBTRACT_WRONG : SUBTRACT);
   }
-  return write(file, `// ${file}${fixing ? ` (fixed ${Date.now()})` : ""}\nexport const marker = "${file}";\n`);
+  return write(file, `// ${file}${fixing ? ` (fixed ${Date.now()})` : ""}${requested ? ` (requested: ${requested.slice(0, 60)})` : ""}\nexport const marker = "${file}@${ticket}";\n`);
 }
 
 /**

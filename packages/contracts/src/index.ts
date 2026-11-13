@@ -435,17 +435,46 @@ export const SubtaskState = z.enum([
   "implementing",
   "reviewing",
   "awaiting_decision",
+  /** Guided track: the requester checks the change before its pull request opens (FR-R4). */
+  "awaiting_check",
   "publishing",
   "pr_open",
   "merged",
   "closed",
   "handed_over",
+  /** Closed as not done by the requester, at the check of its change or together with a sub-task it depends on. */
+  "dropped",
   "cancelled",
   "failed",
 ]);
 export type SubtaskState = z.infer<typeof SubtaskState>;
 
-export const FINAL_SUBTASK_STATES: readonly SubtaskState[] = ["merged", "closed", "handed_over", "cancelled", "failed"];
+export const FINAL_SUBTASK_STATES: readonly SubtaskState[] = ["merged", "closed", "handed_over", "dropped", "cancelled", "failed"];
+
+/** A file of a change with its line counts; null counts for a binary file. */
+export const ChangedFile = z.object({ path: z.string(), added: z.number().int().nullable(), removed: z.number().int().nullable() });
+export type ChangedFile = z.infer<typeof ChangedFile>;
+
+/** What the implementer says proves an acceptance criterion: a claim, checked by the reviewer and shown to the requester. */
+export const CriterionEvidence = z.object({
+  criterion: z.string().min(1).max(1000).describe("The acceptance criterion, in the words of the sub-task"),
+  evidence: z.string().min(1).max(2000).describe("What shows it is met: the test that covers it, the command you ran and its result, or where in the code"),
+});
+export type CriterionEvidence = z.infer<typeof CriterionEvidence>;
+
+/**
+ * A sub-task another one depends on, once its change passed the requester's check and its pull request is open (AD-41).
+ * In the same repository the dependent work is stacked on its branch; in another repository its change is readable.
+ */
+export interface DependencyRef {
+  key: string;
+  title: string;
+  repo: RepoRef;
+  branch: string;
+  headCommit: string;
+  prNumber: number;
+  prUrl: string;
+}
 
 // ---------------------------------------------------------------------------
 // Design session (FR-P1, AD-34, AD-35): turns of the architect agent in a session workspace
@@ -506,6 +535,10 @@ export const BriefRepository = z.object({
   commit: z.string(),
   /** Commit of the default branch the work starts from; guidance files are read there, never from the change itself. */
   baseCommit: z.string().optional(),
+  /** The commit the sub-task's own change starts from: the approved change it is stacked on, or the same as baseCommit. */
+  changeBase: z.string().optional(),
+  /** Why the repository is here, for the agent: e.g. the approved change of a sub-task this one builds on. */
+  note: z.string().optional(),
   mode: z.enum(["writable", "readonly"]),
   /** Checkout directory relative to the workspace root, e.g. repos/shop/acme__web. */
   path: z.string(),
@@ -540,7 +573,7 @@ export const StepBrief = z.object({
   commands: RepositoryCommands.default({}),
   /** Implementation: the findings to fix. Review: the earlier findings to check again. */
   findings: z.array(TrackedFinding).default([]),
-  /** The requester's guidance for a fix round. */
+  /** The requester's guidance for a fix round, or the changes the requester asked for at the check of the change. */
   guidance: z.string().optional(),
   /** Review: what the implementer said it did (a claim to verify) and what the product's commands reported. */
   implementerSummary: z.string().optional(),
@@ -558,6 +591,8 @@ export const StepResult = z.object({
   analysis: Analysis.optional(),
   review: ReviewReport.optional(),
   verification: Verification.optional(),
+  /** Implementation: the implementer's evidence for each acceptance criterion. */
+  evidence: z.array(CriterionEvidence).max(20).optional(),
   commits: z.number().int().nonnegative().optional(),
   error: z.string().optional(),
 });
@@ -617,7 +652,7 @@ export const AgentComponent = z.discriminatedUnion("type", [TextComponent, Table
 export type AgentComponent = z.infer<typeof AgentComponent>;
 
 // Orchestrator cards: system-only components, rendered from orchestrator data.
-export const ProgressStep = z.object({ title: z.string(), status: z.enum(["pending", "running", "done", "failed"]) });
+export const ProgressStep = z.object({ title: z.string(), status: z.enum(["pending", "running", "done", "failed", "skipped"]) });
 export const WorkItemCard = z.object({
   type: z.literal("work_item"),
   runId: z.string(),
@@ -748,20 +783,69 @@ export const LimitsCard = z.object({
   files: z.array(z.string()),
   status: z.enum(["pending", "continue", "guided", "cancel", "expired"]),
 });
-/** The sub-tasks of a guided run, each with its state and its own conversation (first form of the story view, FR-R7). */
+/**
+ * The requester's check of a sub-task's change before its pull request opens (FR-R4). The approval is bound to
+ * the commit (AD-40). The card describes the change; it does not show the code (a viewer for that is a later stage).
+ */
+export const ChangeCard = z.object({
+  type: z.literal("change"),
+  runId: z.string(),
+  subtaskKey: z.string(),
+  approvalId: z.string(),
+  /** The commit the decision is about. */
+  hash: z.string(),
+  repository: z.string(),
+  branch: z.string(),
+  /** How many times the requester asked for changes before this check. */
+  round: z.number().int().nonnegative(),
+  summary: z.string(),
+  /** Each acceptance criterion with the implementer's evidence and the reviewer agent's judgment. */
+  criteria: z.array(z.object({ criterion: z.string(), evidence: z.string().nullable(), met: z.boolean().nullable(), note: z.string().nullable() })),
+  files: z.array(ChangedFile),
+  verification: Verification.nullable(),
+  review: z.object({ summary: z.string(), rounds: z.number().int(), fixRounds: z.number().int(), blocking: z.number().int(), minor: z.number().int(), resolved: z.number().int() }),
+  /** Titles of the sub-tasks whose approved change this one builds on. */
+  buildsOn: z.array(z.string()),
+  status: z.enum(["pending", "approved", "changes", "dropped", "expired"]),
+  feedback: z.string().optional(),
+});
+/** A sub-task was not delivered and others that have not started depend on it: the requester decides (FR-R4). */
+export const DependentsCard = z.object({
+  type: z.literal("dependents"),
+  runId: z.string(),
+  approvalId: z.string(),
+  hash: z.string(),
+  /** The sub-task that was not delivered, and how it ended. */
+  subtask: z.object({ key: z.string(), title: z.string(), state: SubtaskState }),
+  dependents: z.array(z.object({ key: z.string(), title: z.string() })),
+  status: z.enum(["pending", "drop", "build", "cancel", "expired"]),
+});
+/**
+ * The story view (FR-R7): every sub-task of the approved plan in build order, with its product, state, links,
+ * what it builds on, and warnings such as a pull request merged before one it depends on (FR-M5).
+ */
 export const StoryCard = z.object({
   type: z.literal("story"),
   runId: z.string(),
+  /** Product names, for grouping. */
+  products: z.record(z.string(), z.string()).default({}),
   subtasks: z.array(
     z.object({
       key: z.string(),
       index: z.number().int(),
       title: z.string(),
       state: SubtaskState,
+      product: z.string().nullable().default(null),
       repository: z.string().nullable(),
       conversationId: z.string().nullable(),
       prNumber: z.number().nullable(),
       prUrl: z.string().nullable(),
+      ticketNumber: z.number().nullable().default(null),
+      ticketUrl: z.string().nullable().default(null),
+      /** Keys of the sub-tasks it depends on, and the one its branch is stacked on. */
+      dependsOn: z.array(z.string()).default([]),
+      stackedOn: z.string().nullable().default(null),
+      warnings: z.array(z.string()).default([]),
     }),
   ),
 });
@@ -783,6 +867,8 @@ export const OrchestratorCard = z.discriminatedUnion("type", [
   ReviewCard,
   FindingsCard,
   LimitsCard,
+  ChangeCard,
+  DependentsCard,
   StoryCard,
   PullRequestCard,
   NoticeCard,
@@ -801,6 +887,8 @@ export const SYSTEM_ONLY_TYPES = new Set<string>([
   "review",
   "findings",
   "limits",
+  "change",
+  "dependents",
   "story",
   "pull_request",
   "notice",
@@ -904,6 +992,16 @@ export interface SubtaskDto {
   review: SubtaskReview | null;
   verification: Verification | null;
   fixRounds: number;
+  /** Keys of the sub-tasks it depends on (from the plan), and the one its branch is stacked on (AD-41). */
+  dependsOn: string[];
+  stackedOn: string | null;
+  /** The implementer's evidence per acceptance criterion, and the files of the change as last inspected. */
+  evidence: CriterionEvidence[] | null;
+  changedFiles: ChangedFile[] | null;
+  /** How many times the requester asked for changes at the check of the change. */
+  checkRounds: number;
+  /** For the story view: e.g. merged before a pull request it depends on. */
+  warnings: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -1023,7 +1121,7 @@ export interface RunEventDto {
   occurredAt: string;
 }
 
-export type ApprovalKind = "plan" | "questions" | "risk" | "findings" | "limits";
+export type ApprovalKind = "plan" | "questions" | "risk" | "findings" | "limits" | "change" | "dependents";
 
 export interface ApprovalDto {
   id: string;
@@ -1075,6 +1173,18 @@ export type FindingsDecision = z.infer<typeof FindingsDecision>;
 export const LimitsDecision = z.object({ decision: z.enum(["continue", "guided", "cancel"]), hash: z.string() });
 export type LimitsDecision = z.infer<typeof LimitsDecision>;
 
+/** The requester's check of a sub-task's change, bound to its commit (FR-R4, AD-40). */
+export const ChangeDecision = z.object({
+  decision: z.enum(["approve", "changes", "drop"]),
+  feedback: z.string().max(4000).optional(),
+  hash: z.string(),
+});
+export type ChangeDecision = z.infer<typeof ChangeDecision>;
+
+/** What to do with the sub-tasks that depend on one that was not delivered: drop them too, build them anyway, or cancel the run. */
+export const DependentsDecision = z.object({ decision: z.enum(["drop", "build", "cancel"]), hash: z.string() });
+export type DependentsDecision = z.infer<typeof DependentsDecision>;
+
 export const QuestionAnswer = z.object({ answer: z.string().min(1).max(8000) });
 export type QuestionAnswer = z.infer<typeof QuestionAnswer>;
 
@@ -1102,15 +1212,18 @@ export interface DeliveryRunInput {
 }
 
 /** Memo set on runs started by this version; older executions are retired at worker start. */
-export const RUN_WORKFLOW_GENERATION = 4;
+export const RUN_WORKFLOW_GENERATION = 5;
 
 export const workflowIdForIssue = (repo: RepoRef, number: number) => `run:github:${repo.owner}/${repo.name}#${number}`;
 
 // Signals delivered to the delivery-run workflow.
 export interface ApprovalSignal {
   approvalId: string;
-  /** Plan: approve, changes, reject. Risk: approve, reject. Findings: open, retry, take_over, cancel. Limits: continue, guided, cancel. */
-  decision: "approve" | "changes" | "reject" | "open" | "retry" | "take_over" | "cancel" | "continue" | "guided";
+  /**
+   * Plan: approve. Risk: approve, reject. Findings: open, retry, take_over, cancel. Limits: continue, guided, cancel.
+   * Change: approve, changes, drop. Dependents: drop, build, cancel.
+   */
+  decision: "approve" | "changes" | "reject" | "open" | "retry" | "take_over" | "cancel" | "continue" | "guided" | "drop" | "build";
   feedback?: string;
 }
 export interface AnswerSignal {
@@ -1120,6 +1233,14 @@ export interface AnswerSignal {
 }
 export interface CancelSignal {
   reason: string;
+}
+/** Sent by a sub-task workflow to its run once its pull request is open: sub-tasks that depend on it can start (AD-41). */
+export interface SubtaskPublishedSignal {
+  key: string;
+  branch: string;
+  headCommit: string;
+  prNumber: number;
+  prUrl: string;
 }
 /** A message of the requester for the architect, delivered to the design session of a run. */
 export interface RequesterMessageSignal {

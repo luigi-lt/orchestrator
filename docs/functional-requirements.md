@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.5) |
-| **Date** | 2026-11-07 |
+| **Status** | Agreed baseline (v1.6) |
+| **Date** | 2026-11-13 |
 | **Scope** | The next iteration after the [MVP](mvp.md): pilot-ready experience, focused on understanding the work, shaping the plan and reviewing the result |
 
 ## 1. Purpose and context
@@ -172,7 +172,7 @@ As a requester on the fast track, I can see the intended fix before it is built,
 #### FR-B1 Sub-tasks · Now · CAP-04
 - Sub-tasks run in dependency order, each in its own sandbox set up for its product (FR-M4), on its own branch in its product's repository.
 - The implementer runs the project's tests and build where they exist; results are captured for review.
-- A sub-task that depends on another in the same repository starts on top of its branch once that sub-task's change is approved; across products, see FR-M4.
+- A sub-task that depends on another in the same repository starts on top of its branch once that sub-task's change is approved and its pull request is open; across products, see FR-M4.
 
 ### 5.4 Review the result
 
@@ -193,7 +193,8 @@ As a requester, every change I see has already been reviewed, so that my time go
 #### FR-R4 Diff check in the app (guided track) · Now · CAP-09, CAP-10
 As a requester on the guided track, I see and approve each agent change before its pull request opens.
 - The card appears in the sub-task's own conversation (FR-C2).
-- The **change review card** shows: summary, acceptance criteria with the implementer's evidence for each, files changed with a diff viewer (unified and side-by-side), test results, and the review report.
+- The **change review card** shows: summary, acceptance criteria with the implementer's evidence for each and the reviewer's judgment, the files changed with their line counts, test results, and the review report.
+- The card does **not** show the code. A view of the code changes in the app (unified and side-by-side) is a second stage (FR-N12): the card is not the right place for it, and where it belongs is still to be decided. Until then the requester reads the code in the pull request, which opens on approval.
 - Actions: **Approve** (the pull request opens), **Request changes** with feedback (the implementer iterates, the reviewer re-reviews, and the card returns), **Drop the sub-task** (it is closed as not done and noted on the story; sub-tasks that depend on it pause for the requester to decide).
 
 #### FR-R5 Fast-track publishing · Now · CAP-02
@@ -205,7 +206,8 @@ As a requester on the guided track, I see and approve each agent change before i
 #### FR-R7 Story view · Now · CAP-10, CAP-11
 As a requester, I see the whole story at a glance.
 - Every sub-task, grouped by product, with status (planned, in progress, AI review, awaiting my check, pull request open, merged, dropped) and links, including the link to its conversation (FR-C2).
-- The story completes when the pull requests of all sub-tasks that were not dropped are merged, in every product; the ticket is updated accordingly.
+- The story completes when the pull requests of all sub-tasks that were not dropped are merged, in every product; the ticket is then closed by the orchestrator, since no single pull request closes it.
+- A pull request closed without merging, or a branch the requester took over, does not stop the other sub-tasks; the run then ends as not fully delivered. When a sub-task is not delivered and others that have not started depend on it, the requester decides: drop them too, build them without it, or cancel the run.
 
 ### 5.5 Work across products
 
@@ -231,7 +233,7 @@ As a requester, I get a plan where the products fit together before anything is 
 #### FR-M4 Product implementers · Now · CAP-01, CAP-04
 As a requester, each sub-task is built by an agent that works the way the product's team works.
 - The implementer of a sub-task runs in a sandbox with its product's toolchain, gets only its repository, and follows its product's guidance and build and test commands.
-- A sub-task that depends on a sub-task of another product starts once that sub-task passes its diff check; its implementer gets the contract from the plan and can read the approved change.
+- A sub-task that depends on a sub-task of another product starts once that sub-task has passed its diff check and its pull request is open; its implementer gets the contract from the plan and can read the approved change.
 - Sub-tasks run one at a time in this iteration, across products too (parallel work is FR-N7).
 
 #### FR-M5 Pull requests across products · Now · CAP-07, CAP-09
@@ -282,6 +284,7 @@ As a requester on the guided track, I follow and decide each sub-task in its own
 | FR-N9 | Jira and Bitbucket on the same journeys (business stack) | Later |
 | FR-N10 | Developer sub-tasks: assign a sub-task to a named developer, who builds it on a tracked sub-issue; agent sub-tasks can wait for it | Later |
 | FR-N11 | Product-owner approvals: owners of an affected product approve its sub-tasks before they are built, or do their diff checks | Later |
+| FR-N12 | See the code changes of a sub-task in the app before approving them (unified and side-by-side); where in the app this lives is to be decided — not in the change review card | Next |
 
 ## 6. Success measures
 
@@ -334,3 +337,4 @@ Detailed in the [reference architecture](architecture.md) v2.0: decisions AD-30 
 | 1.3 | Work across products: product catalog, product identification by the analyst, cross-product design with contracts, one implementer setup per product, pull requests in each product's repository, guidance kept in each product's repository (§5.5); Jira mapping open item |
 | 1.4 | Aligned with the architecture v2.0: fast-track limits re-checked on the finished change (FR-A2, FR-R5); one conversation per run and session resume behavior (FR-P1); guidance files are high-risk and who approves high-risk changes (FR-R6); contract paths in the catalog (FR-M1); §8 points to the architecture decisions |
 | 1.5 | Conversation hierarchy ticket → run → sub-task: conversations grouped by ticket in both views (FR-C1), a conversation for each sub-task under its run (FR-C2); the change review card moves to the sub-task's conversation (FR-R4) |
+| 1.6 | The change review card no longer shows the code: the view of code changes is a second stage (FR-R4, FR-N12). A dependent sub-task starts when the one it depends on has passed its check and its pull request is open (FR-B1, FR-M4). What happens when a sub-task is not delivered, and who closes the story (FR-R7) |

@@ -4,8 +4,10 @@
 // ticket, run and sub-task; the fast track with the product's test command, the AI review and its fix loop;
 // the guided track with its design session (the architect agent in the run's conversation, plan versions,
 // approval bound to a version, the session saved and restored), sub-issues on the ticket, and one branch,
-// pull request and conversation per sub-task, across two repositories; the requester's decisions on open
-// findings and on a change beyond the fast-track limits.
+// pull request and conversation per sub-task, across two repositories; the requester's check of each change
+// before its pull request opens, sub-tasks that build on an approved change (stacked in one repository,
+// readable in another), the story view with merge order, a dropped sub-task; the requester's decisions on
+// open findings and on a change beyond the fast-track limits.
 const API = process.env.API_URL ?? "http://localhost:3000";
 const GH = process.env.FAKE_GITHUB_URL ?? "http://127.0.0.1:8095";
 const MODEL = process.env.FAKE_ANTHROPIC_URL ?? "http://127.0.0.1:8099";
@@ -75,6 +77,25 @@ const waitForPlan = (conversationId, what, pred) =>
 const architectSaid = async (conversationId) =>
   (await api(`/api/conversations/${conversationId}`)).messages.filter((m) => m.role === "agent" && m.author === "architect");
 const refused = (promise) => promise.then(() => false, () => true);
+const storyOf = async (conversationId) => (await cardsOf(conversationId)).find((c) => c.type === "story");
+
+/** Waits until a sub-task of a run is in one of the states; a failed run ends the wait at once. */
+const subtaskIn = (runId, key, states) =>
+  waitFor(
+    `sub-task ${key} to be ${states.join(" or ")}`,
+    async () => {
+      const d = await api(`/api/runs/${runId}`);
+      if (d.run.state === "failed") throw Object.assign(new Error(`run failed: ${d.run.error}`), { fatal: true });
+      const st = d.subtasks.find((x) => x.key === key);
+      return st && states.includes(st.state) ? { d, st } : null;
+    },
+    600_000,
+  );
+/** The requester's pending check of a sub-task's change: the card in the sub-task's conversation. */
+const pendingCheck = (st, round = 0) =>
+  waitFor(`the check of ${st.key}`, async () => (await cardsOf(st.conversationId)).find((c) => c.type === "change" && c.status === "pending" && c.round === round), 120_000);
+const decideChange = (card, decision, feedback) => api(`/api/approvals/${card.approvalId}/change`, { method: "POST", body: { decision, hash: card.hash, feedback } });
+const pullOf = async (branch) => (await gh("/_test/state")).pulls.find((p) => p.head === branch);
 
 /** Listens to the web app's event stream, as a browser does. */
 function listen() {
@@ -141,7 +162,7 @@ async function main() {
   const fastCards = await cardsOf(fast.run.conversationId);
   const analysisCard = fastCards.find((c) => c.type === "analysis");
   check(analysisCard?.track === "fast" && analysisCard.products[0]?.name === "Calculator library", "analysis card shows the product and the fast track");
-  check(!fastCards.some((c) => ["plan", "findings", "limits"].includes(c.type)), "no approval of any kind on the fast track");
+  check(!fastCards.some((c) => ["plan", "findings", "limits", "change"].includes(c.type)), "no approval of any kind on the fast track");
   check((await issueOf(bug.number)).labels.includes("track:fast"), "the ticket carries the label track:fast");
 
   // The product's test command, the AI review and one fix round (FR-B1, FR-R1, FR-R2).
@@ -285,19 +306,9 @@ async function main() {
   check(await refused(api(`/api/approvals/${final.approvalId}/plan`, { method: "POST", body: { decision: "reject", hash: final.hash } })), "a plan cannot be rejected or edited here: changes are asked for in the conversation");
   await api(`/api/approvals/${final.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: final.hash } });
 
-  console.log("6. The approved plan is built across two repositories, each sub-task after the ones it depends on");
-  const subtaskOpen = (runId, index) =>
-    waitFor(
-      `the pull request of sub-task ${index + 1}`,
-      async () => {
-        const d = await api(`/api/runs/${runId}`);
-        if (d.run.state === "failed") throw Object.assign(new Error(`run failed: ${d.run.error}`), { fatal: true });
-        return d.subtasks.length === index + 1 && d.subtasks[index].state === "pr_open" ? d : null;
-      },
-      600_000,
-    );
-  const firstBuilt = await subtaskOpen(again.runId, 0);
-  check((await planCardOf(conv)).status === "approved" && firstBuilt.design.state === "closed", "the plan card shows the approved version and the design session is closed");
+  console.log("6. The approved plan is built across two repositories: the requester checks each change before its pull request opens");
+  const { d: firstCheck, st: c1 } = await subtaskIn(again.runId, "calc-negate", ["awaiting_check"]);
+  check((await planCardOf(conv)).status === "approved" && firstCheck.design.state === "closed", "the plan card shows the approved version and the design session is closed");
   check((await say(conv, "hello")).to === "front-door", "after the session the conversation is answered by the front-door agent again");
   versions = await api(`/api/runs/${again.runId}/plans`);
   check(versions.map((v) => v.status).join() === "superseded,superseded,approved", "all three versions are kept; the third is the approved one");
@@ -309,38 +320,85 @@ async function main() {
     `the ticket has a sub-issue per sub-task, each in the repository it changes: ${children.map((c) => c.k).join(", ")}`,
   );
   check(hub.comments[storyKey].some((c) => /Plan approved\*\* \(version 3\)/.test(c.body) && c.body.includes(`acme/web#${children[1].number}`)), "the approved plan is summarised on the ticket");
-  const c1 = firstBuilt.subtasks[0];
-  check(c1.key === "calc-negate" && c1.repository === "acme/demo" && c1.branch.endsWith("-calc-negate"), "the calculator sub-task is built first, because the shop sub-task depends on it");
+  // The story view: every sub-task of the plan from the start, in build order.
+  let storyCard = await storyOf(conv);
+  check(
+    storyCard.subtasks.map((st) => `${st.key}:${st.state}`).join() === "calc-negate:awaiting_check,shop-page:planned" &&
+      storyCard.subtasks[1].dependsOn.join() === "calc-negate" &&
+      storyCard.products[storyCard.subtasks[1].product] === "Web shop" &&
+      storyCard.subtasks[1].ticketNumber === children[1].number,
+    "the story view lists every sub-task from the start, in build order, with its product, its sub-issue and what it depends on",
+  );
+  check(c1.repository === "acme/demo" && c1.branch.endsWith("-calc-negate"), "the calculator sub-task is built first, because the shop sub-task depends on it");
   check(!!c1.conversationId && c1.conversationId !== conv && c1.ticketNumber === children[0].number, "the sub-task has its own conversation and knows its sub-issue");
-  const crossPr1 = hub.pulls.find((p) => p.head === c1.branch);
+
+  // The requester's check of the change: bound to the commit, with nothing pushed before it.
+  const check1 = await pendingCheck(c1);
+  check(firstCheck.run.state === "awaiting_approval" && (await api("/api/pending")).some((p) => p.id === check1.approvalId && p.kind === "change"), "the change waits for the requester's check");
+  check(check1.hash === c1.headCommit && check1.files.map((f) => `${f.path} +${f.added} -${f.removed}`).join() === "negate.js +2 -0", `the card shows the commit and the files changed: ${check1.files.map((f) => f.path)}`);
+  check(
+    check1.criteria.length === 1 && check1.criteria[0].criterion === "negate(2) returns -2" && /negate\.js/.test(check1.criteria[0].evidence ?? "") && check1.criteria[0].met === true,
+    "each acceptance criterion carries the implementer's evidence and the reviewer's judgment",
+  );
+  check(check1.verification?.passed && check1.review.blocking === 0 && /Added negate\.js/.test(check1.summary), "the card carries the summary, the checks and the review");
+  check(hub.pulls.length === 1 && (await refused(gh(`/_test/branch?repo=acme/demo&name=${encodeURIComponent(c1.branch)}`))), "nothing is pushed before the requester's check");
+  check(await refused(api(`/api/approvals/${check1.approvalId}/change`, { method: "POST", body: { decision: "approve", hash: "stale" } })), "a check with the hash of another commit is refused");
+  check(await refused(decideChange(check1, "changes", "  ")), "asking for changes needs to say what should change");
+  await decideChange(check1, "approve");
+  await subtaskIn(again.runId, "calc-negate", ["pr_open"]);
+  const crossPr1 = await pullOf(c1.branch);
+  const pushed1 = await gh(`/_test/branch?repo=acme/demo&name=${encodeURIComponent(c1.branch)}`);
+  check(pushed1.commits === 1 && pushed1.log.startsWith(check1.hash), "exactly the approved commit was pushed");
   check(
     crossPr1?.repo === "acme/demo" && /\(1\/2\): Add negate to the calculator/.test(crossPr1.title) && crossPr1.body.includes(`Part of #${story.number}`) && crossPr1.body.includes(`Closes #${children[0].number}`),
     "its pull request is part of the ticket and closes its sub-issue",
   );
-  const storyCardX = (await cardsOf(conv)).find((c) => c.type === "story");
-  check(storyCardX?.subtasks[0]?.conversationId === c1.conversationId, "the run's conversation lists the sub-task and links to its conversation");
-  await gh(`/_test/pulls/${crossPr1.number}/merge`, { method: "POST" });
-  const secondBuilt = await subtaskOpen(again.runId, 1);
-  const c2 = secondBuilt.subtasks[1];
-  hub = await gh("/_test/state");
-  const crossPr2 = hub.pulls.find((p) => p.head === c2.branch);
-  check(secondBuilt.subtasks[0].state === "merged" && c2.key === "shop-page" && c2.repository === "acme/web" && crossPr2?.repo === "acme/web", "the shop sub-task started after the calculator change was merged, in the shop's repository");
-  check(hub.issues.find((i) => i.k === children[0].k).state === "closed", "the sub-issue of the merged sub-task is closed");
+  check(/@tester checked this change in the orchestrator before it was opened/.test(crossPr1.body) && !/Merge order/.test(crossPr1.body), "the pull request says that the requester checked the change");
+
+  // The next sub-task starts as soon as the first one is approved and its pull request is open: no waiting for the merge.
+  const { d: secondCheck, st: c2 } = await subtaskIn(again.runId, "shop-page", ["awaiting_check"]);
+  check(secondCheck.subtasks[0].state === "pr_open" && c2.repository === "acme/web", "the shop sub-task was built while the calculator pull request is still open");
+  const shopStep = secondCheck.steps.filter((st) => st.kind === "implement").pop();
+  const shopLog = await api(`/api/steps/${shopStep.id}/progress`);
+  check(shopLog.some((l) => l.text.includes(`acme/demo@${check1.hash.slice(0, 10)}`)), "its implementer could read the approved calculator change, at exactly the approved commit");
+  check(secondCheck.run.plan.summary.includes("do not rename anything") && /negate\(a\)/.test(secondCheck.run.plan.summary), "the implementers get the plan's constraints and the contract between the products");
+  const check2 = await pendingCheck(c2);
+  check(check2.buildsOn.join() === "Add negate to the calculator" && check2.files.map((f) => f.path).join() === "shop.js" && check2.criteria.length === 2, "its check says what it builds on and shows its own change");
+  await decideChange(check2, "approve");
+  await subtaskIn(again.runId, "shop-page", ["pr_open"]);
+  const crossPr2 = await pullOf(c2.branch);
   const shopBranch = await gh(`/_test/branch?repo=acme/web&name=${encodeURIComponent(c2.branch)}`);
-  check(shopBranch.files.join() === "shop.js" && shopBranch.commits === 1, "the shop branch holds one commit with its own file");
-  check(crossPr2.body.includes(`Closes acme/demo#${story.number}`) && crossPr2.body.includes(`Closes #${children[1].number}`), "the last pull request closes the ticket across repositories, and its own sub-issue");
-  const shopStep = secondBuilt.steps.filter((st) => st.kind === "implement").pop();
-  const shopBrief = await api(`/api/steps/${shopStep.id}/progress`);
-  check(shopBrief.length > 0 && secondBuilt.run.plan.summary.includes("do not rename anything") && /negate\(a\)/.test(secondBuilt.run.plan.summary), "the implementers get the plan's constraints and the contract between the products");
+  check(crossPr2?.repo === "acme/web" && crossPr2.base === "main" && shopBranch.files.join() === "shop.js" && shopBranch.commits === 1, "the shop pull request is in the shop's repository with one commit of its own");
+  check(
+    crossPr2.body.includes(`Part of acme/demo#${story.number}`) && crossPr2.body.includes(`Closes #${children[1].number}`) && crossPr2.body.includes(`Merge after acme/demo#${crossPr1.number} (Add negate to the calculator)`),
+    "it links the story across repositories, closes its own sub-issue and states the merge order",
+  );
+  storyCard = await storyOf(conv);
+  check(storyCard.subtasks.every((st) => st.state === "pr_open" && st.prNumber) && storyCard.subtasks[0].conversationId === c1.conversationId, "the story view shows both pull requests open, each with the link to its conversation");
+
+  // Merge order is advice the orchestrator watches: the shop pull request is merged first.
   await gh(`/_test/pulls/${crossPr2.number}/merge`, { method: "POST" });
+  await subtaskIn(again.runId, "shop-page", ["merged"]);
+  storyCard = await storyOf(conv);
+  hub = await gh("/_test/state");
+  check(
+    new RegExp(`was merged before acme/demo#${crossPr1.number} \\(Add negate to the calculator\\), which it depends on`).test(storyCard.subtasks[1].warnings.join()) &&
+      hub.comments[storyKey].some((c) => /Merge order/.test(c.body)),
+    "a pull request merged before the one it depends on is flagged on the story and on the ticket",
+  );
+  check(hub.issues.find((i) => i.k === children[1].k).state === "closed" && (await api(`/api/runs/${again.runId}`)).run.state !== "completed", "its sub-issue is closed; the story is not complete yet");
+  await gh(`/_test/pulls/${crossPr1.number}/merge`, { method: "POST" });
   const crossDone = await waitForState(again.runId, ["completed"], 180_000);
   hub = await gh("/_test/state");
   check(crossDone.subtasks.every((st) => st.state === "merged") && children.every((c) => hub.issues.find((i) => i.k === c.k).state === "closed"), "the run completed after both merges and both sub-issues are closed");
+  const storyIssue = await issueOf(story.number);
+  check(storyIssue.state === "closed" && storyIssue.labels.includes("ai-done"), "the story is closed by the orchestrator when its last pull request is merged");
   const crossEvents = crossDone.events.map((e) => e.type);
   check(
-    ["design.opened", "plan.version_created", "plan.proposed", "plan.approval_voided", "design.closed", "plan.approved", "ticket.subtasks_created"].every((t) => crossEvents.includes(t)) &&
-      crossDone.events.every((e, i) => e.seq === i + 1),
-    "the design session's events are in the run's one gapless sequence",
+    ["design.opened", "plan.version_created", "plan.proposed", "plan.approval_voided", "design.closed", "plan.approved", "ticket.subtasks_created", "change.check_requested", "change.decided", "story.merged_out_of_order"].every((t) =>
+      crossEvents.includes(t),
+    ) && crossDone.events.every((e, i) => e.seq === i + 1),
+    "the events of the design session, the checks and the sub-tasks are in the run's one gapless sequence",
   );
 
   console.log("7. A design session that falls silent is saved, and restored by the next message");
@@ -392,34 +450,62 @@ async function main() {
   const gProposed = await waitForPlan(gconv, "the plan put up for approval", (c) => c.status === "proposed" && !!c.approvalId);
   await api(`/api/approvals/${gProposed.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: gProposed.hash } });
 
-  const firstOpen = await subtaskOpen(guidedRun.id, 0);
-  const s1 = firstOpen.subtasks[0];
-  check(s1.key === "multiply" && s1.state === "pr_open", "the first sub-task has its pull request open; the second has not started");
+  // The first sub-task: the requester asks for a change at the check, and checks the new commit.
+  const { st: m1 } = await subtaskIn(guidedRun.id, "multiply", ["awaiting_check"]);
+  const mCheck1 = await pendingCheck(m1);
+  await decideChange(mCheck1, "changes", "Please also mention zero");
+  const mCheck2 = await pendingCheck(m1, 1);
+  const reworked = await api(`/api/runs/${guidedRun.id}`);
+  check(
+    reworked.steps.filter((s) => s.id.includes("-multiply-s")).map((s) => s.kind).join() === "implement,review,implement,review" &&
+      reworked.steps.some((s) => /^Changes requested \(1\)/.test(s.title)),
+    "the requested change went to the implementer and the result was reviewed again",
+  );
+  const m1Cards = (await cardsOf(m1.conversationId)).filter((c) => c.type === "change");
+  check(
+    mCheck2.hash !== mCheck1.hash && /as requested/.test(mCheck2.summary) && m1Cards[0].status === "changes" && m1Cards[0].feedback === "Please also mention zero",
+    "the check returned with a new commit; the earlier card shows what was asked",
+  );
+  check((await gh("/_test/state")).pulls.every((p) => p.head !== m1.branch), "still nothing pushed for it");
+  await decideChange(mCheck2, "approve");
+  const { d: firstOpen, st: s1 } = await subtaskIn(guidedRun.id, "multiply", ["pr_open"]);
+  check(s1.headCommit === mCheck2.hash && s1.checkRounds === 1, "the pull request opened with the commit approved at the second check");
   check(!!s1.conversationId && s1.conversationId !== firstOpen.run.conversationId, "the sub-task has its own conversation");
   const s1Cards = (await cardsOf(s1.conversationId)).map((c) => c.type);
-  check(["subtask", "progress", "review", "pull_request"].every((t) => s1Cards.includes(t)), `its conversation holds its own cards: ${s1Cards.join(", ")}`);
+  check(["subtask", "progress", "review", "change", "pull_request"].every((t) => s1Cards.includes(t)), `its conversation holds its own cards: ${[...new Set(s1Cards)].join(", ")}`);
   const runCards = await cardsOf(firstOpen.run.conversationId);
-  const storyCard = runCards.find((c) => c.type === "story");
-  check(storyCard?.subtasks[0]?.conversationId === s1.conversationId && storyCard.subtasks[0].state === "pr_open", "the run's conversation lists the sub-task and links to its conversation");
-  check(!runCards.some((c) => c.type === "review" || c.type === "pull_request"), "the sub-task's cards are not in the run's conversation");
+  check(!runCards.some((c) => c.type === "review" || c.type === "pull_request" || c.type === "change"), "the sub-task's cards are not in the run's conversation");
   const guidedTicket = (await api("/api/tickets")).find((t) => t.issueNumber === guided.number);
-  check(guidedTicket.runs[0].subtasks.map((st) => st.conversationId).join() === s1.conversationId, "the hierarchy lists the sub-task under its run");
-  let pulls = (await gh("/_test/state")).pulls;
-  const pr1 = pulls.find((p) => p.head === s1.branch);
-  check(/\(1\/2\): Add multiply function/.test(pr1.title) && pr1.body.includes(`Part of #${guided.number}`) && !pr1.body.includes(`Closes #${guided.number}`), "the first pull request is part of the ticket and does not close it");
-  await gh(`/_test/pulls/${pr1.number}/merge`, { method: "POST" });
+  check(guidedTicket.runs[0].subtasks.map((st) => st.conversationId).includes(s1.conversationId), "the hierarchy lists the sub-task under its run");
+  const pr1 = await pullOf(s1.branch);
+  check(/\(1\/2\): Add multiply function/.test(pr1.title) && pr1.base === "main" && pr1.body.includes(`Part of #${guided.number}`) && !pr1.body.includes(`Closes #${guided.number}`), "the first pull request is part of the ticket and does not close it");
 
-  const secondOpen = await subtaskOpen(guidedRun.id, 1);
-  const s2 = secondOpen.subtasks[1];
-  check(secondOpen.subtasks[0].state === "merged" && s2.branch.endsWith("-notes") && s2.conversationId !== s1.conversationId, "the second sub-task started after the first was merged, on its own branch and conversation");
-  const s2Branch = await gh(`/_test/branch?repo=acme/demo&name=${encodeURIComponent(s2.branch)}`);
-  check(s2Branch.files.join() === "NOTES.md", "the second branch starts from the merged first change and adds only its own file");
-  pulls = (await gh("/_test/state")).pulls;
-  const pr2 = pulls.find((p) => p.head === s2.branch);
-  check(/\(2\/2\): Document multiply/.test(pr2.title) && pr2.body.includes(`Closes #${guided.number}`), "the last pull request closes the ticket");
+  // The second sub-task depends on the first, in the same repository: its branch is stacked on the approved change.
+  const { st: n1 } = await subtaskIn(guidedRun.id, "notes", ["awaiting_check"]);
+  check(n1.stackedOn === "multiply" && n1.baseCommit === mCheck2.hash, "the second sub-task started from the approved commit of the first, before any merge");
+  const nCheck = await pendingCheck(n1);
+  check(nCheck.files.map((f) => f.path).join() === "NOTES.md" && nCheck.buildsOn.join() === "Add multiply function", "its check shows only its own change and says what it builds on");
+  await decideChange(nCheck, "approve");
+  const { st: s2 } = await subtaskIn(guidedRun.id, "notes", ["pr_open"]);
+  const pr2 = await pullOf(s2.branch);
+  check(
+    pr2.base === s1.branch && pr2.body.includes(`builds on #${pr1.number} and targets its branch`) && pr2.body.includes(`Merge after #${pr1.number} (Add multiply function)`),
+    "its pull request targets the branch of the first one and states the merge order",
+  );
+  const own = await gh(`/_test/branch?repo=acme/demo&name=${encodeURIComponent(s2.branch)}&base=${encodeURIComponent(s1.branch)}`);
+  const whole = await gh(`/_test/branch?repo=acme/demo&name=${encodeURIComponent(s2.branch)}`);
+  check(own.files.join() === "NOTES.md" && own.commits === 1 && whole.files.sort().join() === "NOTES.md,multiply.js", "reviewers see only its own commit, on a branch that contains the change it builds on");
+  check((await storyOf(firstOpen.run.conversationId)).subtasks[1].stackedOn === "multiply", "the story view says which branch it builds on");
+
+  // When the first pull request merges, the second one moves to the default branch.
+  await gh(`/_test/pulls/${pr1.number}/merge`, { method: "POST" });
+  const moved = await waitFor("the stacked pull request to move to main", async () => (await gh("/_test/state")).pulls.find((p) => p.number === pr2.number && p.base === "main"), 180_000);
+  check(moved.retargeted === 1 && moved.state === "open", "after the merge of the first pull request the second one targets main");
   await gh(`/_test/pulls/${pr2.number}/merge`, { method: "POST" });
   const guidedDone = await waitForState(guidedRun.id, ["completed"], 180_000);
-  check(guidedDone.subtasks.every((st) => st.state === "merged"), "guided run completed after both merges");
+  const guidedStory = await storyOf(guidedDone.run.conversationId);
+  check(guidedDone.subtasks.every((st) => st.state === "merged") && guidedStory.subtasks.every((st) => st.warnings.length === 0), "the run completed after both merges, in order, with no warning");
+  check(guidedDone.events.some((e) => e.type === "scm.pr_retargeted") && (await issueOf(guided.number)).state === "closed", "the story is closed when its last pull request is merged");
 
   console.log("8. Findings still open after two fix rounds: the requester decides");
   const stubborn = await newIssue("Add a stub", "A small stub file. [stubborn] [file:stub.js]", ["ai-ready", "bug"]);
@@ -468,6 +554,40 @@ async function main() {
   await api(`/api/runs/${bigRun.id}/cancel`, { method: "POST", body: { reason: "end of test" } });
   const bigCancelled = await waitForState(bigRun.id, ["cancelled"], 120_000);
   check(bigCancelled.design.state === "closed", "cancelling ends the design session with nothing built");
+
+  console.log("10. A sub-task dropped at the check: nothing is pushed, and the requester decides about the sub-tasks that depend on it");
+  const modulo = await newIssue("Add modulo with care", "A modulo function that needs a design choice. [guided]", ["ai-ready"]);
+  const moduloRun = await runFor(modulo.number);
+  const moduloConv = (await waitForState(moduloRun.id, ["designing"])).run.conversationId;
+  await waitForPlan(moduloConv, "the first draft", (c) => c.version === 1);
+  await say(moduloConv, "Fine, put it up for approval");
+  const moduloPlan = await waitForPlan(moduloConv, "the plan put up for approval", (c) => c.status === "proposed" && !!c.approvalId);
+  await api(`/api/approvals/${moduloPlan.approvalId}/plan`, { method: "POST", body: { decision: "approve", hash: moduloPlan.hash } });
+  const { st: toDrop } = await subtaskIn(moduloRun.id, "multiply", ["awaiting_check"]);
+  const pullsBefore = (await gh("/_test/state")).pulls.length;
+  await decideChange(await pendingCheck(toDrop), "drop");
+  const asked = await waitFor("the question about the sub-task that depends on it", async () => (await api("/api/pending")).find((p) => p.runId === moduloRun.id && p.kind === "dependents"), 120_000);
+  const dependents = (await cardsOf(moduloConv)).find((c) => c.type === "dependents");
+  check(
+    dependents?.subtask.key === "multiply" && dependents.subtask.state === "dropped" && dependents.dependents.map((x) => x.key).join() === "notes" && dependents.status === "pending",
+    "the run asks what to do with the sub-task that depends on the dropped one",
+  );
+  check(await refused(api(`/api/approvals/${asked.id}/dependents`, { method: "POST", body: { decision: "drop", hash: "stale" } })), "a stale decision is refused");
+  await api(`/api/approvals/${asked.id}/dependents`, { method: "POST", body: { decision: "drop", hash: dependents.hash } });
+  const droppedRun = await waitForState(moduloRun.id, ["closed"], 180_000);
+  hub = await gh("/_test/state");
+  check(droppedRun.subtasks.map((st) => st.state).join() === "dropped,dropped" && hub.pulls.length === pullsBefore, "both sub-tasks are dropped and nothing was pushed");
+  check(await refused(gh(`/_test/branch?repo=acme/demo&name=${encodeURIComponent(toDrop.branch)}`)), "the dropped change never left the orchestrator");
+  const moduloKey = `acme/demo#${modulo.number}`;
+  const moduloChildren = hub.subIssues.filter((x) => x.parent === moduloKey).map((x) => hub.issues.find((i) => i.k === x.child));
+  check(moduloChildren.length === 2 && moduloChildren.every((c) => c.state === "closed") && hub.comments[moduloKey].some((c) => /was dropped by @tester/.test(c.body)), "their sub-issues are closed and the ticket says what was dropped");
+  const moduloCards = await cardsOf(moduloConv);
+  check(
+    moduloCards.find((c) => c.type === "story").subtasks.every((st) => st.state === "dropped") && moduloCards.some((c) => c.type === "notice" && /Every sub-task was dropped/.test(c.text)),
+    "the story view shows both as dropped and the run says that nothing was built",
+  );
+  const moduloIssue = await issueOf(modulo.number);
+  check(moduloIssue.state === "open" && !moduloIssue.labels.includes("ai-done"), "the ticket stays open: nothing was delivered");
 
   console.log(failures ? `\nFAILED: ${failures} check(s)` : "\nPASSED: all checks");
   process.exit(failures ? 1 : 0);
