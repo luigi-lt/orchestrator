@@ -7,6 +7,7 @@ import {
   buildOrder,
   findCatalogProduct,
   findCatalogRepository,
+  isFastTrackKey,
   workItemType,
   type Analysis,
   type Catalog,
@@ -110,8 +111,8 @@ export function validateHandoffPlan(plan: HandoffPlan, catalog: Catalog): string
   const keys = new Set<string>();
   for (const st of plan.subtasks) {
     if (keys.has(st.key)) errors.push(`Sub-task key "${st.key}" is used twice; every sub-task needs its own key.`);
-    // "change" names the single change of the fast track, which a run may hold already.
-    if (st.key === "change") errors.push(`Sub-task key "change" is reserved; choose a key that names the sub-task.`);
+    // "change", "change-2"… name the single change of the fast track, which a run may hold already.
+    if (isFastTrackKey(st.key)) errors.push(`Sub-task key "${st.key}" is reserved; choose a key that names the sub-task.`);
     keys.add(st.key);
   }
   for (const st of plan.subtasks) {

@@ -45,6 +45,11 @@ export const config = {
   prPollSeconds: () => int("PR_POLL_SECONDS", 60),
   /** Silence after which the architect's session workspace is saved and shut down (AD-34). */
   designIdleSeconds: () => int("DESIGN_IDLE_SECONDS", 20 * 60),
+  /** Pauses, in seconds, before an agent step that failed because of the model provider is tried again (§18). */
+  modelRetrySeconds: () =>
+    list("MODEL_RETRY_SECONDS", ["60", "300", "900"])
+      .map((v) => Number.parseInt(v, 10))
+      .filter((n) => Number.isFinite(n) && n > 0),
   /** The longest a session workspace lives before it is saved and replaced. */
   designMaxMinutes: () => int("DESIGN_MAX_MINUTES", 8 * 60),
   /** Fix rounds after an AI review before the requester decides (FR-R2). */

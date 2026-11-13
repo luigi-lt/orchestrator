@@ -3,7 +3,7 @@
 import http from "node:http";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -28,6 +28,9 @@ const SEED = {
 };
 
 const state = { issues: new Map(), comments: new Map(), events: new Map(), labels: new Map(), subIssues: [], pulls: [], nextIssue: 1, nextComment: 1 };
+// Access the tests take away: repositories where the user has no write access (shown by the REST API), and
+// repositories that refuse pushes (a pre-receive hook, as a token without write permission would).
+const access = { noWrite: new Set(), pushRefused: new Set() };
 
 const git = (args, cwd) => execFileSync("git", ["-c", "safe.directory=*", ...args], { cwd, stdio: ["ignore", "pipe", "pipe"] }).toString();
 
@@ -112,6 +115,22 @@ const server = http.createServer(async (req, res) => {
         pr.merged = true;
         return send(res, 200, pr);
       }
+      if (m === "POST" && p[1] === "access") {
+        const b = await readBody(req);
+        const hook = join(GIT_ROOT, `${b.repo}.git`, "hooks", "pre-receive");
+        if (b.write !== undefined) b.write ? access.noWrite.delete(b.repo) : access.noWrite.add(b.repo);
+        if (b.push !== undefined) {
+          if (b.push) {
+            access.pushRefused.delete(b.repo);
+            rmSync(hook, { force: true });
+          } else {
+            access.pushRefused.add(b.repo);
+            writeFileSync(hook, `#!/bin/sh\necho "Permission to ${b.repo}.git denied to ${USER.login}." >&2\nexit 1\n`);
+            chmodSync(hook, 0o755);
+          }
+        }
+        return send(res, 200, { noWrite: [...access.noWrite], pushRefused: [...access.pushRefused] });
+      }
       if (m === "GET" && p[1] === "state") {
         return send(res, 200, {
           issues: [...state.issues.entries()].map(([k, v]) => ({ k, ...v, labels: [...state.labels.get(k)] })),
@@ -138,7 +157,9 @@ const server = http.createServer(async (req, res) => {
     if (p[0] !== "repos") return send(res, 404, { message: `not found: ${m} ${url.pathname}` });
     const [, o, r, kind, n, sub, extra] = p;
     if (!REPOS.includes(`${o}/${r}`)) return send(res, 404, { message: "repo not found" });
-    if (m === "GET" && !kind) return send(res, 200, { default_branch: "main", full_name: `${o}/${r}` });
+    if (m === "GET" && !kind) {
+      return send(res, 200, { default_branch: "main", full_name: `${o}/${r}`, permissions: { admin: false, push: !access.noWrite.has(`${o}/${r}`), pull: true } });
+    }
 
     if (kind === "labels" && m === "POST") return send(res, 201, {});
     if (kind === "issues" && !n && m === "GET") {

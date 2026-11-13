@@ -33,6 +33,8 @@ export function OrchestratorCardView({ card }: { card: OrchestratorCard }) {
       return <ChangeCard card={card} />;
     case "dependents":
       return <DependentsCard card={card} />;
+    case "blocked":
+      return <BlockedCard card={card} />;
     case "story":
       return <StoryCard card={card} />;
     case "pull_request":
@@ -294,7 +296,7 @@ const PLAN_STATUS = {
   draft: "The architect is still shaping this plan with you. Ask for changes in the conversation.",
   proposed: "The architect put this version up for your approval. To change it, ask in the conversation; a new version replaces this one.",
   approved: "You approved this version. It is what the agents build.",
-  expired: "The run ended before this plan was approved.",
+  expired: "This plan was not approved: the run ended, or moved to the fast track.",
 } as const;
 
 /**
@@ -728,6 +730,48 @@ function ChangeCard({ card }: { card: CardOf<"change"> }) {
           <textarea value={feedback} onChange={(e) => setFeedback(e.target.value)} rows={3} placeholder="Or say what should change; the implementer does another round and the change is reviewed again" />
           <button disabled={busy || !feedback.trim()} onClick={() => void decide("changes")}>
             Request changes
+          </button>
+        </div>
+      )}
+      {error && <p className="error small">{error}</p>}
+    </div>
+  );
+}
+
+const BLOCKED_DECISION = { retry: "retried", cancel: "cancelled" } as const;
+
+/** The token cannot reach a repository: the sub-task waits until the access is fixed (AD-42). */
+function BlockedCard({ card }: { card: CardOf<"blocked"> }) {
+  const { busy, error, run } = useDecision();
+  const pending = card.status === "pending";
+  const decide = (decision: "retry" | "cancel") => run(() => post(`/api/approvals/${card.approvalId}/blocked`, { decision, hash: card.hash }));
+  return (
+    <div className={`card ${pending ? "needs-action" : ""}`}>
+      <div className="card-head">
+        <span className="kicker">Blocked: access to a repository{pending ? " · your action is needed" : ""}</span>
+        <StatusBadge status={card.status === "pending" || card.status === "expired" ? card.status : BLOCKED_DECISION[card.status]} />
+      </div>
+      <p>
+        The orchestrator cannot <strong>{card.what}</strong> with your token:
+      </p>
+      <ul>
+        {card.problems.map((p) => (
+          <li key={p} className="small">
+            {p}
+          </li>
+        ))}
+      </ul>
+      <p className="muted small">
+        Fix the access (for a fine-grained token: add the repository, with Contents, Issues and Pull requests set to Read and write; check that the token
+        has not expired), then retry. Nothing that needs the access has happened yet.
+      </p>
+      {pending && (
+        <div className="actions">
+          <button className="primary" disabled={busy} onClick={() => void decide("retry")}>
+            Retry
+          </button>
+          <button className="danger ghost" disabled={busy} onClick={() => void decide("cancel")}>
+            Cancel
           </button>
         </div>
       )}

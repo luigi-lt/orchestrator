@@ -248,4 +248,11 @@ alter table subtasks
   add column warnings jsonb not null default '[]';
 `,
   },
+  {
+    // Iteration 2, increment 5: a design session started afresh from the current plan forgets the conversation before it.
+    version: 6,
+    sql: `
+alter table design_sessions add column history_since timestamptz;
+`,
+  },
 ];

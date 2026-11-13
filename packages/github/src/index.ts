@@ -124,6 +124,16 @@ export class GitHubClient {
     return { login: data!.login, id: data!.id, name: data!.name };
   }
 
+  /**
+   * What the token can do in a repository, or null when it cannot see it. `push` is the user's role there: GitHub does
+   * not show what a fine-grained token itself may do, which is why a push is also tried without sending anything.
+   */
+  async getRepositoryAccess(repo: RepoRef): Promise<{ push: boolean | null } | null> {
+    const { status, data } = await this.request<{ permissions?: { push?: boolean } }>("GET", this.repoPath(repo), { allow404: true });
+    if (status === 404 || !data) return null;
+    return { push: data.permissions?.push ?? null };
+  }
+
   async getDefaultBranch(repo: RepoRef): Promise<string> {
     const { data } = await this.request<{ default_branch: string }>("GET", this.repoPath(repo));
     return data!.default_branch;

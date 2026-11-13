@@ -570,8 +570,21 @@ function designContext(brief: StepBrief): string[] {
 function turnPrompt(brief: StepBrief, turn: DesignTurnInput, start: "new" | "restored" | "rebuilt" | null): string {
   const design = brief.design!;
   const says = turn.messages.length ? ["The requester says:", ...turn.messages.map((m) => (turn.messages.length > 1 ? `- ${m}` : m))] : [];
-  if (start === "new" || (start === "rebuilt" && turn.opening)) {
+  const currentPlan = design.latestPlan
+    ? ["", `## The current plan (version ${design.latestVersion})`, "```json", JSON.stringify(design.latestPlan, null, 1), "```"]
+    : [];
+  if (start === "new" || (start === "rebuilt" && turn.opening && !design.latestPlan)) {
     return [...designContext(brief), "", "Open the design session now, as your instructions describe, and submit a first draft plan with submit_plan."].join("\n");
+  }
+  if (start === "rebuilt" && turn.opening) {
+    // The run came back to the guided track after the requester had switched it to the fast track.
+    return [
+      ...designContext(brief),
+      ...currentPlan,
+      "",
+      "The requester switched this work back to the guided track. Re-open the design session: say briefly where the plan stands and what you would change.",
+      "Call submit_plan only when you change the plan.",
+    ].join("\n");
   }
   if (start === "rebuilt") {
     // The saved session could not be restored: the record of the session stands in for its memory.
@@ -586,9 +599,10 @@ function turnPrompt(brief: StepBrief, turn: DesignTurnInput, start: "new" | "res
       ...designContext(brief),
       "",
       "## The design session so far",
-      "You are continuing a design session. Your earlier working memory is gone; this is the record of it.",
-      ...record.map((m) => `${m.role === "requester" ? "Requester" : "You (architect)"}: ${m.text}`),
-      ...(design.latestPlan ? ["", `## The current plan (version ${design.latestVersion})`, "```json", JSON.stringify(design.latestPlan, null, 1), "```"] : []),
+      ...(record.length
+        ? ["You are continuing a design session. Your earlier working memory is gone; this is the record of it.", ...record.map((m) => `${m.role === "requester" ? "Requester" : "You (architect)"}: ${m.text}`)]
+        : ["You are continuing a design session from its current plan. The requester started the session afresh: the conversation before this point is not available."]),
+      ...currentPlan,
       "",
       ...says,
     ].join("\n");
@@ -693,8 +707,12 @@ async function runDesignSession(brief: StepBrief): Promise<StepResult> {
   }
   if (!session) {
     session = await client.createSession({ ...config, sessionId: design.sessionId });
-    start = design.history.length ? "rebuilt" : "new";
-    if (start === "rebuilt") report("status", "Session rebuilt from the record of the conversation");
+    // With a plan or a conversation behind it, the session continues from the record (R-13), or from the plan alone
+    // when the requester started it afresh (R-14).
+    start = design.history.length || design.latestPlan ? "rebuilt" : "new";
+    // Right after a fresh start the record holds only what the requester has just said: no reply of the architect yet.
+    const afresh = design.history.every((m) => m.role === "requester");
+    if (start === "rebuilt") report("status", afresh ? "Session started afresh from the current plan" : "Session rebuilt from the record of the conversation");
   }
 
   // Reply text goes to the conversation as it is written; the gateway passes it on without it entering any workflow.

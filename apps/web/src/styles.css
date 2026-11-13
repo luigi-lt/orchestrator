@@ -292,6 +292,12 @@ ol.story > li { list-style: decimal outside; }
   background: color-mix(in srgb, var(--orch) 9%, var(--surface)); color: var(--text);
 }
 .design-strip.suspended, .design-strip.suspending { background: color-mix(in srgb, var(--warning) 10%, var(--surface)); }
+.track-switch {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 16px;
+  border-bottom: 1px solid var(--border); background: var(--surface);
+}
+.track-switch input { flex: 1 1 220px; min-width: 0; }
+button.link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; text-decoration: underline; font: inherit; }
 .badge.designing { background: color-mix(in srgb, var(--orch) 16%, transparent); color: var(--orch); }
 .badge.draft, .badge.superseded { background: var(--surface-2); color: var(--muted); }
 .badge.proposed { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--warning); }

@@ -7,7 +7,8 @@
 // pull request and conversation per sub-task, across two repositories; the requester's check of each change
 // before its pull request opens, sub-tasks that build on an approved change (stacked in one repository,
 // readable in another), the story view with merge order, a dropped sub-task; the requester's decisions on
-// open findings and on a change beyond the fast-track limits.
+// open findings and on a change beyond the fast-track limits; switching the track both ways; a token that
+// cannot push; a design session started afresh; an overloaded model provider.
 const API = process.env.API_URL ?? "http://localhost:3000";
 const GH = process.env.FAKE_GITHUB_URL ?? "http://127.0.0.1:8095";
 const MODEL = process.env.FAKE_ANTHROPIC_URL ?? "http://127.0.0.1:8099";
@@ -588,6 +589,147 @@ async function main() {
   );
   const moduloIssue = await issueOf(modulo.number);
   check(moduloIssue.state === "open" && !moduloIssue.labels.includes("ai-done"), "the ticket stays open: nothing was delivered");
+
+  console.log("11. The requester switches the track: to guided before anything is pushed, and back to fast from the design session");
+  const tricky = await newIssue("Add a ratio helper", "A small helper; it may need a new dependency. [file:package.json]", ["ai-ready", "bug"]);
+  const trickyRun = await runFor(tricky.number);
+  const atRisk = await waitForState(trickyRun.id, ["awaiting_approval"]);
+  let trackNow = (await api(`/api/conversations/${atRisk.run.conversationId}`)).track;
+  check(
+    atRisk.run.track === "fast" && (await api("/api/pending")).some((p) => p.runId === trickyRun.id && p.kind === "risk") && trackNow?.current === "fast" && trackNow.to === "guided",
+    "while the fast-track change waits for its high-risk approval, the conversation offers the switch to the guided track",
+  );
+  check(await refused(api(`/api/runs/${trickyRun.id}/track`, { method: "POST", body: { track: "fast" } })), "switching to the track the run is already on is refused");
+  await api(`/api/runs/${trickyRun.id}/track`, { method: "POST", body: { track: "guided", reason: "It adds a dependency; I want a plan" } });
+  const switched = await waitFor(
+    "the design session after the switch",
+    async () => {
+      const d = await api(`/api/runs/${trickyRun.id}`);
+      return d.run.track === "guided" && d.plans.length >= 1 ? d : null;
+    },
+    300_000,
+  );
+  const toGuided = switched.events.find((e) => e.type === "track.changed");
+  check(toGuided?.payload.from === "fast" && toGuided.payload.by === "tester" && toGuided.payload.reason === "It adds a dependency; I want a plan", "the switch is in the timeline with who asked for it and why");
+  hub = await gh("/_test/state");
+  check(
+    (await issueOf(tricky.number)).labels.includes("track:guided") && hub.comments[`acme/demo#${tricky.number}`].some((c) => /Track changed to \*\*guided\*\* by @tester: It adds a dependency/.test(c.body)),
+    "the ticket's label follows, and the ticket says who switched and why",
+  );
+  check(switched.subtasks.find((st) => st.key === "change")?.state === "cancelled" && hub.pulls.every((p) => p.head !== switched.run.branch), "the change was set aside and nothing was pushed");
+  check((await cardsOf(switched.run.conversationId)).find((c) => c.type === "risk")?.status === "expired", "the high-risk approval it waited for is closed");
+  trackNow = (await api(`/api/conversations/${switched.run.conversationId}`)).track;
+  check(trackNow?.current === "guided" && trackNow.to === "fast", "in the design session the plan stays in one repository: the switch back to the fast track is offered");
+
+  await api(`/api/runs/${trickyRun.id}/track`, { method: "POST", body: { track: "fast" } });
+  const backToFast = await waitFor(
+    "the change built again on the fast track",
+    async () => {
+      const d = await api(`/api/runs/${trickyRun.id}`);
+      if (d.run.state === "failed") throw Object.assign(new Error(`run failed: ${d.run.error}`), { fatal: true });
+      return d.run.track === "fast" && d.subtasks.some((st) => st.key === "change-2") && d.run.state === "awaiting_approval" ? d : null;
+    },
+    300_000,
+  );
+  const change2 = backToFast.subtasks.find((st) => st.key === "change-2");
+  check(backToFast.design.state === "closed" && /Make these changes, as one change:/.test(change2.description) && /Add multiply function/.test(change2.description) && /Document multiply/.test(change2.description), "the design session closed and the plan's sub-tasks became one change");
+  check((await planCardOf(backToFast.run.conversationId)).status === "expired", "the plan card says the plan was not approved");
+  const risk2 = (await api("/api/pending")).find((p) => p.runId === trickyRun.id && p.kind === "risk");
+  const risk2Card = (await cardsOf(backToFast.run.conversationId)).filter((c) => c.type === "risk" && c.status === "pending").pop();
+  await api(`/api/approvals/${risk2.id}/risk`, { method: "POST", body: { decision: "approve", hash: risk2Card.hash } });
+  const opened11 = await waitForState(trickyRun.id, ["awaiting_merge"]);
+  trackNow = (await api(`/api/conversations/${opened11.run.conversationId}`)).track;
+  check(trackNow?.to === null && /pull request is open/.test(trackNow.why ?? ""), "once the pull request is open the track can no longer be switched");
+  check(await refused(api(`/api/runs/${trickyRun.id}/track`, { method: "POST", body: { track: "guided" } })), "and a request to switch is refused");
+  const pr11 = await pullOf(change2.branch);
+  check(!!pr11 && change2.branch.endsWith("-2") && opened11.events.filter((e) => e.type === "track.changed").map((e) => e.payload.track).join() === "guided,fast", "the pull request opened from the second change; the timeline has both switches");
+  await gh(`/_test/pulls/${pr11.number}/merge`, { method: "POST" });
+  await waitForState(trickyRun.id, ["completed"], 180_000);
+  check((await issueOf(tricky.number)).labels.includes("track:fast"), "the run completed on the fast track, and the label says so");
+
+  console.log("12. Access: a change waits while the token cannot push, and goes on when the access is fixed");
+  await gh("/_test/access", { method: "POST", body: { repo: "acme/demo", write: false } });
+  const locked = await newIssue("Add percent", "Please add a percent function. [file:percent.js]", ["ai-ready", "bug"]);
+  const lockedRun = await runFor(locked.number);
+  const blocked1 = await waitFor("the blocked card", async () => (await api("/api/pending")).find((p) => p.runId === lockedRun.id && p.kind === "blocked"), 300_000);
+  let lockedDetail = await api(`/api/runs/${lockedRun.id}`);
+  const card1 = (await cardsOf(lockedDetail.run.conversationId)).find((c) => c.type === "blocked" && c.status === "pending");
+  check(
+    card1?.what === "push to acme/demo" && /has no write access to acme\/demo/.test(card1.problems.join()) && !lockedDetail.steps.some((st) => st.kind === "implement"),
+    "before any agent works on it, the change waits: the user has no write access to the repository",
+  );
+  await gh("/_test/access", { method: "POST", body: { repo: "acme/demo", write: true, push: false } });
+  await api(`/api/approvals/${blocked1.id}/blocked`, { method: "POST", body: { decision: "retry", hash: card1.hash } });
+  const blocked2 = await waitFor("the refused push", async () => (await api("/api/pending")).find((p) => p.runId === lockedRun.id && p.kind === "blocked" && p.id !== blocked1.id), 300_000);
+  lockedDetail = await api(`/api/runs/${lockedRun.id}`);
+  const card2 = (await cardsOf(lockedDetail.run.conversationId)).find((c) => c.type === "blocked" && c.status === "pending");
+  check(
+    card2?.what === "push the branch to acme/demo" && /Permission to acme\/demo\.git denied/.test(card2.problems.join()) && lockedDetail.steps.some((st) => st.kind === "implement" && st.state === "succeeded"),
+    "after the change was built, a push refused by the repository makes it wait too",
+  );
+  check((await gh("/_test/state")).pulls.every((p) => p.head !== lockedDetail.run.branch), "no pull request was opened");
+  await gh("/_test/access", { method: "POST", body: { repo: "acme/demo", push: true } });
+  await api(`/api/approvals/${blocked2.id}/blocked`, { method: "POST", body: { decision: "retry", hash: card2.hash } });
+  const unlocked = await waitForState(lockedRun.id, ["awaiting_merge"]);
+  const lockedPr = await pullOf(unlocked.run.branch);
+  check(!!lockedPr && unlocked.events.filter((e) => e.type === "access.blocked").length === 2, "once the access was fixed and the requester retried, the pull request opened");
+  await gh(`/_test/pulls/${lockedPr.number}/merge`, { method: "POST" });
+  await waitForState(lockedRun.id, ["completed"], 180_000);
+
+  console.log("13. Guided: no approval while the token cannot push; a design session started afresh keeps the plan");
+  const story13 = await newIssue("Add modulo to the calculator", "A story about modulo.", ["ai-ready", "story"]);
+  const run13 = await runFor(story13.number);
+  const conv13 = (await waitForState(run13.id, ["designing"])).run.conversationId;
+  await waitForPlan(conv13, "the first draft", (c) => c.version === 1);
+  await say(conv13, "Constraint: do not change math.js");
+  await waitForPlan(conv13, "version 2", (c) => c.version === 2);
+  await gh("/_test/access", { method: "POST", body: { repo: "acme/demo", write: false } });
+  await say(conv13, "Put it up for approval");
+  const accessNotice = await waitFor("the access notice", async () => (await cardsOf(conv13)).find((c) => c.type === "notice" && /cannot be put up for approval yet/.test(c.text)), 180_000);
+  check(
+    /has no write access to acme\/demo/.test(accessNotice.text) && (await planCardOf(conv13)).status === "draft" && !(await api("/api/pending")).some((p) => p.runId === run13.id && p.kind === "plan"),
+    "the plan is not put up for approval while the token cannot push to its repository, and the conversation says why",
+  );
+  await gh("/_test/access", { method: "POST", body: { repo: "acme/demo", write: true } });
+  const turnsBefore13 = (await call(MODEL, "/_test/state")).designTurns.length;
+  await waitFor("the architect to finish", async () => !(await api(`/api/conversations/${conv13}`)).busy, 120_000);
+  await api(`/api/runs/${run13.id}/fresh-session`, { method: "POST", body: {} });
+  await waitFor("the fresh-start notice", async () => (await cardsOf(conv13)).find((c) => c.type === "notice" && /starts afresh with your next message/.test(c.text)), 180_000);
+  await say(conv13, "One more constraint: do not add files outside the root");
+  const v13 = await waitForPlan(conv13, "version 3 after the fresh start", (c) => c.version === 3);
+  const detail13 = await api(`/api/runs/${run13.id}`);
+  const sessions13 = detail13.steps.filter((st) => st.kind === "design");
+  const freshLog = await api(`/api/steps/${sessions13[sessions13.length - 1].id}/progress`);
+  const freshTurn = (await call(MODEL, "/_test/state")).designTurns.slice(turnsBefore13).find((t) => /files outside the root/.test(t.says));
+  check(
+    freshLog.some((l) => /Session started afresh from the current plan/.test(l.text)) && freshTurn?.fresh && freshTurn.prompts === 1 && detail13.events.some((e) => e.type === "design.restarted"),
+    "the fresh session got the analysis and the current plan, not the conversation",
+  );
+  check(v13.plan.constraints.join(" | ") === "Constraint: do not change math.js | One more constraint: do not add files outside the root", "the architect kept the constraints of the current plan and added the new one");
+  await say(conv13, "Fine, put it up for approval");
+  const proposed13 = await waitForPlan(conv13, "the plan put up for approval", (c) => c.status === "proposed" && !!c.approvalId);
+  check(proposed13.version === 3, "with the access fixed, the plan is put up for approval");
+  await api(`/api/runs/${run13.id}/cancel`, { method: "POST", body: { reason: "end of test" } });
+  await waitForState(run13.id, ["cancelled"], 120_000);
+
+  console.log("14. The model provider is overloaded: the step is tried again after a pause, and the run goes on");
+  await call(MODEL, "/_test/overload", { method: "POST", body: { count: 15 } });
+  const outage = await newIssue("Add double", "Please add a double function. [file:double.js]", ["ai-ready", "bug"]);
+  const outageRun = await runFor(outage.number);
+  const outageOpen = await waitForState(outageRun.id, ["awaiting_merge"]);
+  const analyses = outageOpen.steps.filter((st) => st.kind === "analyse");
+  const failedAnalyses = analyses.filter((st) => st.state === "failed");
+  const waits = outageOpen.events.filter((e) => e.type === "step.retry_scheduled");
+  check(
+    failedAnalyses.length >= 1 && failedAnalyses.every((st) => /529|Overloaded/.test(st.error ?? "")) && analyses[analyses.length - 1].state === "succeeded",
+    `the analysis failed on the overloaded provider (${failedAnalyses.length} time(s)) and then succeeded`,
+  );
+  check(waits.length === failedAnalyses.length && waits.every((e) => e.payload.reason === "model provider" && e.payload.waitSeconds === 5), "each failure was waited out before the next attempt");
+  check((await call(MODEL, "/_test/state")).overloaded >= 15, "the provider really was overloaded");
+  const outagePr = await pullOf(outageOpen.run.branch);
+  await gh(`/_test/pulls/${outagePr.number}/merge`, { method: "POST" });
+  await waitForState(outageRun.id, ["completed"], 180_000);
+  ok("the run completed");
 
   console.log(failures ? `\nFAILED: ${failures} check(s)` : "\nPASSED: all checks");
   process.exit(failures ? 1 : 0);

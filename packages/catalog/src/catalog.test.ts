@@ -129,6 +129,8 @@ describe("product catalog", () => {
     expect(problems([plan.subtasks[0]!, { ...st, key: "page" }])).toMatch(/used twice/);
     // "change" is the single change of the fast track, which a run that switched tracks holds already.
     expect(problems([plan.subtasks[0]!, { ...st, key: "change" }])).toMatch(/"change" is reserved/);
+    expect(problems([plan.subtasks[0]!, { ...st, key: "change-3" }])).toMatch(/"change-3" is reserved/);
+    expect(problems([plan.subtasks[0]!, { ...st, key: "change-log" }])).not.toMatch(/reserved/);
     expect(problems([plan.subtasks[0]!, { ...st, dependsOn: ["page"] }])).toMatch(/form a cycle/);
     expect(problems([{ ...plan.subtasks[0]!, dependsOn: ["gone"] }, st])).toMatch(/not a sub-task of this plan/);
     expect(problems(plan.subtasks, [{ ...plan.contracts[0]!, consumers: [] }])).toMatch(/must name the sub-tasks/);

@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { join as joinPath } from "node:path";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ApplicationFailure, Context } from "@temporalio/activity";
 import { fastTrackLimitsExceeded } from "@orch/catalog";
@@ -269,6 +269,25 @@ async function fulfilRepositoryRequest(runId: string, request: RepositoryRequest
 }
 
 const STALE_AFTER_MS = 3 * 60 * 1000;
+/**
+ * A workspace counts as lost only after it has looked stale for this long to the waiting activity itself. After a
+ * laptop sleeps, every heartbeat is old at first; a live workspace reports again within seconds (§18).
+ */
+const STALE_GRACE_MS = 60 * 1000;
+
+/** Remembers since when, as seen by this process, a step has looked stale. */
+const staleSince = new Map<string, number>();
+function lostAfterGrace(stepId: string, stale: boolean): boolean {
+  if (!stale) {
+    staleSince.delete(stepId);
+    return false;
+  }
+  const since = staleSince.get(stepId) ?? Date.now();
+  staleSince.set(stepId, since);
+  if (Date.now() - since < STALE_GRACE_MS) return false;
+  staleSince.delete(stepId);
+  return true;
+}
 const START_TIMEOUT_MS = 5 * 60 * 1000;
 
 /** Supervises a step: serves repository requests and waits for the result, heartbeating to Temporal meanwhile. */
@@ -288,7 +307,7 @@ export async function awaitStep(input: { stepId: string }): Promise<StepResult> 
     const now = Date.now();
     if (step.state === "pending" && now - startedWaiting > START_TIMEOUT_MS) {
       await failStepIfActive(db, input.stepId, "The workspace did not start in time");
-    } else if (step.state === "running" && step.lastSeenAt && now - new Date(step.lastSeenAt).getTime() > STALE_AFTER_MS) {
+    } else if (lostAfterGrace(input.stepId, step.state === "running" && !!step.lastSeenAt && now - new Date(step.lastSeenAt).getTime() > STALE_AFTER_MS)) {
       await failStepIfActive(db, input.stepId, "The workspace stopped responding");
     }
     await Promise.race([sleep(1500), activity.cancelled.catch(() => undefined)]);
@@ -352,7 +371,10 @@ export async function prepareDesignWorkspace(input: {
   // The record of the session: what it is rebuilt from when its checkpoint cannot be restored (R-13).
   const run = await getRun(db, input.runId);
   const messages = run?.conversationId ? await listMessages(db, run.conversationId) : [];
+  // After a fresh start from the current plan, the conversation before it is not given to the architect again (R-14).
+  const since = session?.historySince ?? null;
   const history = messages
+    .filter((m) => !since || m.createdAt > since)
     .filter((m) => m.text && (m.role === "user" || (m.role === "agent" && m.author === "architect")))
     .slice(-60)
     .map((m) => ({ role: m.role === "user" ? ("requester" as const) : ("architect" as const), text: m.text!.slice(0, 6000) }));
@@ -405,7 +427,10 @@ export async function awaitDesignTurn(input: { runId: string; stepId: string; tu
       await fulfilRepositoryRequest(input.runId, request);
       activity.heartbeat();
     }
-    if (!stepAlive(await getStep(db, input.stepId))) {
+    const step = await getStep(db, input.stepId);
+    // A step that ended is lost at once; one that only looks stale gets the grace period first.
+    const ended = !step || (step.state !== "pending" && step.state !== "running");
+    if (ended || lostAfterGrace(input.stepId, !stepAlive(step))) {
       await failStepIfActive(db, input.stepId, "The design session workspace stopped responding");
       throw ApplicationFailure.nonRetryable("The design session workspace was lost", "WorkspaceLost");
     }
@@ -439,6 +464,25 @@ export async function suspendDesignWorkspace(input: { runId: string }): Promise<
   if (!saved) await failStepIfActive(db, session.stepId, "The design session workspace did not save its session in time");
   await saveDesignSession(db, input.runId, { state: "suspended", stepId: null });
   return { stepId: session.stepId, saved };
+}
+
+/**
+ * Starts the design session again from the current plan (R-14 fallback, for sessions that grew too long): the
+ * workspace is stopped, its saved session thrown away, and the next turn gets the analysis and the latest plan
+ * but not the conversation before this point. The session stays open: the requester keeps talking to the architect.
+ */
+export async function restartDesignSession(input: { runId: string }): Promise<{ stepId: string | null }> {
+  const { db } = ctx();
+  const session = await getDesignSession(db, input.runId);
+  if (!session || session.state === "closed") return { stepId: null };
+  const stepId = session.stepId;
+  if (stepId) {
+    await saveDesignSession(db, input.runId, { state: "suspending" });
+    if (!(await stepEnded(stepId, 120_000))) await failStepIfActive(db, stepId, "The design session was started afresh");
+  }
+  await rm(designCheckpoint(input.runId), { force: true });
+  await saveDesignSession(db, input.runId, { state: "suspended", stepId: null, hasCheckpoint: false, historySince: new Date().toISOString() });
+  return { stepId };
 }
 
 /** Ends the design session for good: the plan is approved, or the run is cancelled. */

@@ -53,7 +53,9 @@ function findShellTool(tools) {
 }
 
 // What the tests can ask about afterwards (GET /_test/state).
-const seen = { requests: 0, guidanceInPrompt: false, guidanceInSystem: false, planSentBack: false, designTurns: [] };
+const seen = { requests: 0, guidanceInPrompt: false, guidanceInSystem: false, planSentBack: false, designTurns: [], overloaded: 0 };
+// Requests still to answer with 529 overloaded_error (POST /_test/overload): the model provider in trouble.
+let overload = 0;
 const GUIDANCE_MARKER = "E2E-GUIDANCE-MARKER";
 
 const analysisBase = {
@@ -309,12 +311,21 @@ function design(messages) {
   const since = toolUsesSinceLastPrompt(messages);
   const tool = (name, input) => ({ type: "tool_use", id: id("toolu"), name, input });
   const said = requesterSaid(messages);
-  const constraints = [...new Set(said.filter((t) => CONSTRAINT.test(t)))];
+  // A session started afresh knows the constraints only from the current plan in its prompt.
+  const fromPlan = (() => {
+    const m = /## The current plan \(version \d+\)\n```json\n([\s\S]*?)\n```/.exec(prompts.join("\n"));
+    try {
+      return m ? JSON.parse(m[1]).constraints ?? [] : [];
+    } catch {
+      return [];
+    }
+  })();
+  const constraints = [...new Set([...fromPlan, ...said.filter((t) => CONSTRAINT.test(t))])];
   const now = last.includes("The requester says:") ? last.slice(last.lastIndexOf("The requester says:") + 19) : "";
 
   if (since.length === 0) {
     // One entry per turn, so the test can tell whether a session that was saved and restored still had its memory.
-    seen.designTurns.push({ prompts: prompts.length, remembersOpening: prompts.length > 1 && /Open the design session now/.test(prompts[0]), rebuilt: /Your earlier working memory is gone/.test(last), says: now.trim().slice(0, 80) });
+    seen.designTurns.push({ prompts: prompts.length, remembersOpening: prompts.length > 1 && /Open the design session now/.test(prompts[0]), rebuilt: /Your earlier working memory is gone/.test(last), fresh: /started the session afresh/.test(last), says: now.trim().slice(0, 80) });
   }
   if (JSON.stringify(messages[messages.length - 1] ?? "").includes("The plan has problems")) seen.planSentBack = true;
 
@@ -433,8 +444,19 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { "content-type": "application/json" });
     return res.end(JSON.stringify({ input_tokens: 100 }));
   }
+  if (req.method === "POST" && url.pathname === "/_test/overload") {
+    overload = Number((await readBody(req)).count ?? 0);
+    res.writeHead(200, { "content-type": "application/json" });
+    return res.end(JSON.stringify({ overload }));
+  }
   if (req.method === "POST" && url.pathname === "/v1/messages") {
     const body = await readBody(req);
+    if (overload > 0) {
+      overload--;
+      seen.overloaded++;
+      res.writeHead(529, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } }));
+    }
     const blocks = decide(body);
     console.log(
       JSON.stringify({

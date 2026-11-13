@@ -33,6 +33,7 @@ import type {
   CriterionEvidence,
   DeliveryRunInput,
   DependencyRef,
+  FreshSessionSignal,
   PlanSubtask,
   DesignTurnInput,
   DesignTurnResult,
@@ -49,6 +50,7 @@ import type {
   SubtaskReview,
   SubtaskState,
   Track,
+  TrackRequest,
   TrackedFinding,
   Verification,
   WorkItem,
@@ -63,6 +65,11 @@ export const answerSignal = defineSignal<[AnswerSignal]>("answer");
 export const cancelSignal = defineSignal<[CancelSignal]>("cancel");
 export const requesterMessageSignal = defineSignal<[RequesterMessageSignal]>("requesterMessage");
 export const subtaskPublishedSignal = defineSignal<[SubtaskPublishedSignal]>("subtaskPublished");
+/** The requester switches the track (FR-A3): sent to the run, which passes it to the change or the design session going on. */
+export const changeTrackSignal = defineSignal<[TrackRequest]>("changeTrack");
+export const switchTrackSignal = defineSignal<[TrackRequest]>("switchTrack");
+/** The requester starts the design session again from the current plan (R-14). */
+export const freshSessionSignal = defineSignal<[FreshSessionSignal]>("freshSession");
 
 const orch = proxyActivities<typeof Orchestration>({
   taskQueue: "orchestration",
@@ -102,6 +109,8 @@ interface ProgressItem {
 }
 
 const clip = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`);
+/** "Title:" and one "- item" line per item; nothing when there are no items. */
+const bullets = (title: string, items: string[]) => (items.length ? [`${title}:`, ...items.map((i) => `- ${i}`)] : []);
 const slug = (r: RepoRef) => `${r.owner}/${r.name}`;
 
 /** The message of the failure at the bottom of a chain of workflow, activity and application failures. */
@@ -109,6 +118,50 @@ function rootMessage(err: unknown): string {
   let current: unknown = err;
   for (let depth = 0; depth < 8 && current instanceof Error && current.cause instanceof Error; depth++) current = current.cause;
   return current instanceof Error ? current.message : String(current);
+}
+
+/** The type of the application failure at the bottom of a chain of workflow, activity and application failures. */
+function failureType(err: unknown): string | undefined {
+  let current: unknown = err;
+  for (let depth = 0; depth < 8 && current instanceof Error; depth++) {
+    if (current instanceof ApplicationFailure && current.type) return current.type;
+    current = current.cause;
+  }
+  return undefined;
+}
+
+/** A step that failed because of the model provider (rate limit, overload, outage, network) is worth waiting out (§18). */
+const PROVIDER_TROUBLE =
+  /\b(429|5\d\d)\b|rate.?limit|overloaded|too many requests|temporarily unavailable|service unavailable|timed? ?out|ECONNRESET|ETIMEDOUT|ECONNREFUSED|socket hang up|fetch failed|network error/i;
+const describeWait = (seconds: number) => (seconds < 90 ? `${seconds} seconds` : `${Math.round(seconds / 60)} minutes`);
+
+/**
+ * Runs an agent step until it succeeds or its chances are used up. Trouble with the model provider is waited out
+ * with growing pauses (`waits`, in seconds); any other failure gets one more try when `retryOnce` is set.
+ */
+async function stepWithRetries(
+  run: (attempt: number) => Promise<{ stepId: string; result: StepResult }>,
+  opts: { waits: number[]; retryOnce: boolean; onWait: (seconds: number, n: number) => Promise<void>; onRetry: () => Promise<void> },
+): Promise<{ stepId: string; result: StepResult }> {
+  let waited = 0;
+  let retried = false;
+  for (let attempt = 1; ; attempt++) {
+    const outcome = await run(attempt);
+    if (outcome.result.status === "succeeded") return outcome;
+    const error = `${outcome.result.error ?? ""} ${outcome.result.summary}`;
+    if (PROVIDER_TROUBLE.test(error) && waited < opts.waits.length) {
+      const seconds = opts.waits[waited++]!;
+      await opts.onWait(seconds, waited);
+      await sleep(seconds * 1000);
+      continue;
+    }
+    if (opts.retryOnce && !retried) {
+      retried = true;
+      await opts.onRetry();
+      continue;
+    }
+    return outcome;
+  }
 }
 
 /**
@@ -156,6 +209,8 @@ export interface SubTaskInput {
   mergeAfter: DependencyRef[];
   maxFixRounds: number;
   prPollSeconds: number;
+  /** Pauses, in seconds, before a step that failed because of the model provider is tried again. */
+  modelRetrySeconds: number[];
 }
 
 export interface SubTaskResult {
@@ -163,6 +218,8 @@ export interface SubTaskResult {
   /** Why, in words for the requester. */
   note?: string;
   progress: ProgressItem[];
+  /** For a switch to the guided track: who asked for it and why (FR-A3). */
+  switch?: { by: string; reason: string };
 }
 
 export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResult> {
@@ -177,6 +234,26 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
   let conversationId = input.runConversationId;
   let runState: RunState = "executing";
   let stepCounter = 0;
+
+  // A switch to the guided track stops the work at once, as long as nothing has been pushed (FR-A3).
+  const building = new CancellationScope();
+  let publishing = false;
+  let switched: TrackRequest | null = null;
+  setHandler(switchTrackSignal, async (request) => {
+    if (switched) return;
+    if (publishing || request.track !== "guided") {
+      await orch.postNotice({
+        runId,
+        conversationId,
+        noticeKey: `track-refused-${key}`,
+        level: "warning",
+        text: "The change is already being published: the track can no longer be switched.",
+      });
+      return;
+    }
+    switched = request;
+    building.cancel();
+  });
   /** The commit the sub-task's own change starts from, and the commit that holds it. */
   let baseCommit = "";
   let headCommit = "";
@@ -258,6 +335,44 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
     }
   };
 
+  /** An agent step with the retries of §18: the model provider waited out, any other failure tried once more. */
+  const attemptStep = (kind: StepKind, title: string, extra: Parameters<typeof runStep>[2]) =>
+    stepWithRetries((n) => runStep(kind, n === 1 ? title : `${title} (attempt ${n})`, extra), {
+      waits: input.modelRetrySeconds,
+      retryOnce: true,
+      onWait: async (seconds, n) => {
+        await emit("step.retry_scheduled", { subtask: key, kind, reason: "model provider", waitSeconds: seconds, retry: n });
+        await pushProgress(`Waiting for the model provider: trying again in ${describeWait(seconds)}`);
+      },
+      onRetry: () => pushProgress(kind === "review" ? "Retrying the review" : "Retrying the implementation"),
+    });
+
+  /**
+   * The token cannot reach the repository (AD-42): the sub-task waits for the requester, who fixes the access and
+   * retries, or cancels. Nothing that needs the access has happened yet.
+   */
+  const askBlocked = async (what: string, problems: string[]): Promise<"retry" | "cancel"> => {
+    await setState("awaiting_decision", "awaiting_approval", `Blocked: cannot ${what}`);
+    const { approvalId } = await orch.requestBlockedDecision({ runId, key, conversationId, what, problems });
+    await emit("access.blocked", { subtask: key, approvalId, what, problems });
+    const decision = await waitForApproval(approvalId);
+    await emit("access.decided", { subtask: key, approvalId, decision: decision.decision });
+    return decision.decision === "cancel" ? "cancel" : "retry";
+  };
+
+  /** A publishing step that the token may be refused: the sub-task then waits for the requester instead of failing. */
+  const withAccess = async <T>(what: string, fn: () => Promise<T>): Promise<T | "cancel"> => {
+    for (;;) {
+      try {
+        return await fn();
+      } catch (err) {
+        if (failureType(err) !== "AccessDenied") throw err;
+        if ((await askBlocked(what, [rootMessage(err)])) === "cancel") return "cancel";
+        await setState("publishing", "publishing", "Publishing the change");
+      }
+    }
+  };
+
   /** Ends the sub-task without a merged pull request: its state, its open decisions and the steps still running. */
   const end = async (status: SubTaskResult["status"], state: SubtaskState, note: string): Promise<SubTaskResult> => {
     for (const p of progress) if (p.status === "running") p.status = state === "dropped" ? "skipped" : "failed";
@@ -334,7 +449,14 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
     } else if (updated.status === "merged") {
       headCommit = updated.headCommit;
       await orch.patchSubtask({ runId, key, patch: { headCommit } });
-      if (push) await integ.pushBranch({ runId, subtaskKey: key, repo, branch });
+      if (push) {
+        try {
+          await integ.pushBranch({ runId, subtaskKey: key, repo, branch });
+        } catch (err) {
+          if (failureType(err) !== "AccessDenied") throw err;
+          await warn("uptodate-push", `The branch ${branch} was brought up to date, but it could not be pushed: ${rootMessage(err)}`);
+        }
+      }
     }
   };
 
@@ -367,14 +489,20 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
     baseCommit = prepared.baseCommit;
     await orch.patchSubtask({ runId, key, patch: { baseCommit } });
 
+    // Before any agent works on it: the token must be able to push to the repository (AD-42).
+    for (;;) {
+      const access = await integ.checkAccess({ repositories: [slug(repo)] });
+      if (!access.problems.length) break;
+      await emit("access.checked", { subtask: key, problems: access.problems.length });
+      if ((await askBlocked(`push to ${slug(repo)}`, access.problems.map((p) => p.problem))) === "cancel") {
+        return end("cancelled_by_requester", "cancelled", `Cancelled by your decision: the token cannot push to ${slug(repo)}; nothing was built.`);
+      }
+    }
+
     // Implementation in a sandbox, on the sub-task's own branch.
     setProgress("Implementation", "running");
     await setState("implementing", "executing", "Implementing");
-    let attempt = await runStep("implement", `Implement: ${subtask.title}`, { round: 0 });
-    if (attempt.result.status !== "succeeded") {
-      await pushProgress("Retrying the implementation");
-      attempt = await runStep("implement", `Implement: ${subtask.title} (retry)`, { round: 0 });
-    }
+    const attempt = await attemptStep("implement", `Implement: ${subtask.title}`, { round: 0 });
     if (attempt.result.status !== "succeeded") throw ApplicationFailure.nonRetryable(`The implementation failed: ${attempt.result.error ?? attempt.result.summary}`);
     await steps.applyStepResult({ runId, subtaskKey: key, stepId: attempt.stepId, branch });
     let summary = attempt.result.summary;
@@ -401,7 +529,7 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       for (;;) {
         setProgress("AI review", "running");
         await setState("reviewing", "reviewing", round ? `AI review (round ${round + 1})` : "AI review");
-        const reviewed = await runStep("review", round ? `Review (round ${round + 1})` : "Review", {
+        const reviewed = await attemptStep("review", round ? `Review (round ${round + 1})` : "Review", {
           round,
           findings: earlier,
           implementerSummary: summary,
@@ -443,7 +571,7 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
         setProgress("Implementation", "running");
         await setState("implementing", "executing", `Fixing the review findings (round ${fixRounds})`);
         await emit("review.fix_requested", { subtask: key, round: fixRounds, findings: outcome.toFix.length });
-        const fix = await runStep("implement", `Fix round ${fixRounds}: ${subtask.title}`, { round, findings: outcome.toFix, guidance });
+        const fix = await attemptStep("implement", `Fix round ${fixRounds}: ${subtask.title}`, { round, findings: outcome.toFix, guidance });
         if (fix.result.status !== "succeeded") throw ApplicationFailure.nonRetryable(`Fix round ${fixRounds} failed: ${fix.result.error ?? fix.result.summary}`);
         await steps.applyStepResult({ runId, subtaskKey: key, stepId: fix.stepId, branch });
         await orch.patchSubtask({ runId, key, patch: { fixRounds } });
@@ -484,7 +612,10 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
         await emit("track.limits_exceeded", { subtask: key, approvalId, reasons: inspection.limits });
         const decision = await waitForApproval(approvalId);
         await emit("track.limits_decided", { subtask: key, approvalId, decision: decision.decision });
-        if (decision.decision === "guided") return end("switch_to_guided", "cancelled", "Switched to the guided track; the fast-track change was set aside and nothing was pushed.");
+        if (decision.decision === "guided") {
+          const ended = await end("switch_to_guided", "cancelled", "Switched to the guided track; the fast-track change was set aside and nothing was pushed.");
+          return { ...ended, switch: { by: workItem.requester.login, reason: "The change exceeded the fast-track limits" } };
+        }
         if (decision.decision === "cancel") return end("cancelled_by_requester", "cancelled", "Cancelled by your decision; nothing was pushed.");
       }
       // A branch the requester takes over is theirs to judge: no check of the change here.
@@ -536,7 +667,7 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       setProgress("AI review", "pending");
       setProgress("Implementation", "running");
       await setState("implementing", "executing", "Making the changes you asked for");
-      const changed = await runStep("implement", `Changes requested (${checkRounds}): ${subtask.title}`, { round, findings: [], guidance: decision.feedback });
+      const changed = await attemptStep("implement", `Changes requested (${checkRounds}): ${subtask.title}`, { round, findings: [], guidance: decision.feedback });
       if (changed.result.status !== "succeeded") throw ApplicationFailure.nonRetryable(`The requested changes failed: ${changed.result.error ?? changed.result.summary}`);
       await steps.applyStepResult({ runId, subtaskKey: key, stepId: changed.stepId, branch });
       summary = changed.result.summary;
@@ -568,7 +699,11 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
       if ((await integ.getPullRequestState({ repo, number: input.stackedOn.prNumber })) === "merged") await bringUpToDate(false);
       else stacked = input.stackedOn;
     }
-    await integ.pushBranch({ runId, subtaskKey: key, repo, branch });
+    // From here on the change leaves the orchestrator: the track can no longer be switched.
+    publishing = true;
+    if ((await withAccess(`push the branch to ${slug(repo)}`, () => integ.pushBranch({ runId, subtaskKey: key, repo, branch }))) === "cancel") {
+      return end("cancelled_by_requester", "cancelled", "Cancelled by your decision: the branch could not be pushed.");
+    }
     await emit("scm.branch_pushed", { subtask: key, repository: slug(repo), branch });
     if (!openPullRequest) {
       // Take over: the branch is the requester's to continue; no pull request is opened.
@@ -576,13 +711,16 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
     }
 
     const title = total > 1 ? `[agent] ${workItem.title} (${input.index + 1}/${total}): ${subtask.title}` : `[agent] ${workItem.title}`;
-    const pr = await integ.openPullRequest({
-      repo,
-      branch,
-      base: stacked ? stacked.branch : input.defaultBranch,
-      title: clip(title, 250),
-      body: pullRequestBody(review, verification, fixRounds, unresolved, stacked),
-    });
+    const pr = await withAccess(`open the pull request in ${slug(repo)}`, () =>
+      integ.openPullRequest({
+        repo,
+        branch,
+        base: stacked ? stacked.branch : input.defaultBranch,
+        title: clip(title, 250),
+        body: pullRequestBody(review, verification, fixRounds, unresolved, stacked),
+      }),
+    );
+    if (pr === "cancel") return end("cancelled_by_requester", "cancelled", `Cancelled by your decision: the branch ${branch} was pushed, but no pull request was opened.`);
     await orch.patchSubtask({ runId, key, patch: { prNumber: pr.number, prUrl: pr.url } });
     await emit(
       "scm.pr_opened",
@@ -656,8 +794,17 @@ export async function subTaskWorkflow(input: SubTaskInput): Promise<SubTaskResul
   };
 
   try {
-    return await body();
+    return await building.run(body);
   } catch (err) {
+    // Set by the signal handler, which the compiler cannot see from here.
+    const request = switched as TrackRequest | null;
+    if (isCancellation(err) && request && !CancellationScope.current().consideredCancelled) {
+      // The requester switched to the guided track before anything was pushed (FR-A3).
+      return CancellationScope.nonCancellable(async () => {
+        const ended = await end("switch_to_guided", "cancelled", `Switched to the guided track by @${request.by}; the change was set aside and nothing was pushed.`);
+        return { ...ended, switch: { by: request.by, reason: request.reason ?? "" } };
+      });
+    }
     if (isCancellation(err)) {
       // The run was cancelled or stopped: record it, then let the cancellation reach the run workflow.
       await CancellationScope.nonCancellable(async () => {
@@ -686,21 +833,50 @@ export interface DesignSessionInput {
   idleSeconds: number;
 }
 
-export interface DesignSessionResult {
-  plan: HandoffPlan;
-  version: number;
-  /** Keys of the sub-tasks in the order they are built. */
-  order: string[];
-}
+export type DesignSessionResult =
+  | {
+      kind: "approved";
+      plan: HandoffPlan;
+      version: number;
+      /** Keys of the sub-tasks in the order they are built. */
+      order: string[];
+    }
+  | {
+      /** The requester switched to the fast track before approving a plan (FR-A3). */
+      kind: "switched";
+      by: string;
+      reason: string;
+      /** The latest plan version, collapsed into one change by the run; null when the architect had not written one. */
+      plan: HandoffPlan | null;
+      version: number | null;
+      /** The one repository the work stays in. */
+      repository: string;
+    };
+
+/** The repositories a plan changes, each once. */
+const planRepositories = (plan: HandoffPlan) => {
+  const seen = new Map<string, string>();
+  for (const st of plan.subtasks) if (!seen.has(st.repository.toLowerCase())) seen.set(st.repository.toLowerCase(), st.repository);
+  return [...seen.values()];
+};
 
 export async function designSessionWorkflow(input: DesignSessionInput): Promise<DesignSessionResult> {
   const { runId, conversationId } = input;
   const startedAt = Date.now();
-  const emit = eventWriter(runId, "design");
+  // A run can come back to the design session (guided, fast, guided again): turns and events of each session are its own.
+  // The random end of the run ID: its start is a timestamp, the same for sessions started close together.
+  const session_ = workflowInfo().runId.replace(/-/g, "").slice(-12);
+  const emit = eventWriter(runId, `design-${session_}`);
   const queue: RequesterMessageSignal[] = [];
   const approvals = new Map<string, ApprovalSignal>();
+  const switches: TrackRequest[] = [];
+  const freshStarts: FreshSessionSignal[] = [];
   setHandler(requesterMessageSignal, (m) => void queue.push(m));
   setHandler(approvalSignal, (s) => void approvals.set(s.approvalId, s));
+  setHandler(switchTrackSignal, (r) => void switches.push(r));
+  setHandler(freshSessionSignal, (r) => void freshStarts.push(r));
+  let noticeCounter = 0;
+  const notice = (level: "info" | "warning", text: string) => orch.postNotice({ runId, conversationId, noticeKey: `design-${session_}-${++noticeCounter}`, level, text });
 
   let turnCounter = 0;
   let workspaceUp = false;
@@ -720,7 +896,7 @@ export async function designSessionWorkflow(input: DesignSessionInput): Promise<
    * then record the reply and what it did to the plan. A lost workspace is replaced and gets the same turn.
    */
   const turn = async (messages: RequesterMessageSignal[]) => {
-    const turnInput: DesignTurnInput = { turnId: `${runId}-t${++turnCounter}`, opening: messages.length === 0, messages: messages.map((m) => m.text) };
+    const turnInput: DesignTurnInput = { turnId: `${runId}-${session_}-t${++turnCounter}`, opening: messages.length === 0, messages: messages.map((m) => m.text) };
     let result: DesignTurnResult | undefined;
     let lost = "";
     for (let attempt = 1; attempt <= 3 && !result; attempt++) {
@@ -746,7 +922,21 @@ export async function designSessionWorkflow(input: DesignSessionInput): Promise<
     }
     result ??= { turnId: turnInput.turnId, status: "failed", text: "", components: [], proposed: false, session: "continued", error: lost || "The design session workspace was lost" };
 
-    const recorded = await orch.recordDesignTurn({ runId, conversationId, turn: turnInput, result });
+    // A plan is put up for approval only when the token can push to every repository in it (AD-42).
+    let accessProblems: string[] = [];
+    if (result.status === "succeeded" && result.proposed) {
+      const plan = result.plan ?? (await orch.latestPlan({ runId }))?.plan;
+      if (plan) {
+        const access = await integ.checkAccess({ repositories: planRepositories(plan) });
+        accessProblems = access.problems.map((p) => p.problem);
+        if (accessProblems.length) {
+          result = { ...result, proposed: false };
+          await emit("access.plan_refused", { problems: accessProblems });
+        }
+      }
+    }
+
+    const recorded = await orch.recordDesignTurn({ runId, conversationId, turn: turnInput, result, accessProblems });
     await emit("design.turn_completed", { turn: turnCounter, status: result.status, session: result.session });
     if (recorded.created) {
       version = recorded.version;
@@ -773,7 +963,7 @@ export async function designSessionWorkflow(input: DesignSessionInput): Promise<
     for (;;) {
       const approved = () => pendingApproval !== null && approvals.get(pendingApproval)?.decision === "approve";
       const idleLeft = Math.max(1000, lastTurnAt + input.idleSeconds * 1000 - Date.now());
-      const woke = await condition(() => queue.length > 0 || approved(), workspaceUp ? idleLeft : "1 day");
+      const woke = await condition(() => queue.length > 0 || approved() || switches.length > 0 || freshStarts.length > 0, workspaceUp ? idleLeft : "1 day");
       if (!woke) {
         if (workspaceUp) {
           // Silence: the session is saved and its workspace shut down; the next message restores it (AD-34).
@@ -784,12 +974,49 @@ export async function designSessionWorkflow(input: DesignSessionInput): Promise<
         }
         continue;
       }
+      if (switches.length) {
+        // The requester switches to the fast track (FR-A3): only before the approval, and with one repository.
+        const request = switches.shift()!;
+        if (request.track !== "fast") {
+          await notice("info", "The run is already on the guided track.");
+          continue;
+        }
+        const latest = await orch.latestPlan({ runId });
+        const repositories = latest ? planRepositories(latest.plan) : input.repositories;
+        if (repositories.length !== 1) {
+          await emit("track.switch_refused", { to: "fast", repositories });
+          await notice(
+            "warning",
+            `The fast track needs the work to stay in one repository, and ${latest ? `the current plan (version ${latest.version})` : "the analysis"} involves ${repositories.length}: ${repositories.join(", ")}. Ask the architect to keep it to one repository, or stay on the guided track.`,
+          );
+          continue;
+        }
+        await release("close");
+        // A plan that was put up for approval is not approved now; its card says so.
+        await orch.closeOutApprovals({ runId });
+        await emit("design.closed", { switchedTo: "fast", by: request.by });
+        return { kind: "switched", by: request.by, reason: request.reason ?? "", plan: latest?.plan ?? null, version: latest?.version ?? null, repository: repositories[0]! };
+      }
+      if (freshStarts.length) {
+        // The session starts again from the current plan, without the conversation before it (R-14 fallback).
+        const request = freshStarts.splice(0, freshStarts.length)[0]!;
+        const restarted = await steps.restartDesignSession({ runId });
+        if (restarted.stepId) await workspaces.destroyWorkspace({ stepId: restarted.stepId });
+        workspaceUp = false;
+        await emit("design.restarted", { by: request.by });
+        await notice(
+          "info",
+          "The design session starts afresh with your next message: the architect gets the analysis and the current plan, not the conversation before this point.",
+        );
+        continue;
+      }
       if (approved() && queue.length === 0) {
         const approvedVersion = version!;
         await release("close");
         const final = await orch.finalizePlan({ runId, conversationId, version: approvedVersion });
         await emit("design.closed", { version: approvedVersion });
-        return { plan: final.plan, version: approvedVersion, order: final.order };
+        if (final.productsChanged) await emit("products.identified", { products: final.products, source: "plan" }, { products: final.products });
+        return { kind: "approved", plan: final.plan, version: approvedVersion, order: final.order };
       }
       // Messages that arrived while the architect was busy are answered together, as one turn.
       await turn(queue.splice(0, queue.length));
@@ -829,6 +1056,9 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
   const children: Promise<unknown>[] = [];
   const published = new Map<string, SubtaskPublishedSignal>();
   setHandler(subtaskPublishedSignal, (p) => void published.set(p.key, p));
+  // Requests to switch the track (FR-A3): the run passes each one to the change or the design session going on.
+  const trackRequests: TrackRequest[] = [];
+  setHandler(changeTrackSignal, (r) => void trackRequests.push(r));
   setHandler(approvalSignal, (s) => void approvals.set(s.approvalId, s));
   setHandler(answerSignal, (s) => void answers.set(s.approvalId, s));
   setHandler(cancelSignal, (s) => {
@@ -975,7 +1205,16 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
       if (attempt > 5) throw ApplicationFailure.nonRetryable("The analysis did not converge after 5 attempts");
       setProgress("Analysis", "running");
       await setState("analysing", attempt === 1 ? "Analysing the work item" : "Analysing again with your answers");
-      const { result } = await runStep("analyse", attempt === 1 ? "Analysis" : `Analysis (round ${attempt})`, { primaryRepo: repo, questionRounds });
+      const title = attempt === 1 ? "Analysis" : `Analysis (round ${attempt})`;
+      const { result } = await stepWithRetries((n) => runStep("analyse", n === 1 ? title : `${title} (attempt ${n})`, { primaryRepo: repo, questionRounds }), {
+        waits: init.settings.modelRetrySeconds,
+        retryOnce: true,
+        onWait: async (seconds, n) => {
+          await emit("step.retry_scheduled", { kind: "analyse", reason: "model provider", waitSeconds: seconds, retry: n });
+          await pushProgress(`Waiting for the model provider: trying again in ${describeWait(seconds)}`);
+        },
+        onRetry: () => pushProgress("Retrying the analysis"),
+      });
       if (result.status !== "succeeded" || !result.analysis) throw ApplicationFailure.nonRetryable(`The analysis failed: ${result.error ?? result.summary}`);
       if (!result.analysis.ready) {
         const questions = result.analysis.questions;
@@ -1067,6 +1306,7 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
               mergeAfter: opts.mergeAfter ?? [],
               maxFixRounds: init.settings.maxFixRounds,
               prPollSeconds,
+              modelRetrySeconds: init.settings.modelRetrySeconds,
             },
           ],
         }),
@@ -1077,46 +1317,159 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
       return { result };
     };
 
-    // The rules allow the fast track only for one repository; anything else is designed first.
-    if (track === "fast" && repositories.length === 1) {
-      // Fast track (FR-P6, FR-R5): the analyst's approach is the plan and nobody has to approve it.
-      // One change: implemented, reviewed by the reviewer agent, checked against the fast-track limits, published.
-      const plan: Plan = {
-        summary: clip(analysis.approach || analysis.understanding, 2000),
-        subtasks: [
-          {
-            title: clip(workItem.title.length >= 3 ? workItem.title : `Change for #${workItem.number}`, 200),
-            description: [analysis.understanding, analysis.approach ? `Approach: ${analysis.approach}` : ""].filter(Boolean).join("\n\n"),
-            acceptanceCriteria: analysis.acceptanceCriteria,
-          },
-        ],
-      };
-      await emit("plan.derived", { subtasks: 1 }, { plan });
-      state = "executing";
-      const change = await startSubtask(plan, 0, { key: "change", repo: repoOf(repositories[0]!), branchSuffix: "", ownConversation: false, closesIssue: true, prefix: progress, diffCheck: false });
-      const result = await change.result;
-      progress = result.progress;
-      if (result.status === "merged") return finish("completed", "Pull request merged. Done.", "success");
-      if (result.status === "closed") return finish("closed", result.note ?? "Pull request closed without merging.", "info");
-      if (result.status === "handed_over") return finish("closed", result.note ?? "The branch was pushed without a pull request.", "info");
-      if (result.status === "cancelled_by_requester") return finish("cancelled", result.note ?? "Cancelled by your decision.", "warning");
-      if (result.status === "failed") throw ApplicationFailure.nonRetryable(result.note ?? "The change failed");
-      // The change turned out bigger than the fast track allows and the requester chose the guided track (FR-A2, FR-A3).
-      track = "guided";
-      progress = [{ title: "Analysis", status: "done" }];
-      await emit("track.changed", { track, reason: "The requester switched after the change exceeded the fast-track limits" }, { track });
-      await integ.setTrackLabel({ repo, number: workItem.number, track });
-    }
-    track = "guided";
+    /** Waits for a child's result; requests to switch the track are passed on to it meanwhile, and it decides. */
+    const awaitPassingSwitches = async <T>(result: Promise<T>, passOn: (request: TrackRequest) => Promise<void>): Promise<T> => {
+      let done = false;
+      let failed = false;
+      let value: T | undefined;
+      let error: unknown;
+      void result.then(
+        (v) => {
+          done = true;
+          value = v;
+        },
+        (e: unknown) => {
+          done = true;
+          failed = true;
+          error = e;
+        },
+      );
+      for (;;) {
+        await condition(() => done || trackRequests.length > 0);
+        while (!done && trackRequests.length) await passOn(trackRequests.shift()!);
+        if (done) {
+          if (failed) throw error;
+          return value as T;
+        }
+      }
+    };
 
-    // Guided track (FR-P1 to FR-P4): the architect agent and the requester shape the hand-off plan in the
-    // run's conversation; nothing is built until the requester approves a plan version.
-    progress.push({ title: "Design session", status: "running" }, { title: "Plan approval", status: "pending" });
-    await setState("designing", "Design session with the architect agent");
-    const design = await executeChild(designSessionWorkflow, {
-      workflowId: `design:${runId}`,
-      args: [{ runId, workItem, analysis, repositories, conversationId, idleSeconds: init.settings.designIdleSeconds }],
+    let trackChanges = 0;
+    /** Records a switch of the track: who asked for it and why, in the timeline, on the ticket and in the conversation (FR-A3). */
+    const changeTrack = async (to: Track, by: string, reason: string) => {
+      const from = track;
+      track = to;
+      trackChanges++;
+      await emit("track.changed", { track: to, from, by, reason }, { track: to });
+      await integ.setTrackLabel({ repo, number: workItem.number, track: to });
+      await integ.commentOnIssue({
+        repo,
+        number: workItem.number,
+        key: `run=${runId}:track=${trackChanges}`,
+        body: `🤖 Track changed to **${to}** by @${by}${reason ? `: ${reason}` : "."}`,
+      });
+      await orch.postNotice({
+        runId,
+        conversationId,
+        noticeKey: `track-${trackChanges}`,
+        level: "info",
+        text: `Switched to the ${to} track by @${by}${reason ? ` (${reason})` : ""}. ${
+          to === "guided"
+            ? "A design session with the architect agent starts from the analysis."
+            : "The plan becomes one change, built and reviewed with no stops before the pull request."
+        }`,
+      });
+    };
+    const notOnTrack = (current: Track) =>
+      orch.postNotice({ runId, conversationId, noticeKey: `track-same-${trackChanges}-${trackRequests.length}`, level: "info", text: `The run is already on the ${current} track.` });
+
+    /** Fast track: the analyst's approach is the plan and nobody has to approve it (FR-P6, FR-R5). */
+    const fromAnalysis = (): Plan => ({
+      summary: clip(analysis.approach || analysis.understanding, 2000),
+      subtasks: [
+        {
+          title: clip(workItem.title.length >= 3 ? workItem.title : `Change for #${workItem.number}`, 200),
+          description: [analysis.understanding, analysis.approach ? `Approach: ${analysis.approach}` : ""].filter(Boolean).join("\n\n"),
+          acceptanceCriteria: analysis.acceptanceCriteria,
+        },
+      ],
     });
+    /** A hand-off plan made into one change, when the requester switches it to the fast track (FR-A3). */
+    const collapse = (handoff: HandoffPlan): Plan => ({
+      summary: clip(
+        [`Goal: ${handoff.goal}`, `Approach: ${handoff.approach}`, ...bullets("Constraints", handoff.constraints), ...bullets("Out of scope", handoff.outOfScope)].join("\n"),
+        8000,
+      ),
+      subtasks: [
+        {
+          title: clip(workItem.title.length >= 3 ? workItem.title : `Change for #${workItem.number}`, 200),
+          description: clip(
+            [
+              handoff.goal,
+              "",
+              "Make these changes, as one change:",
+              ...handoff.subtasks.map((st, i) => `${i + 1}. ${st.title}: ${st.description}`),
+              ...bullets("Likely files", [...new Set(handoff.subtasks.flatMap((st) => st.likelyFiles))]),
+            ].join("\n"),
+            8000,
+          ),
+          acceptanceCriteria: [...new Set(handoff.subtasks.flatMap((st) => st.acceptanceCriteria))],
+        },
+      ],
+    });
+
+    // The rules allow the fast track only for one repository; anything else is designed first. The requester can
+    // switch the track while it is allowed (FR-A3): the run goes back and forth until a plan is approved, or ends.
+    let fastPlan: Plan | null = null;
+    let fastRepository: string | null = repositories.length === 1 ? repositories[0]! : null;
+    let fastAttempts = 0;
+    if (track === "fast" && !fastRepository) track = "guided";
+    let design: Extract<DesignSessionResult, { kind: "approved" }> | null = null;
+    while (!design) {
+      if (track === "fast") {
+        // One change: implemented, reviewed by the reviewer agent, checked against the fast-track limits, published.
+        fastAttempts++;
+        const key = fastAttempts === 1 ? "change" : `change-${fastAttempts}`;
+        const plan = fastPlan ?? fromAnalysis();
+        await emit("plan.derived", { subtasks: 1, from: fastPlan ? "plan" : "analysis" }, { plan });
+        state = "executing";
+        const change = await startSubtask(plan, 0, {
+          key,
+          repo: repoOf(fastRepository!),
+          branchSuffix: fastAttempts === 1 ? "" : `-${fastAttempts}`,
+          ownConversation: false,
+          closesIssue: true,
+          prefix: progress,
+          diffCheck: false,
+        });
+        const result = await awaitPassingSwitches(change.result, async (request) => {
+          if (request.track !== "guided") return void (await notOnTrack("fast"));
+          await getExternalWorkflowHandle(`subtask:${runId}:${key}`).signal(switchTrackSignal, request);
+        });
+        progress = result.progress;
+        if (result.status === "merged") return finish("completed", "Pull request merged. Done.", "success");
+        if (result.status === "closed") return finish("closed", result.note ?? "Pull request closed without merging.", "info");
+        if (result.status === "handed_over") return finish("closed", result.note ?? "The branch was pushed without a pull request.", "info");
+        if (result.status === "cancelled_by_requester") return finish("cancelled", result.note ?? "Cancelled by your decision.", "warning");
+        if (result.status === "failed") throw ApplicationFailure.nonRetryable(result.note ?? "The change failed");
+        // To the guided track: asked by the requester, or chosen when the change exceeded the fast-track limits (FR-A2, FR-A3).
+        progress = [{ title: "Analysis", status: "done" }];
+        await changeTrack("guided", result.switch?.by ?? workItem.requester.login, result.switch?.reason ?? "");
+        continue;
+      }
+
+      // Guided track (FR-P1 to FR-P4): the architect agent and the requester shape the hand-off plan in the
+      // run's conversation; nothing is built until the requester approves a plan version.
+      progress.push({ title: "Design session", status: "running" }, { title: "Plan approval", status: "pending" });
+      await setState("designing", "Design session with the architect agent");
+      const session = await startChild(designSessionWorkflow, {
+        workflowId: `design:${runId}`,
+        args: [{ runId, workItem, analysis, repositories, conversationId, idleSeconds: init.settings.designIdleSeconds }],
+      });
+      const outcome = await awaitPassingSwitches(session.result(), async (request) => {
+        if (request.track !== "fast") return void (await notOnTrack("guided"));
+        await session.signal(switchTrackSignal, request);
+      });
+      if (outcome.kind === "approved") {
+        design = outcome;
+        break;
+      }
+      // To the fast track: the latest plan version, if any, becomes the one change (FR-A3).
+      fastPlan = outcome.plan ? collapse(outcome.plan) : null;
+      fastRepository = outcome.repository;
+      progress = progress.filter((p) => p.title !== "Design session" && p.title !== "Plan approval");
+      await changeTrack("fast", outcome.by, outcome.reason);
+    }
     setProgress("Design session", "done");
     setProgress("Plan approval", "done");
 
@@ -1124,15 +1477,14 @@ export async function deliveryRunWorkflow(input: DeliveryRunInput): Promise<RunS
     const handoff = design.plan;
     const ordered = design.order.map((k) => handoff.subtasks.find((st) => st.key === k)!);
     const titleOf = (k: string) => handoff.subtasks.find((st) => st.key === k)?.title ?? k;
-    const list = (title: string, items: string[]) => (items.length ? [`${title}:`, ...items.map((i) => `- ${i}`)] : []);
     const plan: Plan = {
       summary: clip(
         [
           `Goal: ${handoff.goal}`,
           `Approach: ${handoff.approach}`,
-          ...list("Constraints", handoff.constraints),
-          ...list("Out of scope", handoff.outOfScope),
-          ...list(
+          ...bullets("Constraints", handoff.constraints),
+          ...bullets("Out of scope", handoff.outOfScope),
+          ...bullets(
             "Contracts between products",
             handoff.contracts.map((c) => `${c.name}: ${c.description} (provided by: ${c.providers.map(titleOf).join(", ")}; used by: ${c.consumers.map(titleOf).join(", ")})`),
           ),

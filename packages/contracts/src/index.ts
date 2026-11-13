@@ -300,7 +300,7 @@ export type Subtask = z.infer<typeof Subtask>;
 
 export const Plan = z.object({
   summary: z.string().min(1).describe("One or two sentences describing the overall approach"),
-  subtasks: z.array(Subtask).min(1).max(8).describe("Ordered sub-tasks; each becomes one commit"),
+  subtasks: z.array(Subtask).min(1).max(20).describe("Ordered sub-tasks; each becomes one commit"),
 });
 export type Plan = z.infer<typeof Plan>;
 
@@ -809,6 +809,21 @@ export const ChangeCard = z.object({
   status: z.enum(["pending", "approved", "changes", "dropped", "expired"]),
   feedback: z.string().optional(),
 });
+/**
+ * A sub-task cannot go on because the token cannot reach a repository: no access, no write access, or rejected
+ * credentials (AD-42). The requester fixes the access and retries, or cancels.
+ */
+export const BlockedCard = z.object({
+  type: z.literal("blocked"),
+  runId: z.string(),
+  subtaskKey: z.string(),
+  approvalId: z.string(),
+  hash: z.string(),
+  /** What could not be done, e.g. "push the branch to acme/web". */
+  what: z.string(),
+  problems: z.array(z.string()),
+  status: z.enum(["pending", "retry", "cancel", "expired"]),
+});
 /** A sub-task was not delivered and others that have not started depend on it: the requester decides (FR-R4). */
 export const DependentsCard = z.object({
   type: z.literal("dependents"),
@@ -869,6 +884,7 @@ export const OrchestratorCard = z.discriminatedUnion("type", [
   LimitsCard,
   ChangeCard,
   DependentsCard,
+  BlockedCard,
   StoryCard,
   PullRequestCard,
   NoticeCard,
@@ -889,6 +905,7 @@ export const SYSTEM_ONLY_TYPES = new Set<string>([
   "limits",
   "change",
   "dependents",
+  "blocked",
   "story",
   "pull_request",
   "notice",
@@ -1121,7 +1138,7 @@ export interface RunEventDto {
   occurredAt: string;
 }
 
-export type ApprovalKind = "plan" | "questions" | "risk" | "findings" | "limits" | "change" | "dependents";
+export type ApprovalKind = "plan" | "questions" | "risk" | "findings" | "limits" | "change" | "dependents" | "blocked";
 
 export interface ApprovalDto {
   id: string;
@@ -1185,6 +1202,23 @@ export type ChangeDecision = z.infer<typeof ChangeDecision>;
 export const DependentsDecision = z.object({ decision: z.enum(["drop", "build", "cancel"]), hash: z.string() });
 export type DependentsDecision = z.infer<typeof DependentsDecision>;
 
+/** A sub-task blocked by missing access: retry once the access is fixed, or cancel (AD-42). */
+export const BlockedDecision = z.object({ decision: z.enum(["retry", "cancel"]), hash: z.string() });
+export type BlockedDecision = z.infer<typeof BlockedDecision>;
+
+/** The requester switches the track of a run (FR-A3). The orchestrator decides whether it still can. */
+export const ChangeTrackRequest = z.object({ track: Track, reason: z.string().max(500).optional() });
+export type ChangeTrackRequest = z.infer<typeof ChangeTrackRequest>;
+
+/** Whether the track of a run can be switched now, and if not, why (FR-A3). */
+export interface TrackSwitchDto {
+  current: Track | null;
+  /** The track it can be switched to now, if any. */
+  to: Track | null;
+  /** Why it cannot be switched, when it is on a track but `to` is null. */
+  why: string | null;
+}
+
 export const QuestionAnswer = z.object({ answer: z.string().min(1).max(8000) });
 export type QuestionAnswer = z.infer<typeof QuestionAnswer>;
 
@@ -1212,7 +1246,7 @@ export interface DeliveryRunInput {
 }
 
 /** Memo set on runs started by this version; older executions are retired at worker start. */
-export const RUN_WORKFLOW_GENERATION = 5;
+export const RUN_WORKFLOW_GENERATION = 6;
 
 export const workflowIdForIssue = (repo: RepoRef, number: number) => `run:github:${repo.owner}/${repo.name}#${number}`;
 
@@ -1221,7 +1255,7 @@ export interface ApprovalSignal {
   approvalId: string;
   /**
    * Plan: approve. Risk: approve, reject. Findings: open, retry, take_over, cancel. Limits: continue, guided, cancel.
-   * Change: approve, changes, drop. Dependents: drop, build, cancel.
+   * Change: approve, changes, drop. Dependents: drop, build, cancel. Blocked: retry, cancel.
    */
   decision: "approve" | "changes" | "reject" | "open" | "retry" | "take_over" | "cancel" | "continue" | "guided" | "drop" | "build";
   feedback?: string;
@@ -1233,6 +1267,16 @@ export interface AnswerSignal {
 }
 export interface CancelSignal {
   reason: string;
+}
+/** A request of the requester to switch the track: to the run, which passes it to the work that is going on (FR-A3). */
+export interface TrackRequest {
+  track: Track;
+  by: string;
+  reason?: string;
+}
+/** Starts the design session again from the current plan, without the earlier conversation (R-14). */
+export interface FreshSessionSignal {
+  by: string;
 }
 /** Sent by a sub-task workflow to its run once its pull request is open: sub-tasks that depend on it can start (AD-41). */
 export interface SubtaskPublishedSignal {
@@ -1249,3 +1293,6 @@ export interface RequesterMessageSignal {
 }
 
 export const designWorkflowId = (runId: string) => `design:${runId}`;
+
+/** The single change of the fast track: "change", then "change-2" and so on when the run comes back to the fast track. */
+export const isFastTrackKey = (key: string) => /^change(-\d+)?$/.test(key);

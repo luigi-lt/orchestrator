@@ -9,18 +9,23 @@ import Fastify, { type FastifyReply } from "fastify";
 import { z } from "zod";
 import { config, errorMessage, log } from "@orch/common";
 import {
+  BlockedDecision,
   ChangeDecision,
+  ChangeTrackRequest,
   DependentsDecision,
   FindingsDecision,
   LimitsDecision,
   PlanDecision,
   QuestionAnswer,
   RiskDecision,
+  FINAL_RUN_STATES,
   catalogRepositories,
   designWorkflowId,
+  isFastTrackKey,
   type ApprovalKind,
   type Catalog,
   type OrchestratorCard,
+  type TrackSwitchDto,
 } from "@orch/contracts";
 import { GitHubClient } from "@orch/github";
 import {
@@ -30,9 +35,11 @@ import {
   getCard,
   getConversation,
   getDesignSession,
+  getLatestPlanVersion,
   getPreference,
   getRun,
   getRunWorkflowId,
+  architectRepliedSince,
   hasOpenDesignTurn,
   insertMessage,
   listPlanVersions,
@@ -169,6 +176,36 @@ async function main(): Promise<void> {
     return session && session.state !== "closed" ? session : null;
   };
 
+  /**
+   * Whether the requester can switch the track of a run now (FR-A3): fast → guided until the change is published,
+   * guided → fast until a plan is approved and only when the work stays in one repository. The workflow checks again.
+   */
+  const trackSwitchOf = async (runId: string): Promise<TrackSwitchDto | null> => {
+    const run = await getRun(db, runId);
+    if (!run?.track) return null;
+    if (FINAL_RUN_STATES.includes(run.state)) return { current: run.track, to: null, why: "The run has ended." };
+    if (run.track === "fast") {
+      const change = (await listSubtasks(db, runId)).filter((st) => isFastTrackKey(st.key)).pop();
+      const published = !!change && (change.prNumber !== null || ["pr_open", "merged", "closed", "handed_over"].includes(change.state));
+      return published ? { current: "fast", to: null, why: "The pull request is open: the track can no longer be switched." } : { current: "fast", to: "guided", why: null };
+    }
+    const plans = await listPlanVersions(db, runId);
+    if (plans.some((v) => v.status === "approved")) return { current: "guided", to: null, why: "The plan is approved: the work stays on the guided track." };
+    if (run.state !== "designing" && run.state !== "awaiting_approval") return { current: "guided", to: null, why: null };
+    const latest = plans[plans.length - 1];
+    const repositories = new Set(
+      (latest ? latest.plan.subtasks.map((st) => st.repository) : (run.analysis?.products ?? []).flatMap((p) => p.repositories)).map((r) => r.toLowerCase()),
+    );
+    if (repositories.size !== 1) {
+      return {
+        current: "guided",
+        to: null,
+        why: `The fast track needs the work to stay in one repository; ${latest ? "the current plan" : "the analysis"} involves ${repositories.size}.`,
+      };
+    }
+    return { current: "guided", to: "fast", why: null };
+  };
+
   const toArchitect = async (conversationId: string, runId: string, text: string) => {
     const message = await insertMessage(db, { conversationId, role: "user", text });
     const client = await temporal();
@@ -188,7 +225,17 @@ async function main(): Promise<void> {
       messages,
       busy: frontDoor.isBusy(req.params.id) || turnRunning,
       // Shown as a strip above the conversation: the requester is talking to the architect, and whether its workspace is up.
-      design: session ? { runId: session.runId, state: session.state, turnRunning } : null,
+      design: session
+        ? {
+            runId: session.runId,
+            state: session.state,
+            turnRunning,
+            // Started afresh from the current plan, and the architect has not answered since (R-14).
+            fresh: !!session.historySince && !(await architectRepliedSince(db, req.params.id, session.historySince)),
+          }
+        : null,
+      // The track of the run, and whether the requester can switch it now (FR-A3).
+      track: conversation.kind === "run" && conversation.focusedRunId ? await trackSwitchOf(conversation.focusedRunId) : null,
     };
   });
   app.post<{ Params: { id: string } }>("/api/conversations/:id/messages", async (req, reply) => {
@@ -311,6 +358,17 @@ async function main(): Promise<void> {
     return { ok: true };
   });
 
+  // A sub-task blocked by missing access: retry once the access is fixed, or cancel (AD-42).
+  app.post<{ Params: { id: string } }>("/api/approvals/:id/blocked", async (req) => {
+    const body = BlockedDecision.parse(req.body);
+    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "blocked");
+    if (body.hash !== approval.hash) throw new UserError("This card is out of date; reload and decide again");
+    await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
+    await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
+    await updateCard(conversationId, `run:${run.id}:blocked:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
+    return { ok: true };
+  });
+
   app.post<{ Params: { id: string } }>("/api/approvals/:id/answer", async (req) => {
     const body = QuestionAnswer.parse(req.body);
     const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "questions");
@@ -351,6 +409,29 @@ async function main(): Promise<void> {
       design: session ? { state: session.state, repositories: session.repositories.map((r) => `${r.repo.owner}/${r.repo.name}`) } : null,
     };
   });
+  // The requester switches the track (FR-A3). The run passes it on to the work going on, which decides whether it still can.
+  app.post<{ Params: { id: string } }>("/api/runs/:id/track", async (req, reply) => {
+    const body = ChangeTrackRequest.parse(req.body);
+    const now = await trackSwitchOf(req.params.id);
+    if (!now) throw new UserError("The run has no track yet: the analysis decides it first");
+    if (now.current === body.track) throw new UserError(`The run is already on the ${body.track} track`);
+    if (now.to !== body.track) throw new UserError(now.why ?? "The track cannot be switched now");
+    const workflowId = await getRunWorkflowId(db, req.params.id);
+    if (!workflowId) throw new UserError("Run not found");
+    await signalRun(services, workflowId, "changeTrack", { track: body.track, by: me.login, reason: body.reason?.trim() || undefined });
+    return reply.code(202).send({ accepted: true });
+  });
+
+  // Starts the design session again from the current plan, without the conversation before it (R-14).
+  app.post<{ Params: { id: string } }>("/api/runs/:id/fresh-session", async (req, reply) => {
+    const session = await getDesignSession(db, req.params.id);
+    if (!session || session.state === "closed") throw new UserError("There is no open design session");
+    if (!(await getLatestPlanVersion(db, req.params.id))) throw new UserError("The architect has not written a plan yet");
+    if (await hasOpenDesignTurn(db, req.params.id)) throw new UserError("The architect is still replying; try again when it has finished");
+    await signalRun(services, designWorkflowId(req.params.id), "freshSession", { by: me.login });
+    return reply.code(202).send({ accepted: true });
+  });
+
   // Every version of a run's plan, oldest first: earlier versions stay viewable (FR-P3).
   app.get<{ Params: { id: string } }>("/api/runs/:id/plans", async (req) => listPlanVersions(db, req.params.id));
   app.post<{ Params: { id: string } }>("/api/runs/:id/cancel", async (req) => {

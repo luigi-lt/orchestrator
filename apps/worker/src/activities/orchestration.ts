@@ -8,6 +8,7 @@ import {
   findCatalogProduct,
   findCatalogRepository,
   findingsToFix,
+  isFastTrackKey,
   mergeReview,
   repoSlug,
   sanitizeAgentComponents,
@@ -80,7 +81,7 @@ export async function initRun(input: {
   conversationId: string;
   homeProduct: string;
   catalogHash: string;
-  settings: { maxFixRounds: number; prPollSeconds: number; designIdleSeconds: number };
+  settings: { maxFixRounds: number; prPollSeconds: number; designIdleSeconds: number; modelRetrySeconds: number[] };
 }> {
   const { db } = ctx();
   const { runId, workItem } = input;
@@ -141,7 +142,13 @@ export async function initRun(input: {
       title: workItem.title,
     });
   }
-  return { conversationId, homeProduct, catalogHash, settings: { maxFixRounds: config.maxFixRounds(), prPollSeconds: config.prPollSeconds(), designIdleSeconds: config.designIdleSeconds() } };
+  return { conversationId, homeProduct, catalogHash, settings: {
+      maxFixRounds: config.maxFixRounds(),
+      prPollSeconds: config.prPollSeconds(),
+      designIdleSeconds: config.designIdleSeconds(),
+      modelRetrySeconds: config.modelRetrySeconds(),
+    },
+  };
 }
 
 /**
@@ -269,9 +276,23 @@ export async function recordDesignTurn(input: {
   conversationId: string;
   turn: DesignTurnInput;
   result: DesignTurnResult;
+  /** Why the plan could not be put up for approval: the token cannot push to some of its repositories (AD-42). */
+  accessProblems?: string[];
 }): Promise<{ version: number | null; created: boolean; changes: number; voidedApproval: boolean; proposedApprovalId: string | null }> {
   const { db } = ctx();
   const { runId, conversationId, result } = input;
+  if (input.accessProblems?.length) {
+    await upsertCard(db, conversationId, key(runId, "access", input.turn.turnId), {
+      type: "notice",
+      runId,
+      level: "warning",
+      text: [
+        "The plan cannot be put up for approval yet: the agents could not publish it.",
+        ...input.accessProblems.map((p) => `• ${p}`),
+        "Fix the access, then ask the architect again to put the plan up for approval.",
+      ].join("\n"),
+    });
+  }
   const failed = result.status !== "succeeded";
   const text = failed ? `I could not reply (${result.error ?? "unknown error"}). Send your message again to retry.` : result.text.trim();
   const components = failed ? [] : sanitizeAgentComponents(result.components);
@@ -325,7 +346,11 @@ export async function recordDesignTurn(input: {
  * The requester approved a plan version. It becomes the plan of the run; returns the order in which
  * its sub-tasks are built (each after the ones it depends on).
  */
-export async function finalizePlan(input: { runId: string; conversationId: string; version: number }): Promise<{ plan: HandoffPlan; order: string[] }> {
+export async function finalizePlan(input: {
+  runId: string;
+  conversationId: string;
+  version: number;
+}): Promise<{ plan: HandoffPlan; order: string[]; products: string[]; productsChanged: boolean }> {
   const { db } = ctx();
   const latest = await getLatestPlanVersion(db, input.runId);
   if (!latest || latest.version !== input.version) throw ApplicationFailure.nonRetryable(`Plan version ${input.version} is not the latest version of the run`);
@@ -333,7 +358,18 @@ export async function finalizePlan(input: { runId: string; conversationId: strin
   if (!order) throw ApplicationFailure.nonRetryable("The approved plan has a dependency cycle");
   await setPlanVersionStatus(db, input.runId, latest.version, "approved");
   await showPlan(db, input.runId, input.conversationId, { ...latest, status: "approved" }, null, false);
-  return { plan: latest.plan, order: order.map((st) => st.key) };
+  // The products of the run are those of the approved plan: the architect may have added or removed one (FR-M2).
+  const products = [...new Set(order.map((st) => st.product))];
+  const before = (await getRun(db, input.runId))?.products ?? [];
+  const productsChanged = before.slice().sort().join() !== products.slice().sort().join();
+  if (productsChanged) await updateRun(db, input.runId, { products });
+  return { plan: latest.plan, order: order.map((st) => st.key), products, productsChanged };
+}
+
+/** The latest version of a run's plan, if the architect wrote one. */
+export async function latestPlan(input: { runId: string }): Promise<{ plan: HandoffPlan; version: number } | null> {
+  const latest = await getLatestPlanVersion(ctx().db, input.runId);
+  return latest ? { plan: latest.plan, version: latest.version } : null;
 }
 
 export async function requestRiskApproval(input: {
@@ -373,8 +409,6 @@ export async function requestRiskApproval(input: {
 // Sub-tasks: their own conversation, review and decisions (FR-B1, FR-C2, FR-R1, FR-R2)
 // ---------------------------------------------------------------------------
 
-/** The key of the single change of the fast track; a plan cannot use it for a sub-task. */
-const FAST_TRACK_KEY = "change";
 
 /**
  * The story view in the run's conversation (FR-R7): every sub-task of the approved plan in build order,
@@ -383,7 +417,8 @@ const FAST_TRACK_KEY = "change";
 async function refreshStory(db: Db, runId: string): Promise<void> {
   const run = await getRun(db, runId);
   if (!run?.conversationId) return;
-  const subtasks = (await listSubtasks(db, runId)).filter((st) => st.key !== FAST_TRACK_KEY);
+  // The single change of the fast track is not part of the story; a plan cannot use its keys (validateHandoffPlan).
+  const subtasks = (await listSubtasks(db, runId)).filter((st) => !isFastTrackKey(st.key));
   if (!subtasks.length) return;
   const catalog = await runCatalog(runId);
   await upsertCard(db, run.conversationId, key(runId, "story"), {
@@ -704,6 +739,40 @@ export async function requestChangeCheck(input: {
   return { approvalId, hash: input.commit };
 }
 
+/** The token cannot reach a repository: the sub-task waits until the requester fixes the access and retries, or cancels (AD-42). */
+export async function requestBlockedDecision(input: {
+  runId: string;
+  key: string;
+  conversationId: string;
+  what: string;
+  problems: string[];
+}): Promise<{ approvalId: string; hash: string }> {
+  const { db } = ctx();
+  const approvalId = newId("apr");
+  const hash = hashOf({ runId: input.runId, subtask: input.key, what: input.what, problems: input.problems, approvalId });
+  await createApproval(db, {
+    id: approvalId,
+    runId: input.runId,
+    kind: "blocked",
+    payload: { what: input.what, problems: input.problems },
+    hash,
+    workflowId: callingWorkflow(),
+    conversationId: input.conversationId,
+    subtaskKey: input.key,
+  });
+  await upsertCard(db, input.conversationId, key(input.runId, "blocked", approvalId), {
+    type: "blocked",
+    runId: input.runId,
+    subtaskKey: input.key,
+    approvalId,
+    hash,
+    what: input.what,
+    problems: input.problems,
+    status: "pending",
+  });
+  return { approvalId, hash };
+}
+
 /** A sub-task was not delivered and others that have not started depend on it: the requester decides (FR-R4). */
 export async function requestDependentsDecision(input: {
   runId: string;
@@ -770,7 +839,7 @@ export async function postNotice(input: {
   });
 }
 
-const DECISION_CARDS = new Set(["plan", "questions", "risk", "findings", "limits", "change", "dependents"]);
+const DECISION_CARDS = new Set(["plan", "questions", "risk", "findings", "limits", "change", "dependents", "blocked"]);
 
 /**
  * Expires the pending decisions of a run (or of one sub-task) and marks their cards as expired,
@@ -785,6 +854,11 @@ export async function closeOutApprovals(input: { runId: string; subtaskKey?: str
   );
   for (const row of rows) {
     const card = row.components[0];
+    // A plan that was never approved is closed with the run, or when the run moves to the fast track.
+    if (card?.type === "plan" && !input.subtaskKey && (card.status === "draft" || card.status === "proposed")) {
+      await upsertCard(db, row.conversation_id, row.card_key, { ...card, status: "expired", approvalId: undefined });
+      continue;
+    }
     if (!card || !DECISION_CARDS.has(card.type) || !("status" in card) || card.status !== "pending") continue;
     if (input.subtaskKey && (!("subtaskKey" in card) || card.subtaskKey !== input.subtaskKey)) continue;
     await upsertCard(db, row.conversation_id, row.card_key, { ...card, status: "expired" } as OrchestratorCard);

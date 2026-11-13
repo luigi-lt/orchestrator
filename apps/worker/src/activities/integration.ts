@@ -16,21 +16,66 @@ import {
 import { GitHubError, type GitHubClient } from "@orch/github";
 import { getPollEtag, setPollEtag } from "@orch/store";
 import { ctx } from "../context.js";
-import { git, remoteFor, workRepoDir } from "../git.js";
+import { ACCESS_REFUSED, git, probePush, remoteFor, workRepoDir } from "../git.js";
 
 const LABEL_IN_PROGRESS = "ai-in-progress";
 const LABEL_DONE = "ai-done";
 const MARKER = (key: string) => `<!-- orchestrator:${key} -->`;
 const isOrchestratorComment = (body: string) => body.includes("<!-- orchestrator:");
 
-/** Turns non-retryable GitHub errors into non-retryable activity failures. */
+/**
+ * Turns non-retryable GitHub errors into non-retryable activity failures. A refused access (401, 403, 404) has its
+ * own type: the workflow then asks the requester to fix the access instead of failing (AD-42).
+ */
 async function gh<T>(fn: (client: GitHubClient) => Promise<T>): Promise<T> {
   try {
     return await fn(ctx().github);
   } catch (err) {
-    if (err instanceof GitHubError && !err.retryable) throw ApplicationFailure.nonRetryable(err.message, "GitHubError");
+    if (err instanceof GitHubError && !err.retryable) {
+      throw ApplicationFailure.nonRetryable(err.message, [401, 403, 404].includes(err.status) ? "AccessDenied" : "GitHubError");
+    }
     throw err;
   }
+}
+
+export interface AccessProblem {
+  repository: string;
+  problem: string;
+}
+
+/**
+ * Whether the token can push to each repository (AD-42): it must see the repository, the user must have write access,
+ * and a push that sends nothing must be accepted. Pull request and issue permissions of a fine-grained token cannot be
+ * checked without writing; a refusal there makes the sub-task wait for the requester (`AccessDenied`).
+ */
+export async function checkAccess(input: { repositories: string[] }): Promise<{ problems: AccessProblem[] }> {
+  const { github, owner } = ctx();
+  const problems: AccessProblem[] = [];
+  for (const repository of input.repositories) {
+    const [repoOwner, name] = repository.split("/") as [string, string];
+    const repo = { owner: repoOwner, name };
+    let access: { push: boolean | null } | null;
+    try {
+      access = await github.getRepositoryAccess(repo);
+    } catch (err) {
+      if (err instanceof GitHubError && !err.retryable) {
+        problems.push({ repository, problem: `GitHub refused to show ${repository} (${err.status}): check that the token is still valid and has access to it.` });
+        continue;
+      }
+      throw err;
+    }
+    if (!access) {
+      problems.push({ repository, problem: `The token cannot see ${repository}: add the repository to the token's repository access.` });
+      continue;
+    }
+    if (access.push === false) {
+      problems.push({ repository, problem: `@${owner.login} has no write access to ${repository}: ask its owners for write access.` });
+      continue;
+    }
+    const refused = await probePush(repo);
+    if (refused) problems.push({ repository, problem: `The token cannot push to ${repository} (${refused}): give it Contents: Read and write on this repository.` });
+  }
+  return { problems };
 }
 
 /** Branch, base branch and commit identity for the repository a run changes (not always the ticket's own). */
@@ -108,18 +153,33 @@ export interface SubIssue {
  * sub-task in the repository it changes, attached to the story. Where GitHub refuses the attachment
  * (R-15), the story gets a checklist with links instead. Idempotent: a sub-issue carries a marker.
  */
-export async function mirrorPlanOnTicket(input: { runId: string; workItem: WorkItem; plan: HandoffPlan; version: number; order: string[] }): Promise<{ subIssues: SubIssue[]; attached: number }> {
+export async function mirrorPlanOnTicket(input: {
+  runId: string;
+  workItem: WorkItem;
+  plan: HandoffPlan;
+  version: number;
+  order: string[];
+}): Promise<{ subIssues: SubIssue[]; attached: number; missing: { key: string; reason: string }[] }> {
   const story = input.workItem;
   const storyRef = `${story.repo.owner}/${story.repo.name}#${story.number}`;
   const ordered = input.order.map((k) => input.plan.subtasks.find((st) => st.key === k)!).filter(Boolean);
   const subIssues: SubIssue[] = [];
+  // Sub-tasks whose repository refused the issue: they are built all the same, listed on the story without a sub-issue.
+  const missing: { key: string; reason: string }[] = [];
   let attached = 0;
   for (const [index, st] of ordered.entries()) {
     const [owner, name] = st.repository.split("/") as [string, string];
     const repo = { owner, name };
     const marker = MARKER(`run=${input.runId}:subtask=${st.key}`);
-    await gh((c) => c.ensureLabel(repo, LABEL_SUBTASK, "c5def5", "A sub-task built by the orchestrator's agents"));
-    let issue = (await gh((c) => c.listIssuesByLabel(repo, LABEL_SUBTASK))).find((i) => i.body.includes(marker));
+    let issue: Awaited<ReturnType<GitHubClient["createIssue"]>> | undefined;
+    try {
+      await gh((c) => c.ensureLabel(repo, LABEL_SUBTASK, "c5def5", "A sub-task built by the orchestrator's agents"));
+      issue = (await gh((c) => c.listIssuesByLabel(repo, LABEL_SUBTASK))).find((i) => i.body.includes(marker));
+    } catch (err) {
+      if (!(err instanceof ApplicationFailure) || !err.nonRetryable) throw err;
+      missing.push({ key: st.key, reason: `GitHub refused issues in ${st.repository}: ${err.message.slice(0, 200)}` });
+      continue;
+    }
     if (!issue) {
       const body = [
         st.description,
@@ -132,12 +192,21 @@ export async function mirrorPlanOnTicket(input: { runId: string; workItem: WorkI
         "",
         marker,
       ].join("\n");
-      issue = await gh((c) => c.createIssue(repo, st.title, body, [LABEL_SUBTASK]));
+      try {
+        issue = await gh((c) => c.createIssue(repo, st.title, body, [LABEL_SUBTASK]));
+      } catch (err) {
+        if (!(err instanceof ApplicationFailure) || !err.nonRetryable) throw err;
+        missing.push({ key: st.key, reason: `GitHub refused to create the issue in ${st.repository}: ${err.message.slice(0, 200)}` });
+        continue;
+      }
     }
     if (await gh((c) => c.addSubIssue(story.repo, story.number, issue!.id))) attached++;
     subIssues.push({ key: st.key, repo, number: issue.number, url: issue.url });
   }
-  const list = subIssues.map((si, n) => `- [ ] ${ordered[n]!.title} — ${si.repo.owner}/${si.repo.name}#${si.number}`);
+  const list = ordered.map((st) => {
+    const si = subIssues.find((x) => x.key === st.key);
+    return si ? `- [ ] ${st.title} — ${si.repo.owner}/${si.repo.name}#${si.number}` : `- [ ] ${st.title} — ${st.repository} (no sub-issue: GitHub refused it)`;
+  });
   await commentOnIssue({
     repo: story.repo,
     number: story.number,
@@ -149,11 +218,11 @@ export async function mirrorPlanOnTicket(input: { runId: string; workItem: WorkI
       "",
       `**Approach:** ${input.plan.approach}`,
       "",
-      attached === subIssues.length ? "**Sub-tasks** (sub-issues of this ticket)" : "**Sub-tasks**",
+      attached === ordered.length ? "**Sub-tasks** (sub-issues of this ticket)" : "**Sub-tasks**",
       ...list,
     ].join("\n"),
   });
-  return { subIssues, attached };
+  return { subIssues, attached, missing };
 }
 
 /** Closes the sub-issue of a sub-task: as completed once its pull request is merged, as not planned when it was dropped. */
@@ -195,7 +264,16 @@ export async function pushBranch(input: { runId: string; subtaskKey: string; rep
   if (!input.branch.startsWith("agent/")) throw ApplicationFailure.nonRetryable(`Refusing to push non-agent branch ${input.branch}`);
   const cwd = workRepoDir(input.runId, input.subtaskKey);
   // The branch was squashed locally; on a retry or a re-publish the remote copy is replaced by exactly the inspected commit.
-  await git(["push", "--force", url, `refs/heads/${input.branch}:refs/heads/${input.branch}`], { cwd, env });
+  try {
+    await git(["push", "--force", url, `refs/heads/${input.branch}:refs/heads/${input.branch}`], { cwd, env });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // A refusal does not go away by retrying: the requester must fix the access (AD-42). Anything else is retried.
+    if (ACCESS_REFUSED.test(message)) {
+      throw ApplicationFailure.nonRetryable(`The push to ${input.repo.owner}/${input.repo.name} was refused: ${message.slice(0, 400)}`, "AccessDenied");
+    }
+    throw err;
+  }
 }
 
 /** Opens the pull request of a pushed branch (or returns the one that already exists). */

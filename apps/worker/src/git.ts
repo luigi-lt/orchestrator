@@ -102,6 +102,32 @@ export async function mergeDefaultBranch(
   return { status: "merged", headCommit: await head() };
 }
 
+/** What a refused push or clone says: no access, no write access, or rejected credentials. */
+export const ACCESS_REFUSED =
+  /\b40[13]\b|permission to .* denied|access denied|denied to|not allowed|authentication failed|could not read username|insufficient permission|read-only|readonly|invalid username or password|bad credentials|write access/i;
+
+/**
+ * Tries a push to the repository without sending anything: the deletion of a branch that does not exist, with
+ * --dry-run. The remote must accept the push before it can say the branch is missing. Returns why the push was
+ * refused, or null; trouble that is not a refusal (the network) is not reported here.
+ */
+export async function probePush(repo: RepoRef): Promise<string | null> {
+  const dir = join(config.reposDir(), "_probe");
+  if (!existsSync(join(dir, "HEAD"))) {
+    await mkdir(dir, { recursive: true });
+    await git(["init", "--bare", "--quiet", dir]);
+  }
+  const { url, env } = remoteFor(repo);
+  try {
+    await git(["push", "--dry-run", "--no-verify", url, ":refs/heads/agent/orchestrator-access-check"], { cwd: dir, env, timeoutMs: 60_000 });
+    return null;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (/remote ref does not exist|unable to delete/i.test(message)) return null;
+    return ACCESS_REFUSED.test(message) ? message.slice(0, 300) : null;
+  }
+}
+
 // One git operation at a time per mirror: concurrent fetches into the same repository fight over ref locks.
 const mirrorLocks = new Map<string, Promise<unknown>>();
 function withMirrorLock<T>(dir: string, fn: () => Promise<T>): Promise<T> {

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import type { ConversationDto, MessageDto, TicketDto } from "@orch/contracts";
+import type { ConversationDto, MessageDto, TicketDto, Track, TrackSwitchDto } from "@orch/contracts";
 import { api, post, put, subscribe } from "../api";
 import { useApp } from "../App";
 import { MessageView } from "../components/MessageView";
@@ -96,12 +96,109 @@ interface DesignState {
   runId: string;
   state: "active" | "suspending" | "suspended" | "closed";
   turnRunning: boolean;
+  /** Started afresh from the current plan; the next message starts the new session. */
+  fresh: boolean;
+}
+
+const TRACK_TEXT: Record<Track, string> = {
+  fast: "Fast track: the change is built, reviewed by an agent and opened as a pull request, with no stops before it.",
+  guided: "Guided track: you agree the plan with the architect agent, and check each change before its pull request opens.",
+};
+
+/**
+ * Switching the track of a run (FR-A3), shown in its conversation while it is allowed. The orchestrator checks
+ * again when the request arrives: the work may have moved on meanwhile.
+ */
+function TrackSwitch({ runId, track }: { runId: string; track: TrackSwitchDto }) {
+  const [open, setOpen] = useState(false);
+  const [reason, setReason] = useState("");
+  const [state, setState] = useState<"idle" | "busy" | "sent">("idle");
+  const [error, setError] = useState<string | null>(null);
+  const to = track.to;
+  if (!to || state === "sent") return null;
+  const label = to === "guided" ? "Switch to the guided track" : "Switch to the fast track";
+  const submit = async () => {
+    setState("busy");
+    setError(null);
+    try {
+      await post(`/api/runs/${runId}/track`, { track: to, reason: reason.trim() || undefined });
+      setState("sent");
+    } catch (e) {
+      setError((e as Error).message);
+      setState("idle");
+    }
+  };
+  return (
+    <div className="track-switch" role="group" aria-label="Track">
+      {!open ? (
+        <>
+          <span className="muted small">{TRACK_TEXT[track.current ?? (to === "guided" ? "fast" : "guided")]}</span>
+          <button className="ghost small" onClick={() => setOpen(true)}>
+            {label}
+          </button>
+        </>
+      ) : (
+        <>
+          <span className="small">
+            {to === "guided"
+              ? "The change being built is set aside, nothing is pushed, and a design session with the architect agent starts from the analysis."
+              : "The design session ends; the current plan, if there is one, becomes a single change built with no stops before the pull request."}
+          </span>
+          <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why? (optional, recorded on the ticket)" maxLength={500} aria-label="Why" />
+          <button className="primary small" disabled={state === "busy"} onClick={() => void submit()}>
+            {label}
+          </button>
+          <button className="ghost small" onClick={() => setOpen(false)}>
+            Keep the {track.current} track
+          </button>
+        </>
+      )}
+      {error && <span className="error small">{error}</span>}
+    </div>
+  );
+}
+
+/** R-14 fallback: a long design session starts again from the current plan, without the conversation before it. */
+function FreshSession({ runId }: { runId: string }) {
+  const [state, setState] = useState<"idle" | "confirm" | "sent">("idle");
+  const [error, setError] = useState<string | null>(null);
+  if (state === "sent") return <span className="muted small"> A fresh session starts with your next message.</span>;
+  if (state === "idle") {
+    return (
+      <button className="link small" onClick={() => setState("confirm")} title="For a long session: the architect keeps the analysis and the current plan, not the conversation">
+        Start afresh from the current plan
+      </button>
+    );
+  }
+  return (
+    <span className="small">
+      {" "}
+      The architect will keep the analysis and the current plan, but not this conversation.{" "}
+      <button
+        className="link small"
+        onClick={() =>
+          void post(`/api/runs/${runId}/fresh-session`, {}).then(
+            () => setState("sent"),
+            (e: Error) => setError(e.message),
+          )
+        }
+      >
+        Start afresh
+      </button>{" "}
+      <button className="link small" onClick={() => setState("idle")}>
+        Keep the session
+      </button>
+      {error && <span className="error small"> {error}</span>}
+    </span>
+  );
 }
 
 function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] }) {
   const [messages, setMessages] = useState<MessageDto[]>([]);
   // Set while the run's design session is open: messages here go to the architect agent (AD-38).
   const [design, setDesign] = useState<DesignState | null>(null);
+  const [track, setTrack] = useState<TrackSwitchDto | null>(null);
+  const [runId, setRunId] = useState<string | null>(null);
   const [streaming, setStreaming] = useState("");
   const [typing, setTyping] = useState(false);
   const [draft, setDraft] = useState("");
@@ -119,9 +216,13 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
   }, []);
 
   const loadAfter = useCallback(async () => {
-    const data = await api<{ messages: MessageDto[]; busy: boolean; design: DesignState | null }>(`/api/conversations/${id}?after=${maxVersion.current}`);
+    const data = await api<{ conversation: ConversationDto; messages: MessageDto[]; busy: boolean; design: DesignState | null; track: TrackSwitchDto | null }>(
+      `/api/conversations/${id}?after=${maxVersion.current}`,
+    );
     merge(data.messages);
     setDesign(data.design);
+    setTrack(data.track);
+    setRunId(data.conversation.focusedRunId ?? null);
     return data;
   }, [id, merge]);
 
@@ -165,6 +266,9 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
     }
   };
 
+  // Starting afresh needs a plan to start from.
+  const hasPlan = messages.some((m) => m.components.some((c) => c.type === "plan"));
+
   const timeline = useMemo(
     () => messages.map((m) => <MessageView key={m.id} message={m} onSubmitForm={submitForm} />),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -176,13 +280,17 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
       {design && (
         <div className={`design-strip ${design.state}`} role="status">
           <strong>Design session with the architect agent.</strong>{" "}
-          {design.state === "active"
+          {design.fresh && !design.turnRunning
+            ? "A fresh session starts from the current plan with your next message: the architect will not see the conversation before this point."
+            : design.state === "active"
             ? "Your messages here go to the architect. Ask about the code, set constraints, ask for changes to the plan."
             : design.turnRunning
               ? "Resuming: the architect's workspace is starting again. This can take a minute."
-              : "The architect's workspace was saved while you were away. Your next message resumes it, which can take a minute."}
+              : "The architect's workspace was saved while you were away. Your next message resumes it, which can take a minute."}{" "}
+          {!design.turnRunning && !typing && hasPlan && !design.fresh && <FreshSession key={`${design.state}-${messages.length}`} runId={design.runId} />}
         </div>
       )}
+      {runId && track?.to && <TrackSwitch key={`${track.current}-${track.to}`} runId={runId} track={track} />}
       <div className="timeline">
         {timeline}
         {typing && (

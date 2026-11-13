@@ -683,6 +683,8 @@ export interface DesignSessionRecord {
   /** Every repository opened in the session, with the commit it was opened at: a restored workspace gets the same. */
   repositories: BriefRepository[];
   hasCheckpoint: boolean;
+  /** Set when the session was started afresh from the current plan: the conversation before it is not given to the architect again. */
+  historySince: string | null;
 }
 
 interface DesignSessionRow {
@@ -691,6 +693,7 @@ interface DesignSessionRow {
   step_id: string | null;
   repositories: BriefRepository[];
   has_checkpoint: boolean;
+  history_since: Date | null;
 }
 
 const toDesignSession = (r: DesignSessionRow): DesignSessionRecord => ({
@@ -699,6 +702,7 @@ const toDesignSession = (r: DesignSessionRow): DesignSessionRecord => ({
   stepId: r.step_id,
   repositories: r.repositories,
   hasCheckpoint: r.has_checkpoint,
+  historySince: iso(r.history_since),
 });
 
 export async function getDesignSession(db: Queryable, runId: string): Promise<DesignSessionRecord | null> {
@@ -709,7 +713,7 @@ export async function getDesignSession(db: Queryable, runId: string): Promise<De
 export async function saveDesignSession(
   db: Queryable,
   runId: string,
-  patch: { state?: DesignSessionState; stepId?: string | null; repositories?: BriefRepository[]; hasCheckpoint?: boolean },
+  patch: { state?: DesignSessionState; stepId?: string | null; repositories?: BriefRepository[]; hasCheckpoint?: boolean; historySince?: string },
 ): Promise<void> {
   await db.query("insert into design_sessions (run_id, state) values ($1, 'suspended') on conflict (run_id) do nothing", [runId]);
   const sets: string[] = [];
@@ -718,6 +722,7 @@ export async function saveDesignSession(
   if (patch.stepId !== undefined) sets.push(`step_id = $${values.push(patch.stepId)}`);
   if (patch.repositories !== undefined) sets.push(`repositories = $${values.push(JSON.stringify(patch.repositories))}`);
   if (patch.hasCheckpoint !== undefined) sets.push(`has_checkpoint = $${values.push(patch.hasCheckpoint)}`);
+  if (patch.historySince !== undefined) sets.push(`history_since = $${values.push(patch.historySince)}`);
   if (sets.length) await db.query(`update design_sessions set ${sets.join(", ")}, updated_at = now() where run_id = $1`, values);
   await notify(db, { t: "run", r: runId });
 }
@@ -781,6 +786,15 @@ export async function completeDesignTurn(db: Queryable, runId: string, id: strin
     JSON.stringify(result),
   ]);
   return (res.rowCount ?? 0) > 0;
+}
+
+/** True when the architect has replied in the conversation since the given time. */
+export async function architectRepliedSince(db: Queryable, conversationId: string, since: string): Promise<boolean> {
+  const { rows } = await db.query(
+    "select 1 from messages where conversation_id = $1 and role = 'agent' and author = 'architect' and created_at > $2 limit 1",
+    [conversationId, since],
+  );
+  return rows.length > 0;
 }
 
 export async function hasOpenDesignTurn(db: Queryable, runId: string): Promise<boolean> {
@@ -967,6 +981,7 @@ export async function listPendingApprovals(db: Queryable): Promise<ApprovalDto[]
     limits: "Decide on a change beyond the fast track",
     change: "Check a change before its pull request",
     dependents: "Decide on sub-tasks that depend on one that was not delivered",
+    blocked: "Fix access to a repository, then retry",
   };
   return rows.map((r) => ({
     id: r.id,

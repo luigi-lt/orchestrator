@@ -120,7 +120,12 @@ export async function startRunForIssue(
   }
 }
 
-export async function signalRun(s: Services, workflowId: string, signal: "approval" | "answer" | "cancel", payload: unknown): Promise<void> {
+export async function signalRun(
+  s: Services,
+  workflowId: string,
+  signal: "approval" | "answer" | "cancel" | "changeTrack" | "freshSession",
+  payload: unknown,
+): Promise<void> {
   const client = await s.temporal();
   await client.workflow.getHandle(workflowId).signal(signal, payload);
 }

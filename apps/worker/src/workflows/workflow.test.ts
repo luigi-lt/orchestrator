@@ -92,6 +92,12 @@ interface Scenario {
   limits?: string[];
   risk?: boolean;
   implementFails?: boolean;
+  /** How many implementation steps fail because of the model provider before one succeeds. */
+  providerFailures?: number;
+  /** How many access checks find a problem with every repository, before they pass. */
+  accessRefusals?: number;
+  /** How many pushes are refused, before they pass. */
+  pushRefusals?: number;
   /** The sub-task whose implementation fails. */
   failSubtask?: string;
   /** The plan the architect drafts (the plan across two products by default). */
@@ -150,6 +156,10 @@ function mockActivities(s: Scenario) {
   // The requester's decisions at the check of a change; the run scenario says how they reach the sub-task's workflow.
   const hooks: { decide?: (subtaskKey: string, approvalId: string, decision: string, feedback?: string) => Promise<void> } = {};
   const checks = new Map<string, number>();
+  let accessRefusals = s.accessRefusals ?? 0;
+  let pushRefusals = s.pushRefusals ?? 0;
+  let providerFailures = s.providerFailures ?? 0;
+  let blocked = 0;
   // Design session
   let workspaceUp = false;
   let workspaces = 0;
@@ -166,7 +176,7 @@ function mockActivities(s: Scenario) {
         conversationId: "conv_run",
         homeProduct: "calc",
         catalogHash: "cat1",
-        settings: { maxFixRounds: 2, prPollSeconds: 60, designIdleSeconds: s.designIdleSeconds ?? 3600 },
+        settings: { maxFixRounds: 2, prPollSeconds: 60, designIdleSeconds: s.designIdleSeconds ?? 3600, modelRetrySeconds: [1, 1, 1] },
       }
     ),
     recordAnalysis: async (a: unknown) => {
@@ -259,7 +269,25 @@ function mockActivities(s: Scenario) {
       }
       return { version: planVersion || null, created, changes: created && planVersion > 1 ? 1 : 0, voidedApproval, proposedApprovalId };
     },
-    finalizePlan: async (a: unknown) => (record("finalizePlan", a), { plan: currentPlan!, order: buildOrder(currentPlan!)!.map((st) => st.key) }),
+    finalizePlan: async (a: unknown) => {
+      record("finalizePlan", a);
+      const order = buildOrder(currentPlan!)!;
+      return { plan: currentPlan!, order: order.map((st) => st.key), products: [...new Set(order.map((st) => st.product))], productsChanged: true };
+    },
+    latestPlan: async (a: unknown) => (record("latestPlan", a), currentPlan ? { plan: currentPlan, version: planVersion } : null),
+    restartDesignSession: async (a: unknown) => {
+      record("restartDesignSession", a);
+      const stepId = workspaceUp ? `d${workspaces}` : null;
+      workspaceUp = false;
+      return { stepId };
+    },
+    requestBlockedDecision: async (a: unknown) => (record("requestBlockedDecision", a), { approvalId: `apr_blocked_${++blocked}`, hash: "h" }),
+    checkAccess: async (a: { repositories: string[] }) => {
+      record("checkAccess", a);
+      if (accessRefusals <= 0) return { problems: [] };
+      accessRefusals--;
+      return { problems: a.repositories.map((repository) => ({ repository, problem: `The token cannot push to ${repository}` })) };
+    },
     mirrorPlanOnTicket: async (a: { order: string[]; plan: HandoffPlan }) => (
       record("mirrorPlanOnTicket", a),
       {
@@ -268,6 +296,7 @@ function mockActivities(s: Scenario) {
           return { key, repo: { owner, name }, number: 40 + i, url: `https://example/${owner}/${name}/issues/${40 + i}` };
         }),
         attached: a.order.length,
+        missing: [],
       }
     ),
     closeSubIssue: async (a: unknown) => record("closeSubIssue", a),
@@ -280,7 +309,13 @@ function mockActivities(s: Scenario) {
     setTrackLabel: async (a: unknown) => record("setTrackLabel", a),
     findRequesterReply: async () => null,
     finalizeIssue: async (a: unknown) => record("finalizeIssue", a),
-    pushBranch: async (a: unknown) => record("pushBranch", a),
+    pushBranch: async (a: unknown) => {
+      record("pushBranch", a);
+      if (pushRefusals > 0) {
+        pushRefusals--;
+        throw ApplicationFailure.nonRetryable("The push to acme/demo was refused: 403", "AccessDenied");
+      }
+    },
     openPullRequest: async (a: unknown) => (record("openPullRequest", a), { number: ++prNumber, url: `https://example/pr/${prNumber}`, title: "[agent] x" }),
     getPullRequestState: async (a: { number: number }) => (record("getPullRequestState", a), prStates.get(a.number) ?? s.prInitial ?? "merged"),
     retargetPullRequest: async (a: unknown) => (record("retargetPullRequest", a), true),
@@ -294,6 +329,10 @@ function mockActivities(s: Scenario) {
       if (kind === "analyse") return analysisResults[Math.min(analysisIndex++, analysisResults.length - 1)]!;
       if (kind === "review") return { status: "succeeded", summary: "review", review: reviews[Math.min(reviewIndex++, reviews.length - 1)]! };
       if (s.implementFails || (s.failSubtask && s.failSubtask === subtaskKey)) return { status: "failed", summary: "The workspace failed", error: "model error" };
+      if (providerFailures > 0) {
+        providerFailures--;
+        return { status: "failed", summary: "The workspace failed", error: "429 rate_limit_error: Number of requests has exceeded your rate limit" };
+      }
       return {
         status: "succeeded",
         summary: "Added subtract.js",
@@ -347,6 +386,10 @@ interface Driver {
   say: (text: string) => Promise<void>;
   /** The Approve button on the plan card. */
   approvePlan: (approvalId: string) => Promise<void>;
+  /** The requester switches the track (FR-A3). */
+  changeTrack: (track: "fast" | "guided", reason?: string) => Promise<void>;
+  /** Signals the design session workflow. */
+  signalDesign: (name: string, arg: unknown) => Promise<void>;
 }
 
 describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
@@ -405,6 +448,8 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
             signalSubtask: (key, name, arg) => env.client.workflow.getHandle(`subtask:${runId}:${key}`).signal(name, arg),
             say: (text) => design().signal("requesterMessage", { messageId: `msg_${++said}`, text }),
             approvePlan: (approvalId) => design().signal("approval", { approvalId, decision: "approve" }),
+            changeTrack: (track, reason) => handle.signal("changeTrack", { track, by: "tester", reason }),
+            signalDesign: (name, arg) => design().signal(name, arg),
           },
           m,
         );
@@ -690,6 +735,9 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     expect(implement.plan!.summary).toContain("subtract(a, b): Returns a - b for numbers (provided by: Add subtract function; used by: Use subtract on the page)");
     expect(implement.plan!.subtasks.map((st) => st.title)).toEqual(["Add subtract function", "Use subtract on the page"]);
     expect(m.of<{ number: number }>("closeSubIssue").map((c) => c.number).sort()).toEqual([40, 41]);
+    expect(m.of<{ type: string; payload: { source?: string; products: string[] } }>("recordEvent").find((e) => e.payload.source === "plan")?.payload.products).toEqual(["calc", "shop"]);
+    // Each sub-task checked that the token can push to its repository before it was built (AD-42).
+    expect(m.of<{ repositories: string[] }>("checkAccess").map((c) => c.repositories.join())).toEqual(["acme/web,acme/demo", "acme/demo", "acme/web"]);
     expect(m.of("addStoryWarning")).toHaveLength(0);
     expect(events(m)).toEqual(
       expect.arrayContaining(["design.opened", "plan.version_created", "plan.proposed", "design.closed", "plan.approved", "ticket.subtasks_created", "change.check_requested", "change.decided"]),
@@ -899,6 +947,206 @@ describe("deliveryRunWorkflow", { timeout: 300_000 }, () => {
     const states = m.of<{ key: string; patch: { state?: string } }>("patchSubtask");
     expect(states.some((p) => p.key === "lib" && p.patch.state === "cancelled")).toBe(true);
     expect(states.some((p) => p.key === "page" && p.patch.state === "failed")).toBe(true);
+  });
+
+  // --- Changing the track (FR-A3) ------------------------------------------------------
+
+  it("switches a fast-track change to the guided track on the requester's request, before anything is pushed", async () => {
+    const { state, m } = await runScenario({ risk: true }, async (h, mock) => {
+      await mock.reached("requestRiskApproval");
+      const opened = mock.reached("recordDesignTurn");
+      await h.changeTrack("guided", "It touches CI, I want a plan");
+      await opened;
+      expect(mock.of("pushBranch")).toHaveLength(0);
+      const proposed = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await proposed;
+      let risk = mock.reached("requestRiskApproval");
+      await h.approvePlan("apr_plan_1");
+      await risk;
+      risk = mock.reached("requestRiskApproval");
+      await h.signalSubtask("lib", "approval", { approvalId: "apr_risk", decision: "approve" });
+      await risk;
+      await h.signalSubtask("page", "approval", { approvalId: "apr_risk", decision: "approve" });
+    });
+    expect(state).toBe("completed");
+    // The change was set aside while it waited for the high-risk approval; its decision is closed.
+    expect(m.of<{ key: string }>("initSubtask").map((i) => i.key)).toEqual(["change", "lib", "page"]);
+    expect(m.of<{ subtaskKey?: string; key?: string }>("pushBranch").map((p) => p.subtaskKey)).toEqual(["lib", "page"]);
+    expect(m.of<{ subtaskKey?: string }>("closeOutApprovals").some((c) => c.subtaskKey === "change")).toBe(true);
+    const changed = m.of<{ type: string; payload: { track: string; from: string; by: string; reason: string } }>("recordEvent").find((e) => e.type === "track.changed")!;
+    expect(changed.payload).toMatchObject({ track: "guided", from: "fast", by: "tester", reason: "It touches CI, I want a plan" });
+    expect(m.of<{ track: string }>("setTrackLabel").map((l) => l.track)).toEqual(["fast", "guided"]);
+    expect(m.of<{ key: string; body: string }>("commentOnIssue").find((c) => /:track=1$/.test(c.key))?.body).toContain("Track changed to **guided** by @tester: It touches CI, I want a plan");
+  });
+
+  it("refuses to switch a fast-track change once it is being published", async () => {
+    const { state, m } = await runScenario({ prInitial: "open" }, async (h, mock) => {
+      await mock.reached("openPullRequest");
+      const refused = mock.reached("postNotice");
+      await h.changeTrack("guided");
+      await refused;
+      mock.pr(7, "merged");
+    });
+    expect(state).toBe("completed");
+    expect(m.of<{ noticeKey: string; text: string }>("postNotice").find((n) => n.noticeKey === "track-refused-change")?.text).toMatch(/already being published/);
+    expect(events(m)).not.toContain("track.changed");
+    expect(m.of("recordDesignTurn")).toHaveLength(0);
+  });
+
+  it("switches a design session to the fast track when the plan stays in one repository: the plan becomes one change", async () => {
+    const { state, m } = await runScenario({ track: "guided", plan: handoffStacked }, async (h, mock) => {
+      await mock.reached("recordDesignTurn");
+      await h.changeTrack("fast", "Small enough after all");
+    });
+    expect(state).toBe("completed");
+    expect(m.of("closeDesignSession")).toHaveLength(1);
+    expect(m.of<{ subtaskKey?: string }>("closeOutApprovals").some((c) => !c.subtaskKey)).toBe(true);
+    expect(m.of("finalizePlan")).toHaveLength(0);
+    expect(m.of("mirrorPlanOnTicket")).toHaveLength(0);
+    // One change, without the requester's check, holding every sub-task and acceptance criterion of the plan.
+    const change = m.of<{ key: string; ownConversation: boolean; repo: { name: string } }>("initSubtask");
+    expect(change.map((c) => [c.key, c.ownConversation, c.repo.name])).toEqual([["change", false, "demo"]]);
+    expect(m.of("requestChangeCheck")).toHaveLength(0);
+    const plan = m.of<StepPrep>("prepareStep").find((p) => p.kind === "implement")!.plan!;
+    expect(plan.subtasks).toHaveLength(1);
+    expect(plan.subtasks[0]!.acceptanceCriteria).toEqual(["works", "documented"]);
+    expect(plan.subtasks[0]!.description).toContain("1. Add subtract function: d1");
+    expect(plan.subtasks[0]!.description).toContain("2. Document subtract: d2");
+    expect(m.of<{ checkLimits: boolean }>("inspectChanges")[0]!.checkLimits).toBe(true);
+    expect(m.of<{ type: string; payload: { track: string; from: string } }>("recordEvent").find((e) => e.type === "track.changed")!.payload).toMatchObject({ track: "fast", from: "guided" });
+    expect(m.of<{ track: string }>("setTrackLabel").map((l) => l.track)).toEqual(["guided", "fast"]);
+  });
+
+  it("refuses to switch a design session to the fast track when the plan changes two repositories", async () => {
+    const { state, m } = await runScenario({ track: "guided" }, async (h, mock) => {
+      await mock.reached("recordDesignTurn");
+      const refused = mock.reached("postNotice");
+      await h.changeTrack("fast");
+      await refused;
+      const proposed = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await proposed;
+      await h.approvePlan("apr_plan_1");
+    });
+    expect(state).toBe("completed");
+    const notice = m.of<{ text: string }>("postNotice").find((n) => /needs the work to stay in one repository/.test(n.text))!;
+    expect(notice.text).toContain("involves 2: acme/web, acme/demo");
+    expect(events(m)).toContain("track.switch_refused");
+    expect(events(m)).not.toContain("track.changed");
+    expect(m.of("closeDesignSession")).toHaveLength(1);
+  });
+
+  it("comes back to the design session after a switch to the fast track: a new session with turns of its own", async () => {
+    const { state, m } = await runScenario({ track: "guided", plan: handoffStacked, limits: ["The change touches 9 files (the fast-track limit is 5)"] }, async (h, mock) => {
+      await mock.reached("recordDesignTurn");
+      await h.changeTrack("fast");
+      await mock.reached("requestLimitsDecision");
+      const reopened = mock.reached("recordDesignTurn");
+      await h.signalSubtask("change", "approval", { approvalId: "apr_limits", decision: "guided" });
+      await reopened;
+      const proposed = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await proposed;
+      await h.approvePlan("apr_plan_2");
+    });
+    expect(state).toBe("completed");
+    expect(m.of<{ track: string }>("setTrackLabel").map((l) => l.track)).toEqual(["guided", "fast", "guided"]);
+    // Two sessions: every turn has its own id, and the second session opens by itself again.
+    const turns = m.of<{ turn: DesignTurnInput }>("awaitDesignTurn").map((t) => t.turn);
+    expect(new Set(turns.map((t) => t.turnId)).size).toBe(turns.length);
+    expect(turns.filter((t) => t.opening)).toHaveLength(2);
+    expect(m.of<{ key: string }>("initSubtask").map((i) => i.key)).toEqual(["change", "api", "docs"]);
+    expect(m.of<{ version: number }>("finalizePlan").map((f) => f.version)).toEqual([2]);
+    // The events of both sessions are recorded: their writers do not collide.
+    const keys = m.of<{ key: string }>("recordEvent").map((e) => e.key);
+    expect(new Set(keys).size).toBe(keys.length);
+    expect(events(m).filter((e) => e === "design.opened")).toHaveLength(2);
+  });
+
+  // --- Access (AD-42) ------------------------------------------------------------------
+
+  it("waits for the requester when the token cannot push: before the build, and when the push is refused", async () => {
+    const { state, m } = await runScenario({ accessRefusals: 1, pushRefusals: 1 }, async (h, mock) => {
+      await mock.reached("requestBlockedDecision");
+      expect(mock.of("prepareStep").filter((p) => (p as StepPrep).kind === "implement")).toHaveLength(0);
+      const second = mock.reached("requestBlockedDecision");
+      await h.signalSubtask("change", "approval", { approvalId: "apr_blocked_1", decision: "retry" });
+      await second;
+      await h.signalSubtask("change", "approval", { approvalId: "apr_blocked_2", decision: "retry" });
+    });
+    expect(state).toBe("completed");
+    expect(m.of<{ what: string; problems: string[] }>("requestBlockedDecision").map((b) => b.what)).toEqual(["push to acme/demo", "push the branch to acme/demo"]);
+    expect(m.of<{ problems: string[] }>("requestBlockedDecision")[1]!.problems[0]).toMatch(/refused: 403/);
+    expect(m.of("pushBranch")).toHaveLength(2);
+    expect(m.of("openPullRequest")).toHaveLength(1);
+    expect(events(m).filter((e) => e === "access.blocked")).toHaveLength(2);
+  });
+
+  it("cancels the run when the requester gives up on a blocked sub-task; nothing is built", async () => {
+    const { state, m } = await runScenario({ accessRefusals: 1 }, async (h, mock) => {
+      await mock.reached("requestBlockedDecision");
+      await h.signalSubtask("change", "approval", { approvalId: "apr_blocked_1", decision: "cancel" });
+    });
+    expect(state).toBe("cancelled");
+    expect(kinds(m)).toEqual(["analyse"]);
+    expect(m.of("pushBranch")).toHaveLength(0);
+    expect(finalNotice(m)).toMatch(/the token cannot push to acme\/demo; nothing was built/);
+  });
+
+  it("does not put a plan up for approval while the token cannot push to one of its repositories", async () => {
+    const { state, m } = await runScenario({ track: "guided", accessRefusals: 1 }, async (h, mock) => {
+      await mock.reached("recordDesignTurn");
+      let next = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await next;
+      next = mock.reached("recordDesignTurn");
+      await h.say("The access is fixed: put it up for approval again");
+      await next;
+      await h.approvePlan("apr_plan_1");
+    });
+    // The first proposal was held back; the second, after the access was fixed, was approved.
+    expect(state).toBe("completed");
+    const recorded = m.of<{ result: DesignTurnResult; accessProblems?: string[] }>("recordDesignTurn");
+    expect(recorded[1]!.result.proposed).toBe(false);
+    expect(recorded[1]!.accessProblems).toEqual(["The token cannot push to acme/web", "The token cannot push to acme/demo"]);
+    expect(recorded[2]!.result.proposed).toBe(true);
+    expect(events(m)).toContain("access.plan_refused");
+  });
+
+  // --- Failures (§18) ------------------------------------------------------------------
+
+  it("waits out the model provider: a step that failed on a rate limit is tried again after a pause", async () => {
+    const { state, m } = await runScenario({ providerFailures: 2 });
+    expect(state).toBe("completed");
+    expect(kinds(m)).toEqual(["analyse", "implement", "implement", "implement", "review"]);
+    expect(m.of<StepPrep & { title: string }>("prepareStep").map((p) => p.title).slice(1, 4)).toEqual([
+      "Implement: Add subtract",
+      "Implement: Add subtract (attempt 2)",
+      "Implement: Add subtract (attempt 3)",
+    ]);
+    const waits = m.of<{ type: string; payload: { reason: string; waitSeconds: number } }>("recordEvent").filter((e) => e.type === "step.retry_scheduled");
+    expect(waits.map((w) => w.payload)).toEqual([expect.objectContaining({ reason: "model provider", waitSeconds: 1 }), expect.objectContaining({ reason: "model provider", waitSeconds: 1 })]);
+    expect(m.of<{ headline: string }>("updateProgress").some((p) => /Waiting for the model provider/.test(p.headline))).toBe(true);
+  });
+
+  it("starts the design session afresh from the current plan on the requester's request", async () => {
+    const { state, m } = await runScenario({ track: "guided" }, async (h, mock) => {
+      await mock.reached("recordDesignTurn");
+      const restarted = mock.reached("restartDesignSession");
+      await h.signalDesign("freshSession", { by: "tester" });
+      await restarted;
+      const proposed = mock.reached("recordDesignTurn");
+      await h.say("Put it up for approval");
+      await proposed;
+      await h.approvePlan("apr_plan_1");
+    });
+    expect(state).toBe("completed");
+    expect(events(m)).toContain("design.restarted");
+    // The first workspace went away; the next message started a new one.
+    expect(m.of<{ stepId: string; session?: boolean }>("createWorkspace").filter((w) => w.session).map((w) => w.stepId)).toEqual(["d1", "d2"]);
+    expect(m.of<{ stepId: string }>("destroyWorkspace").some((d) => d.stepId === "d1")).toBe(true);
+    expect(m.of<{ text: string }>("postNotice").some((n) => /starts afresh with your next message/.test(n.text))).toBe(true);
   });
 
   // --- Cancelling --------------------------------------------------------------------
