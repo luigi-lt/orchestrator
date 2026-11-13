@@ -1,0 +1,365 @@
+import { ApplicationFailure, Context } from "@temporalio/activity";
+import { WorkflowExecutionAlreadyStartedError } from "@temporalio/client";
+import { CatalogError, currentCatalog } from "@orch/catalog";
+import { config, log, newId, slugify } from "@orch/common";
+import {
+  RUN_WORKFLOW_GENERATION,
+  TASK_QUEUES,
+  catalogRepositories,
+  workflowIdForIssue,
+  type DeliveryRunInput,
+  type HandoffPlan,
+  type RepoRef,
+  type Track,
+  type WorkItem,
+} from "@orch/contracts";
+import { GitHubError, type GitHubClient } from "@orch/github";
+import { getPollEtag, setPollEtag } from "@orch/store";
+import { ctx } from "../context.js";
+import { ACCESS_REFUSED, git, probePush, remoteFor, workRepoDir } from "../git.js";
+
+const LABEL_IN_PROGRESS = "ai-in-progress";
+const LABEL_DONE = "ai-done";
+const MARKER = (key: string) => `<!-- orchestrator:${key} -->`;
+const isOrchestratorComment = (body: string) => body.includes("<!-- orchestrator:");
+
+/**
+ * Turns non-retryable GitHub errors into non-retryable activity failures. A refused access (401, 403, 404) has its
+ * own type: the workflow then asks the requester to fix the access instead of failing (AD-42).
+ */
+async function gh<T>(fn: (client: GitHubClient) => Promise<T>): Promise<T> {
+  try {
+    return await fn(ctx().github);
+  } catch (err) {
+    if (err instanceof GitHubError && !err.retryable) {
+      throw ApplicationFailure.nonRetryable(err.message, [401, 403, 404].includes(err.status) ? "AccessDenied" : "GitHubError");
+    }
+    throw err;
+  }
+}
+
+export interface AccessProblem {
+  repository: string;
+  problem: string;
+}
+
+/**
+ * Whether the token can push to each repository (AD-42): it must see the repository, the user must have write access,
+ * and a push that sends nothing must be accepted. Pull request and issue permissions of a fine-grained token cannot be
+ * checked without writing; a refusal there makes the sub-task wait for the requester (`AccessDenied`).
+ */
+export async function checkAccess(input: { repositories: string[] }): Promise<{ problems: AccessProblem[] }> {
+  const { github, owner } = ctx();
+  const problems: AccessProblem[] = [];
+  for (const repository of input.repositories) {
+    const [repoOwner, name] = repository.split("/") as [string, string];
+    const repo = { owner: repoOwner, name };
+    let access: { push: boolean | null } | null;
+    try {
+      access = await github.getRepositoryAccess(repo);
+    } catch (err) {
+      if (err instanceof GitHubError && !err.retryable) {
+        problems.push({ repository, problem: `GitHub refused to show ${repository} (${err.status}): check that the token is still valid and has access to it.` });
+        continue;
+      }
+      throw err;
+    }
+    if (!access) {
+      problems.push({ repository, problem: `The token cannot see ${repository}: add the repository to the token's repository access.` });
+      continue;
+    }
+    if (access.push === false) {
+      problems.push({ repository, problem: `@${owner.login} has no write access to ${repository}: ask its owners for write access.` });
+      continue;
+    }
+    const refused = await probePush(repo);
+    if (refused) problems.push({ repository, problem: `The token cannot push to ${repository} (${refused}): give it Contents: Read and write on this repository.` });
+  }
+  return { problems };
+}
+
+/** Branch, base branch and commit identity for the repository a run changes (not always the ticket's own). */
+export async function lookupContext(input: { runId: string; workItem: WorkItem; repo: RepoRef }): Promise<{
+  defaultBranch: string;
+  branch: string;
+  commitAuthor: { name: string; email: string };
+}> {
+  const { owner } = ctx();
+  const defaultBranch = await gh((c) => c.getDefaultBranch(input.repo));
+  const branch = `agent/${input.workItem.number}-${slugify(input.workItem.title, 32)}-${input.runId.slice(-6)}`;
+  const requester = input.workItem.requester;
+  const id = requester.id ?? (requester.login === owner.login ? owner.id : undefined);
+  const email = id ? `${id}+${requester.login}@users.noreply.github.com` : `${requester.login}@users.noreply.github.com`;
+  const name = requester.login === owner.login && owner.name ? owner.name : requester.login;
+  return { defaultBranch, branch, commitAuthor: { name, email } };
+}
+
+/** Posts a comment unless one with the same idempotency key already exists. */
+export async function commentOnIssue(input: { repo: RepoRef; number: number; key: string; body: string }): Promise<void> {
+  const marker = MARKER(input.key);
+  const existing = await gh((c) => c.listComments(input.repo, input.number));
+  if (existing.some((c) => c.body.includes(marker))) return;
+  await gh((c) => c.createComment(input.repo, input.number, `${input.body}\n\n${marker}`));
+}
+
+/** Removes the trigger label (so the issue is not picked up again) and marks it in progress. */
+export async function claimIssue(input: { repo: RepoRef; number: number; runId: string }): Promise<void> {
+  await gh((c) => c.ensureLabel(input.repo, LABEL_IN_PROGRESS, "fbca04", "The orchestrator is working on this issue"));
+  await gh((c) => c.ensureLabel(input.repo, LABEL_DONE, "0e8a16", "The orchestrator finished this issue"));
+  await gh((c) => c.removeLabel(input.repo, input.number, config.triggerLabel()));
+  await gh((c) => c.removeLabel(input.repo, input.number, LABEL_DONE));
+  await gh((c) => c.addLabels(input.repo, input.number, [LABEL_IN_PROGRESS]));
+  await commentOnIssue({
+    repo: input.repo,
+    number: input.number,
+    key: `run=${input.runId}:claimed`,
+    body: `🤖 The orchestrator picked up this issue (run \`${input.runId}\`). Follow it in the orchestrator web app.`,
+  });
+}
+
+/** Returns the requester's reply posted after `since`, ignoring the orchestrator's own comments. */
+export async function findRequesterReply(input: { repo: RepoRef; number: number; since: string; requester: string }): Promise<string | null> {
+  const comments = await gh((c) => c.listComments(input.repo, input.number, input.since));
+  const replies = comments.filter(
+    (c) => c.author === input.requester && !isOrchestratorComment(c.body) && new Date(c.createdAt) > new Date(input.since),
+  );
+  return replies.length ? replies.map((r) => r.body.trim()).join("\n\n") : null;
+}
+
+const TRACK_LABELS: Record<Track, { name: string; color: string; description: string }> = {
+  fast: { name: "track:fast", color: "1d76db", description: "Small change: straight to a reviewed pull request" },
+  guided: { name: "track:guided", color: "5319e7", description: "Designed with the requester before it is built" },
+};
+
+/** Mirrors the track on the ticket; the label follows when the track changes (FR-A3, work model §4). */
+export async function setTrackLabel(input: { repo: RepoRef; number: number; track: Track }): Promise<void> {
+  const other: Track = input.track === "fast" ? "guided" : "fast";
+  for (const t of Object.values(TRACK_LABELS)) await gh((c) => c.ensureLabel(input.repo, t.name, t.color, t.description));
+  await gh((c) => c.removeLabel(input.repo, input.number, TRACK_LABELS[other].name));
+  await gh((c) => c.addLabels(input.repo, input.number, [TRACK_LABELS[input.track].name]));
+}
+
+const LABEL_SUBTASK = "ai-subtask";
+
+export interface SubIssue {
+  key: string;
+  repo: RepoRef;
+  number: number;
+  url: string;
+}
+
+/**
+ * Mirrors an approved plan on the ticket (FR-P5): a summary comment on the story, and one sub-issue per
+ * sub-task in the repository it changes, attached to the story. Where GitHub refuses the attachment
+ * (R-15), the story gets a checklist with links instead. Idempotent: a sub-issue carries a marker.
+ */
+export async function mirrorPlanOnTicket(input: {
+  runId: string;
+  workItem: WorkItem;
+  plan: HandoffPlan;
+  version: number;
+  order: string[];
+}): Promise<{ subIssues: SubIssue[]; attached: number; missing: { key: string; reason: string }[] }> {
+  const story = input.workItem;
+  const storyRef = `${story.repo.owner}/${story.repo.name}#${story.number}`;
+  const ordered = input.order.map((k) => input.plan.subtasks.find((st) => st.key === k)!).filter(Boolean);
+  const subIssues: SubIssue[] = [];
+  // Sub-tasks whose repository refused the issue: they are built all the same, listed on the story without a sub-issue.
+  const missing: { key: string; reason: string }[] = [];
+  let attached = 0;
+  for (const [index, st] of ordered.entries()) {
+    const [owner, name] = st.repository.split("/") as [string, string];
+    const repo = { owner, name };
+    const marker = MARKER(`run=${input.runId}:subtask=${st.key}`);
+    let issue: Awaited<ReturnType<GitHubClient["createIssue"]>> | undefined;
+    try {
+      await gh((c) => c.ensureLabel(repo, LABEL_SUBTASK, "c5def5", "A sub-task built by the orchestrator's agents"));
+      issue = (await gh((c) => c.listIssuesByLabel(repo, LABEL_SUBTASK))).find((i) => i.body.includes(marker));
+    } catch (err) {
+      if (!(err instanceof ApplicationFailure) || !err.nonRetryable) throw err;
+      missing.push({ key: st.key, reason: `GitHub refused issues in ${st.repository}: ${err.message.slice(0, 200)}` });
+      continue;
+    }
+    if (!issue) {
+      const body = [
+        st.description,
+        "",
+        "**Acceptance criteria**",
+        ...st.acceptanceCriteria.map((c) => `- [ ] ${c}`),
+        "",
+        `Sub-task ${index + 1} of ${ordered.length} of ${storyRef}. It is built by an agent; follow it in the orchestrator web app.`,
+        ...(st.dependsOn.length ? [`Depends on: ${st.dependsOn.map((d) => input.plan.subtasks.find((x) => x.key === d)?.title ?? d).join("; ")}`] : []),
+        "",
+        marker,
+      ].join("\n");
+      try {
+        issue = await gh((c) => c.createIssue(repo, st.title, body, [LABEL_SUBTASK]));
+      } catch (err) {
+        if (!(err instanceof ApplicationFailure) || !err.nonRetryable) throw err;
+        missing.push({ key: st.key, reason: `GitHub refused to create the issue in ${st.repository}: ${err.message.slice(0, 200)}` });
+        continue;
+      }
+    }
+    if (await gh((c) => c.addSubIssue(story.repo, story.number, issue!.id))) attached++;
+    subIssues.push({ key: st.key, repo, number: issue.number, url: issue.url });
+  }
+  const list = ordered.map((st) => {
+    const si = subIssues.find((x) => x.key === st.key);
+    return si ? `- [ ] ${st.title} — ${si.repo.owner}/${si.repo.name}#${si.number}` : `- [ ] ${st.title} — ${st.repository} (no sub-issue: GitHub refused it)`;
+  });
+  await commentOnIssue({
+    repo: story.repo,
+    number: story.number,
+    key: `run=${input.runId}:plan=v${input.version}`,
+    body: [
+      `🤖 **Plan approved** (version ${input.version})`,
+      "",
+      input.plan.goal,
+      "",
+      `**Approach:** ${input.plan.approach}`,
+      "",
+      attached === ordered.length ? "**Sub-tasks** (sub-issues of this ticket)" : "**Sub-tasks**",
+      ...list,
+    ].join("\n"),
+  });
+  return { subIssues, attached, missing };
+}
+
+/** Closes the sub-issue of a sub-task: as completed once its pull request is merged, as not planned when it was dropped. */
+export async function closeSubIssue(input: { repo: RepoRef; number: number; dropped?: boolean }): Promise<void> {
+  await gh((c) => c.closeIssue(input.repo, input.number, input.dropped ? "not_planned" : "completed"));
+}
+
+/**
+ * Labels of the ticket at the end of a run. `close` also closes the ticket: a story with several sub-tasks is
+ * complete when the last of its pull requests merges, whichever that is, so no pull request closes it (FR-R7).
+ */
+export async function finalizeIssue(input: { repo: RepoRef; number: number; outcome: "completed" | "closed" | "cancelled" | "failed"; close?: boolean }): Promise<void> {
+  await gh((c) => c.removeLabel(input.repo, input.number, LABEL_IN_PROGRESS));
+  // Never leave the trigger label behind, or the issue would be picked up again in a loop.
+  await gh((c) => c.removeLabel(input.repo, input.number, config.triggerLabel()));
+  if (input.outcome === "completed") {
+    await gh((c) => c.addLabels(input.repo, input.number, [LABEL_DONE]));
+    if (input.close) await gh((c) => c.closeIssue(input.repo, input.number, "completed"));
+  }
+}
+
+/**
+ * Points a stacked pull request at the default branch, once the pull request below it has merged (AD-41).
+ * Returns false when GitHub refuses, e.g. because the pull request was merged or closed in the meantime.
+ */
+export async function retargetPullRequest(input: { repo: RepoRef; number: number; base: string }): Promise<boolean> {
+  try {
+    await gh((c) => c.updatePullRequestBase(input.repo, input.number, input.base));
+    return true;
+  } catch (err) {
+    if (err instanceof ApplicationFailure && err.nonRetryable) return false;
+    throw err;
+  }
+}
+
+/** Pushes a sub-task's branch. Only agent branches ever leave the orchestrator. */
+export async function pushBranch(input: { runId: string; subtaskKey: string; repo: RepoRef; branch: string }): Promise<void> {
+  const { url, env } = remoteFor(input.repo);
+  if (!input.branch.startsWith("agent/")) throw ApplicationFailure.nonRetryable(`Refusing to push non-agent branch ${input.branch}`);
+  const cwd = workRepoDir(input.runId, input.subtaskKey);
+  // The branch was squashed locally; on a retry or a re-publish the remote copy is replaced by exactly the inspected commit.
+  try {
+    await git(["push", "--force", url, `refs/heads/${input.branch}:refs/heads/${input.branch}`], { cwd, env });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // A refusal does not go away by retrying: the requester must fix the access (AD-42). Anything else is retried.
+    if (ACCESS_REFUSED.test(message)) {
+      throw ApplicationFailure.nonRetryable(`The push to ${input.repo.owner}/${input.repo.name} was refused: ${message.slice(0, 400)}`, "AccessDenied");
+    }
+    throw err;
+  }
+}
+
+/** Opens the pull request of a pushed branch (or returns the one that already exists). */
+export async function openPullRequest(input: {
+  repo: RepoRef;
+  branch: string;
+  base: string;
+  title: string;
+  body: string;
+}): Promise<{ number: number; url: string; title: string }> {
+  const existing = await gh((c) => c.findPullRequestByHead(input.repo, input.branch));
+  if (existing) return { number: existing.number, url: existing.url, title: existing.title };
+  const pr = await gh((c) => c.createPullRequest(input.repo, { title: input.title, head: input.branch, base: input.base, body: input.body }));
+  return { number: pr.number, url: pr.url, title: pr.title };
+}
+
+export async function getPullRequestState(input: { repo: RepoRef; number: number }): Promise<"open" | "merged" | "closed"> {
+  const pr = await gh((c) => c.getPullRequest(input.repo, input.number));
+  return pr.merged ? "merged" : pr.state;
+}
+
+/** Discovery poller: finds issues labelled by the owner in every catalog repository and starts a run for each. */
+export async function discoverAndStart(): Promise<number> {
+  const { db, github, temporal, owner } = ctx();
+  const label = config.triggerLabel();
+  let catalog;
+  try {
+    catalog = currentCatalog();
+  } catch (err) {
+    // An invalid catalog stops new runs; runs in flight keep the version they pinned (AD-30).
+    if (err instanceof CatalogError) {
+      log("worker", `discovery skipped, the product catalog is invalid: ${err.message}`);
+      return 0;
+    }
+    throw err;
+  }
+  let started = 0;
+  for (const entry of catalogRepositories(catalog)) {
+    const slug = entry.id;
+    const repo = { owner: entry.owner, name: entry.name };
+    const pollKey = `github:${slug}:${label}`;
+    let listing;
+    try {
+      listing = await github.listLabelledIssues(repo, label, await getPollEtag(db, pollKey));
+    } catch (err) {
+      log("worker", `discovery failed for ${slug}: ${(err as Error).message}`);
+      continue;
+    }
+    if (listing.notModified) continue;
+    for (const issue of listing.issues) {
+      Context.current().heartbeat();
+      const labeler = await github.findLabeler(repo, issue.number, label);
+      if (labeler !== owner.login) {
+        log("worker", `ignoring ${slug}#${issue.number}: labelled by ${labeler ?? "unknown"}, not the owner ${owner.login}`);
+        continue;
+      }
+      const input: DeliveryRunInput = {
+        runId: newId("run"),
+        conversationId: null,
+        workItem: {
+          source: "github",
+          repo,
+          number: issue.number,
+          title: issue.title,
+          body: issue.body,
+          url: issue.url,
+          labels: issue.labels.filter((l) => l !== label),
+          requester: { login: owner.login, id: owner.id },
+        },
+      };
+      try {
+        await temporal.workflow.start("deliveryRunWorkflow", {
+          taskQueue: TASK_QUEUES.orchestration,
+          workflowId: workflowIdForIssue(repo, issue.number),
+          args: [input],
+          memo: { generation: RUN_WORKFLOW_GENERATION },
+          workflowIdConflictPolicy: "FAIL",
+          workflowIdReusePolicy: "ALLOW_DUPLICATE",
+        });
+        started++;
+        log("worker", `started run ${input.runId} for ${slug}#${issue.number}`);
+      } catch (err) {
+        if (!(err instanceof WorkflowExecutionAlreadyStartedError)) throw err;
+      }
+    }
+    await setPollEtag(db, pollKey, listing.etag);
+  }
+  return started;
+}

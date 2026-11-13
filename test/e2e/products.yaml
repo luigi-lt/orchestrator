@@ -1,0 +1,19 @@
+# Product catalog of the end-to-end test: two products, one repository each, served by the fake GitHub.
+products:
+  - id: calc
+    name: Calculator library
+    description: Owns the arithmetic functions (add, subtract). Does not own any web page.
+    owners: [tester]
+    repositories:
+      - id: acme/demo
+        role: library
+        contractPaths: ["index.d.ts"]
+        commands:
+          test: "node test.mjs"
+  - id: shop
+    name: Web shop
+    description: Owns the shop's web pages, which call the calculator library. Does not own the arithmetic itself.
+    owners: [tester]
+    repositories:
+      - id: acme/web
+        role: web client
