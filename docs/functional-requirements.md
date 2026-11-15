@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.6) |
-| **Date** | 2026-11-13 |
+| **Status** | Agreed baseline (v1.7) |
+| **Date** | 2026-11-15 |
 | **Scope** | The next iteration after the [MVP](mvp.md): pilot-ready experience, focused on understanding the work, shaping the plan and reviewing the result |
 
 ## 1. Purpose and context
@@ -26,7 +26,7 @@ The [capability map](capabilities.md) says what the orchestrator must be able to
 |---|---|
 | Requester | The person who hands the work over and works with the agents in the user view (previously called "operator" in discussion; "operator view" stays the name of the technical view) |
 | Analyst agent | Does the preliminary analysis of every work item: understands it, asks clarifying questions, classifies it |
-| Architect agent | On the guided track, designs the solution with the requester in the conversation and writes the hand-off plan |
+| Architect agent | On the guided track, designs the solution with the requester in its own conversation, beside the run's page, and writes the hand-off plan |
 | Implementer agent | Implements a sub-task in a sandbox, set up for the sub-task's product (its guidance, toolchain and commands) |
 | Reviewer agent | Reviews every change before a pull request opens |
 | Front-door agent | The chat assistant in the user view |
@@ -105,7 +105,7 @@ Priorities: **Now** = this iteration; **Next** = the one after; **Later** = back
 As a requester, I get an analysis of every work item I hand over, so that the agents and I share the same understanding before anything is built.
 - The analyst agent reads the ticket (title, description, type, comments, linked issues) and explores the repository.
 - It produces an **analysis summary**: what it understood, the products and repositories involved (FR-M2), affected areas and likely files, risks and assumptions, open questions, an estimated size (S, M, L) and a **proposed track with reasons**.
-- The summary appears as a card in the run's conversation and as a comment on the ticket.
+- The summary appears on the run's page (FR-C2) and as a comment on the ticket.
 
 #### FR-A2 Classification · Now · CAP-02
 As a requester, I get a track proposal I can trust, so that small work flows and large work gets attention.
@@ -126,17 +126,18 @@ As a requester, I can answer the agent's questions in the chat or on the ticket,
 
 ### 5.2 Shape the plan (guided track, with the architect agent)
 
-The requester shapes the plan only through the conversation with the architect agent; the plan card shows the result. The requester's own action is the approval.
+The requester shapes the plan only through the conversation with the architect agent; the plan on the run's page shows the result. The requester's own action is the approval.
 
 #### FR-P1 Design session · Now · CAP-02, CAP-10
-As a requester on the guided track, I design the solution with the architect agent in the conversation, so that the plan reflects decisions we made together.
-- Every run has its own conversation, listed under its ticket (FR-C1); when I started the work from a general chat, that chat shows a link to it. The session starts there by itself once the analyst has classified the work as guided: the architect opens with its reading of the analysis, options and first questions.
-- While the session is open my messages in that conversation go to the architect; every message shows which agent wrote it.
+As a requester on the guided track, I design the solution with the architect agent in its own conversation, so that the plan reflects decisions we made together.
+- Every run has its own page, listed under its ticket (FR-C1, FR-C2); when I started the work from a chat with the assistant, that chat links to it. The session starts by itself once the analyst has classified the work as guided: the architect's conversation opens in the agent panel beside the run's page (FR-C4), with its reading of the analysis, options and first questions.
+- Only the architect and I write in that conversation. I read the plan on the page while we talk; every change the architect makes shows there as a new version.
 - After about 20 minutes of silence the architect's workspace is saved and shut down; my next message resumes it, with a visible "resuming" status while I wait (up to a minute or two).
 - I can ask about the code ("where is the retry logic?"), challenge assumptions, choose between options the architect proposes (with trade-offs), and state constraints ("do not change the public API").
-- The architect keeps a **draft hand-off plan** up to date as we talk, shown in the plan card.
+- The architect keeps a **draft hand-off plan** up to date as we talk, shown in the plan section of the run's page.
 - The architect has read-only access to the repositories of every product involved (FR-M3).
 - The session has no fixed length; it ends when I ask for the plan for approval, or the architect proposes it and I accept.
+- Once I approve a plan, the architect's conversation stays readable but takes no new messages; the panel says why.
 
 #### FR-P2 Hand-off plan content · Now · CAP-02
 As a requester, I get a plan complete enough for agents to build from and for reviewers to check against.
@@ -192,9 +193,9 @@ As a requester, every change I see has already been reviewed, so that my time go
 
 #### FR-R4 Diff check in the app (guided track) · Now · CAP-09, CAP-10
 As a requester on the guided track, I see and approve each agent change before its pull request opens.
-- The card appears in the sub-task's own conversation (FR-C2).
+- The card appears on the sub-task's page (FR-C3).
 - The **change review card** shows: summary, acceptance criteria with the implementer's evidence for each and the reviewer's judgment, the files changed with their line counts, test results, and the review report.
-- The card does **not** show the code. A view of the code changes in the app (unified and side-by-side) is a second stage (FR-N12): the card is not the right place for it, and where it belongs is still to be decided. Until then the requester reads the code in the pull request, which opens on approval.
+- The card does **not** show the code. A view of the code changes in the app (unified and side-by-side) is a second stage (FR-N12): it belongs in a Changes section of the sub-task's page (FR-C3), not on the card. Until then the requester reads the code in the pull request, which opens on approval.
 - Actions: **Approve** (the pull request opens), **Request changes** with feedback (the implementer iterates, the reviewer re-reviews, and the card returns), **Drop the sub-task** (it is closed as not done and noted on the story; sub-tasks that depend on it pause for the requester to decide).
 
 #### FR-R5 Fast-track publishing · Now · CAP-02
@@ -205,7 +206,7 @@ As a requester on the guided track, I see and approve each agent change before i
 
 #### FR-R7 Story view · Now · CAP-10, CAP-11
 As a requester, I see the whole story at a glance.
-- Every sub-task, grouped by product, with status (planned, in progress, AI review, awaiting my check, pull request open, merged, dropped) and links, including the link to its conversation (FR-C2).
+- Every sub-task, grouped by product, with status (planned, in progress, AI review, awaiting my check, pull request open, merged, dropped) and links, including the link to its page (FR-C3). The story view is a section of the run's page (FR-C2).
 - The story completes when the pull requests of all sub-tasks that were not dropped are merged, in every product; the ticket is then closed by the orchestrator, since no single pull request closes it.
 - A pull request closed without merging, or a branch the requester took over, does not stop the other sub-tasks; the run then ends as not fully delivered. When a sub-task is not delivered and others that have not started depend on it, the requester decides: drop them too, build them without it, or cancel the run.
 
@@ -221,7 +222,7 @@ As the person who sets up the orchestrator, I describe the products once, so tha
 As a requester, I see which products the work touches and why, before any plan is made.
 - The analyst places the work using the catalog descriptions and by exploring the candidate repositories read-only; the product where the ticket was filed is a hint, not the answer.
 - The analysis summary lists each product involved, the reason, and what changes there.
-- I can correct the list in the conversation ("the mobile app is affected too"); during the design session the architect can propose adding or removing a product, and the plan shows it.
+- I can correct the list in the conversation with the architect ("the mobile app is affected too"); during the design session the architect can propose adding or removing a product, and the plan shows it.
 
 #### FR-M3 Design across products · Now · CAP-02
 As a requester, I get a plan where the products fit together before anything is built.
@@ -248,33 +249,54 @@ As a product owner, I keep the guidance for agents in my own repository, so that
 - The analyst, architect, implementer and reviewer all read the guidance of each product they work on.
 - Guidance is repository content and therefore untrusted (design rule 3): it shapes how agents work, but cannot grant tools or network access, change commands set in the catalog, or bypass approvals and risk rules.
 
-### 5.6 Follow the work (conversations)
+### 5.6 Follow the work: pages for the work, a conversation for each agent
 
-Conversations form a hierarchy: **ticket → run → sub-task**. It has the same shape as story → sub-issues on the ticket tool.
+The user view keeps two things apart: what the orchestrator records and asks me (on **pages**), and what agents say (in **conversations**, in an agent panel beside the page). Pages form a hierarchy, **ticket → run → sub-task**, the same shape as story → sub-issues on the ticket tool. Each conversation belongs to one agent.
 
-#### FR-C1 Conversations grouped by ticket · Now · CAP-10, CAP-11
-As a requester, I find everything about a ticket in one place, so that I never have to search for the conversation of a run.
-- The side panel of the user view lists **tickets**. Under each ticket are its **runs**, newest first; each run is one conversation (FR-P1).
+#### FR-C1 Work grouped by ticket · Now · CAP-10, CAP-11
+As a requester, I find everything about a ticket in one place, so that I never have to search for a run.
+- The side panel of the user view lists **tickets**. Under each ticket are its **runs**, newest first, and under a guided run its **sub-tasks**, in plan order and labelled with their product. Each entry opens a page.
 - A ticket that is run again (after a failure, a cancellation or a closed pull request) shows all its runs together, numbered in the order they started.
-- The ticket row shows the ticket's reference and title, and whether its newest run is active, finished or failed. A marker shows that something below it waits for me; the marker is also on the run concerned.
-- A ticket is open by itself while its newest run is active, while something waits for me, or when it holds the conversation I am reading; I can open and close any ticket. Tickets are ordered by their latest activity.
-- Choosing a ticket opens the conversation of its newest run.
-- General chats with the assistant are listed separately, below the tickets. A chat that started a run keeps its link card to that run's conversation.
+- The ticket row shows the ticket's reference and title, and whether its newest run is active, finished or failed. A marker shows that something below it waits for me; markers roll up from sub-task to run to ticket.
+- A ticket is open by itself while its newest run is active, while something waits for me, or when it holds the page I am reading; I can open and close any ticket. Tickets are ordered by their latest activity.
+- Choosing a ticket opens the page of its newest run.
 - The Runs page of the operator view groups runs by ticket in the same way, and a run's page links to the other runs of its ticket.
 
-#### FR-C2 A conversation for each sub-task · Now (arrives with sub-tasks) · CAP-10
-As a requester on the guided track, I follow and decide each sub-task in its own conversation, so that the diff check of one sub-task is not buried in the story of another.
-- The **run's conversation** keeps what concerns the whole work: the analysis, the design session with the architect, the hand-off plan and the story view.
-- **Each sub-task has its own conversation under the run**, listed in plan order and labelled with its product. It holds the sub-task's progress, the review report, the change review card (FR-R4) and the pull request; what I ask to change in that sub-task, I ask there.
-- Markers for something waiting roll up: sub-task → run → ticket.
-- The fast track has one change and no sub-task level: everything stays in the run's conversation.
+#### FR-C2 The run's page · Now · CAP-10
+As a requester, I see where a run stands and what it needs from me on one page, so that nothing waits for me unnoticed.
+- A header with the ticket, the track (and the switch of FR-A3 while it is allowed), the run's state and its progress.
+- **Needs you** at the top: every decision waiting for me in this run, its sub-tasks included, each with its action or a link to the sub-task's page.
+- The analysis (FR-A1), the plan with its versions and what changed (FR-P2, FR-P3) and its Approve button (FR-P4), and the story view (FR-R7). On the fast track, the single change: its review, its check results and its pull request.
+- The activity of the run (what happened, newest first) is folded away until I open it.
+- Only the orchestrator writes on the page. Text an agent wrote (a plan's approach, evidence, a finding) is shown as plain text and labelled with the agent.
+
+#### FR-C3 A page for each sub-task · Now · CAP-10
+As a requester on the guided track, I follow and decide each sub-task on its own page, so that the check of one sub-task is not buried in the story of another.
+- The page holds the sub-task's description and acceptance criteria, its progress, the review report, the check of its change (FR-R4), what blocks it (access, dependents) and its pull request.
+- Later it gets a **Changes** section with the code (FR-N12) and the conversation with its implementer (FR-N2).
+- The fast track has one change and no sub-task level: everything about it is on the run's page.
+
+#### FR-C4 A conversation for each agent · Now · CAP-10
+As a requester, I always know which agent I am talking to, so that I never instruct the wrong one.
+- An **agent panel** beside every page holds the conversations with the agents. Each conversation belongs to one agent and one run (or, later, one sub-task); the panel always shows the agent's name.
+- I choose the agent. The panel lists the agents available for the page I am on and says why one is not: the **architect** from the moment the work is classified as guided until a plan is approved (then its conversation stays readable, without new messages); the **assistant** at any time, for questions about the run, its status and its records.
+- No decision is ever taken in a conversation. Agents can show tables and forms of their own; when an agent refers to a record ("show me the plan"), the conversation links to that section of the page instead of copying it.
+- A reply that arrives while I am on another page marks the agent in the panel and the run in the side panel.
+
+#### FR-C5 The assistant on every page · Now · CAP-10
+As a requester, I can ask the assistant anything from wherever I am.
+- On a page outside any run (the start page), the agent panel opens the assistant. My earlier chats with it are listed inside the panel.
+- When I start work from a chat ("work on PROJ-123"), the chat shows a link to the new run's page.
+
+#### FR-C6 Narrow screens · Now · NFR-UX-01
+- At phone width the page fills the screen and the agent panel opens over it as a full-screen sheet, with a way back to the page. Decisions stay on the page.
 
 ### 5.7 Next and later
 
 | ID | Requirement | Priority |
 |---|---|---|
 | FR-N1 | Plain-language live status in the user view ("running tests: 2 failing, fixing"), elapsed time and cost per run | Next |
-| FR-N2 | Message a running agent to steer it; pause and resume; retry a step with a hint; take over the branch | Next |
+| FR-N2 | Message a running agent to steer it, from the agent panel of its sub-task's page (FR-C4); pause and resume; retry a step with a hint; take over the branch | Next |
 | FR-N3 | The agent addresses pull request review comments and CI failures (bounded, with approval before each push) | Next |
 | FR-N4 | "My work" inbox (needs me / running / done), search, history per repository; on top of the ticket hierarchy (FR-C1) | Next |
 | FR-N5 | First-run setup and a settings page instead of `.env`, including the product catalog | Next |
@@ -284,7 +306,7 @@ As a requester on the guided track, I follow and decide each sub-task in its own
 | FR-N9 | Jira and Bitbucket on the same journeys (business stack) | Later |
 | FR-N10 | Developer sub-tasks: assign a sub-task to a named developer, who builds it on a tracked sub-issue; agent sub-tasks can wait for it | Later |
 | FR-N11 | Product-owner approvals: owners of an affected product approve its sub-tasks before they are built, or do their diff checks | Later |
-| FR-N12 | See the code changes of a sub-task in the app before approving them (unified and side-by-side); where in the app this lives is to be decided — not in the change review card | Next |
+| FR-N12 | See the code changes of a sub-task in the app before approving them (unified and side-by-side); in a Changes section of the sub-task's page (FR-C3), not in the change review card | Next |
 
 ## 6. Success measures
 
@@ -302,7 +324,7 @@ As a requester on the guided track, I follow and decide each sub-task in its own
 ## 7. Demo scenario
 
 1. **A bug, fast track.** Label a bug `ai-ready`. Within minutes: the analysis card says fast track, the fix is built and reviewed by the reviewer agent (one finding fixed in the loop), the pull request opens with the review report. Merge it; the ticket closes as done.
-2. **A story across two products, guided track.** The catalog has two products: a service and its web client, each in its own repository. Hand over a story in the chat. The analyst finds that both products are involved and proposes the guided track. The architect opens a design session: the requester asks two questions, adds a constraint and asks to split one sub-task; the architect fixes the API contract between the two products and revises the plan, and the card shows what changed. The plan has three sub-tasks: two in the service, one in the web client. The requester approves; three sub-issues appear, each in its product's repository. The first service sub-task reaches the diff check, the requester requests one change, then approves; its pull request opens in the service repository. The web client sub-task starts once the API change has passed its diff check, and its pull request says to merge after the service's. The story view shows the sub-tasks grouped by product. In the side panel the story is one ticket, with its run under it and the three sub-task conversations under the run.
+2. **A story across two products, guided track.** The catalog has two products: a service and its web client, each in its own repository. Hand over a story to the assistant. The analyst finds that both products are involved and proposes the guided track. The architect opens a design session: the requester asks two questions, adds a constraint and asks to split one sub-task; the architect fixes the API contract between the two products and revises the plan, and the card shows what changed. The plan has three sub-tasks: two in the service, one in the web client. The requester approves; three sub-issues appear, each in its product's repository. The first service sub-task reaches the diff check, the requester requests one change, then approves; its pull request opens in the service repository. The web client sub-task starts once the API change has passed its diff check, and its pull request says to merge after the service's. The story view shows the sub-tasks grouped by product. In the side panel the story is one ticket, with its run under it and the three sub-task pages under the run.
 
 ## 8. Impact on the architecture
 
@@ -314,12 +336,12 @@ Detailed in the [reference architecture](architecture.md) v2.0: decisions AD-30 
 | Product catalog | New configuration, read by the API and the worker; replaces `GITHUB_REPOS`; the token must cover every catalog repository |
 | Workflow (§9) | Track-dependent skeleton; a run belongs to the story ticket, not to a repository; a child workflow per sub-task, carrying its product and repository, with implement → AI review → fix loop → diff check → pull request |
 | Workspaces (CAP-04) | Analyst and architect sandboxes get read-only copies of several repositories; implementer sandboxes get one repository, the image of its product's toolchain, and read-only copies of approved changes they depend on |
-| Design session | The architect agent converses with the requester across many turns with read-only access to the repositories of every product involved: a session workspace kept warm while the conversation is active, saved and shut down when idle, and restored on the next message (AD-34, AD-35). Each run has its own conversation, routed to the architect while the session is open (AD-38) |
+| Design session | The architect agent converses with the requester across many turns with read-only access to the repositories of every product involved: a session workspace kept warm while the conversation is active, saved and shut down when idle, and restored on the next message (AD-34, AD-35). The architect has its own conversation beside the run's page (AD-38) |
 | Plan model | Versioned plans written by the architect, each version recording the request that prompted it; dependencies; approval bound to a version |
 | Pull requests | One per agent sub-task, in its product's repository (the architecture default; the MVP used one per run) |
-| Component catalog | New cards: analysis summary, hand-off plan with versions and what changed (read-only), change review with diff viewer, review report, story view |
+| Component catalog | New cards: analysis summary, hand-off plan with versions and what changed (read-only), change review, review report, story view; shown on pages, not in conversations (AD-44) |
 | GitHub integration | Sub-issues across repositories, `track:` labels; Jira mapping per §4 |
-| Conversations | A hierarchy ticket → run → sub-task (AD-43): grouping by ticket in both views; a conversation per sub-task, created by its sub-task workflow |
+| User view | Pages for runs and sub-tasks in a hierarchy ticket → run → sub-task, kept by the orchestrator, and an agent panel with one conversation per run and agent (AD-25, AD-38, AD-43, AD-44) |
 
 ## 9. Open items
 
@@ -338,3 +360,4 @@ Detailed in the [reference architecture](architecture.md) v2.0: decisions AD-30 
 | 1.4 | Aligned with the architecture v2.0: fast-track limits re-checked on the finished change (FR-A2, FR-R5); one conversation per run and session resume behavior (FR-P1); guidance files are high-risk and who approves high-risk changes (FR-R6); contract paths in the catalog (FR-M1); §8 points to the architecture decisions |
 | 1.5 | Conversation hierarchy ticket → run → sub-task: conversations grouped by ticket in both views (FR-C1), a conversation for each sub-task under its run (FR-C2); the change review card moves to the sub-task's conversation (FR-R4) |
 | 1.6 | The change review card no longer shows the code: the view of code changes is a second stage (FR-R4, FR-N12). A dependent sub-task starts when the one it depends on has passed its check and its pull request is open (FR-B1, FR-M4). What happens when a sub-task is not delivered, and who closes the story (FR-R7) |
+| 1.7 | User view as pages and an agent panel (layout C): pages for runs and sub-tasks with every decision on them (FR-C1 to FR-C3), one conversation per agent with the agent chosen by the requester (FR-C4), the assistant on every page (FR-C5), narrow screens (FR-C6); the design session moves to the architect's own conversation (FR-P1); the code view gets its place on the sub-task's page (FR-R4, FR-N12) |

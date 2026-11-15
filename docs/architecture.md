@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Proposed (v2.4) — for review |
-| **Date** | 2026-11-14 |
+| **Status** | Proposed (v2.5) — for review |
+| **Date** | 2026-11-15 |
 | **Phase** | Reference architecture — follows the [capability map](capabilities.md), the [non-functional requirements](non-functional-requirements.md) and the [functional requirements](functional-requirements.md) of iteration 2 |
 
 ## 1. Purpose and scope
@@ -33,7 +33,7 @@ Out of scope for this document: detailed API specifications, database DDL and UI
 | Step | One agent invocation with a result (e.g., analyse, implement, review, fix) |
 | Review report | The reviewer agent's structured result for one change: verdict and findings |
 | Diff check | The requester's approval of one sub-task's change in the web app, before its pull request opens |
-| Conversation hierarchy | Ticket → run → sub-task: how conversations are grouped. The ticket is the grouping, the run and each sub-task have a conversation (AD-43) |
+| Work hierarchy | Ticket → run → sub-task: how the work is shown. The ticket groups its runs; the run and each sub-task have a page, and each agent has a conversation beside it (AD-43, AD-44) |
 | Workspace | The isolated sandbox in which an agent reads, changes and builds code. A **step workspace** lives for one step; a **session workspace** lives for a design session and is saved when idle (AD-34) |
 | Requester | The person a run acts for: who sent the chat request, or who added the `ai-ready` label (AD-05) |
 | Agent profile | A versioned agent definition: instructions, tools, model, limits (CAP-01) |
@@ -59,8 +59,8 @@ The capability map (v1.8) and the non-functional requirements (v1.3) are updated
 | **The plan is shaped only in a chat with the architect agent**; the requester never edits it (FR-P1 to FR-P4) | Session workspaces (AD-34), durable design turns (AD-35), immutable plan versions (AD-36). The plan editor and the `editPlan` update of v1.2 are removed |
 | **AI review of every change, fix loop, diff check** (FR-R1 to FR-R4) | `reviewer` step and review report (AD-39); change review bound to a commit (AD-40); `SubTaskWorkflow` reshaped (§9) |
 | **Work across products** (FR-M1 to FR-M6) | Product catalog (AD-30); a run belongs to the ticket (AD-31); agents specialized per product by composition (AD-33); workspaces with several repositories (AD-37); dependencies across repositories (AD-41). The tenant is now the product |
-| **One conversation per run** (decided for this iteration) | Refines AD-25: a run started from a chat no longer lives in that chat (AD-38) |
-| **Conversations in a hierarchy: ticket → run → sub-task** (FR-C1, FR-C2) | Grouping by ticket in both views; a conversation per sub-task under its run (AD-43) |
+| **One conversation per run and agent** (revised in v2.5) | A run started from a chat no longer lives in that chat; each agent has its own conversation beside the run's page (AD-38, AD-44) |
+| **Pages in a hierarchy: ticket → run → sub-task** (FR-C1 to FR-C6) | Grouping by ticket in both views; a page for each run and each sub-task, an agent panel beside them (AD-43, AD-44, §25) |
 | **Write access across products is broad at work** (confirmed) | The requester's own token stays the only write credential (AD-06); access is still checked before a plan can be approved (AD-42) |
 | Capability map wording: "readiness check", "planner", "edit plan" | Read as: preliminary analysis, architect, and re-plan through the architect. The capability map itself is unchanged |
 | Non-functional requirements | NFR-PF-10 added for design-session replies (v1.4) |
@@ -108,7 +108,7 @@ New decisions of this phase. They complement D1–D15 in the capability map.
 | AD-22 | **Service secrets in Azure Key Vault** via Entra workload identity; locally from the OS keychain, injected by the launcher. **Linked credentials are envelope-encrypted** in PostgreSQL | NFR-SE-03 | — |
 | AD-23 | **Temporal server runs as a single process on Container Apps** for the pilot, on PostgreSQL. Scale-out path in §19 | Matches best-effort availability; minimal operations | Temporal Cloud: run metadata at a third party; AKS Helm: needs AKS |
 | AD-24 | **The sandbox has no access to source control.** The worker fetches the repository and hands it over as a git bundle through the sandbox gateway; results leave the same way and are pushed by the worker after secret scanning and a policy check | Nothing inside the sandbox can read other repositories or write anywhere; the sandbox needs no route to Bitbucket | Cloning from inside the sandbox with an injected token: a write-capable token at the proxy could be abused |
-| AD-25 | **One web app with two views and a toggle.** User view: conversation with generative UI only. Operator view: conventional role-scoped pages, open to everyone within their scope. Switching keeps context; every run has a home conversation | One sign-in and design system; each audience gets the interaction that fits | Two separate apps; generative UI in the operator view |
+| AD-25 | **One web app with two views and a toggle.** User view: pages for the person's own work, kept by the orchestrator, with the agents' conversations in a panel beside them (AD-44; revised in v2.5, was conversation only). Operator view: conventional role-scoped pages, open to everyone within their scope. Switching keeps context; every run has a page in both views | One sign-in and design system; each audience gets the interaction that fits | Two separate apps; generative UI in the operator view; a user view of conversation only, where records and agents share one stream |
 | AD-26 | **Polling everywhere, no webhooks.** Temporal Schedules poll Jira for new tickets every minute and watch active tickets every two minutes; each sub-task workflow polls its pull request; GitHub is polled every ≤ 5 min (personal) | No webhook can be created; Schedules are durable, observable and pausable | Webhooks: not available; can be added later to speed things up |
 | AD-27 | **Jira through Atlassian's Remote MCP server, with each user's OAuth 2.1 connection**, called programmatically by the worker (no LLM in polling or write-back). Write-back appears under the requester's name, marked agent-generated. Each project has one or more **intake connections** for discovery | The access users can get without admins; respects their Jira permissions | Integration account: needs admins; personal API tokens with REST: fallback if the MCP server falls short (R-10) |
 | AD-28 | **Every external credential is linked by its user**: Copilot token, Atlassian connection, Bitbucket token, optional Jenkins token. Stored encrypted, used only server-side, expiry tracked with reminders | No shared service accounts exist or can be created | — |
@@ -121,12 +121,13 @@ New decisions of this phase. They complement D1–D15 in the capability map.
 | AD-35 | **Design turns are durable workflow work; token streaming is out of band.** A message is persisted, signalled to the `DesignSessionWorkflow` and delivered by an activity; the reply streams workspace → gateway → `api` → browser without entering Temporal history | One owner of the workspace lifecycle; turns survive restarts and are never lost or run twice | The `api` talking to the workspace directly: two owners, lost turns on restart |
 | AD-36 | **Plans are immutable versions written only by the architect through a tool.** The orchestrator validates each version (schema, catalog, dependencies), stores it with the request that prompted it, computes what changed, and renders it. Approval is a user action bound to a version hash; a newer version voids a pending approval | The requester steers, the architect writes, and what is approved is exactly what is built (FR-P3, FR-P4) | An editable plan (v1.2): changes without explanation. Patch operations from the agent: harder to validate, versions drift |
 | AD-37 | **Workspaces hold several repositories; at most one is writable.** Read-only workspaces (analysis, design, review) get the repositories of the products involved as separate bundles and can ask for more catalog repositories, within a limit. An implementer workspace gets its one repository writable, plus read-only copies of approved changes it depends on. Only the writable repository's branch can leave a workspace | Agents see what they need across products; the damage a step can do stays one branch in one repository | One workspace per repository: no cross-product reasoning. All repositories writable: cross-repository changes outside the plan |
-| AD-38 | **One conversation per run; the `api` routes by run state, not a model.** While a design session is open, the requester's messages go to the architect; otherwise to the front-door agent scoped to that run. Every agent message is labelled with its author | Two agents never compete in one thread, and routing cannot be talked into anything | Sharing the chat that started the run: two agents and several runs in one thread |
+| AD-38 | **One conversation per run and agent; the person chooses the agent, the orchestrator says which are available.** Each conversation belongs to one agent, and a message goes to the agent of the conversation it is written in. The `api` checks, from the run's state and never by asking a model, that the agent is available: the architect from the guided classification until a plan is approved, the assistant (front-door agent, scoped to the run or sub-task) at any time. Revised in v2.5; until then one conversation per run whose addressee followed the run's state | Exactly one agent per thread; no message reaches an agent the person did not choose; routing cannot be talked into anything | Sharing the chat that started the run; one conversation per run whose addressee follows the run's state (v2.0 to v2.4) |
 | AD-39 | **Every change is reviewed by the reviewer agent in a fresh read-only workspace**, from the change, the sub-task, the plan and the product's guidance — not from the implementer's transcript. Where a deployment offers several model families, the reviewer's default model differs from the implementer's. The verdict drives the fix loop and fast-track publishing only | An independent second look; errors of the first agent are less likely to be repeated | Self-review by the implementer: same context, same blind spots |
 | AD-40 | **The diff check approves a commit.** The worker computes what changed from the result commit; the change review card is rendered from it (files and line counts; the code itself is not on the card, a view of it is a second stage, FR-N12); the approval carries the commit hash, and exactly that commit is pushed | What the requester saw is what is published | Approving a description of the change |
 | AD-41 | **Dependent sub-tasks: stacked in one repository, referenced across repositories.** In the same repository the dependent branch starts from the approved commit of the one it depends on, and its pull request targets that branch until it merges. Across repositories the dependent implementer gets a read-only copy of the approved change and the contract; pull requests state the merge order and the orchestrator flags violations | Work continues without waiting for merges; reviewers see only each sub-task's own diff | Waiting for each merge: days of idle time. One long-lived branch per story: one huge review |
 | AD-42 | **Access is checked before commitment.** Analysis needs the requester's read access to each repository it opens; a plan can be approved only when the requester can push to every repository in it and (business) create issues in every Jira project involved. As built: the repository must be visible, the user must have write access, and a push that sends nothing (`git push --dry-run` of a branch deletion) must be accepted; a refusal found later makes the sub-task wait for the requester | No story is left half-built because a credential cannot reach one product | Finding out at push time |
-| AD-43 | **Conversations form a hierarchy: ticket → run → sub-task.** A ticket groups the conversations of all its runs; in a guided run, each sub-task has its own conversation under the run, which keeps what concerns the whole work (analysis, design session, plan, story view). The ticket is not a conversation and needs no new state: it is the identity runs already share (the workflow ID that claims the ticket). Waiting decisions roll up from sub-task to run to ticket | Everything about a ticket in one place, in the shape people know from story → sub-issues; a diff check and its discussion stay with their sub-task | A flat list of conversations: runs of the same ticket scattered. One conversation per run for everything: several diff checks and review reports in one long thread |
+| AD-43 | **The work forms a hierarchy: ticket → run → sub-task.** A ticket groups all its runs; a run has a page for what concerns the whole work (analysis, plan, story view), and in a guided run each sub-task has a page under it (its check, review and pull request). Agent conversations attach to a run, later also to a sub-task (AD-38). The ticket is not stored: it is the identity runs already share (the workflow ID that claims the ticket). Waiting decisions roll up from sub-task to run to ticket. Revised in v2.5: conversations became pages | Everything about a ticket in one place, in the shape people know from story → sub-issues; a diff check stays with its sub-task | A flat list; one long page or thread per run for everything |
+| AD-44 | **Pages for the orchestrator's records, conversations for agents.** Cards, decisions and progress are sections of the run's and sub-task's pages, written only by the orchestrator. Agents' text appears only in their conversations, where an agent can show tables and forms of its own and point to a section of a page, but never place a card or a decision | The trust boundary is visible in the layout; a decision is never inside a chat; a long run stays readable; the person reads the plan while talking to the architect | Cards and agent turns in one timeline (v2.0 to v2.4); threads attached to records, which cramp a long design session; a tab per agent, which hides the plan while designing |
 
 ## 5. System context
 
@@ -234,7 +235,7 @@ flowchart TB
 
 | Deployable | Responsibility | Technology | Trust zone | Scaling | Main capabilities |
 |---|---|---|---|---|---|
-| `api` | Control plane (modular monolith): edge and sessions, conversation and its routing, web channel, run commands and queries, approvals, chat intake, registry and product catalog, identity and linked credentials, credential broker, notifications, event fan-out. Serves the web app's static files | Node.js, TypeScript; AG-UI; Cedar; Web Push | Control plane | Horizontal, stateless (min 1) | CAP-01, 02, 07, 08, 09, 10, 11 |
+| `api` | Control plane (modular monolith): edge and sessions, pages, conversations and their routing, web channel, run commands and queries, approvals, chat intake, registry and product catalog, identity and linked credentials, credential broker, notifications, event fan-out. Serves the web app's static files | Node.js, TypeScript; AG-UI; Cedar; Web Push | Control plane | Horizontal, stateless (min 1) | CAP-01, 02, 07, 08, 09, 10, 11 |
 | `copilot-runtime` (sidecar of `api`) | Shared Copilot runtime for front-door agent sessions, `mode: "empty"` | Copilot CLI server | Control plane | With `api` | CAP-10 |
 | `worker` | Temporal workflows (delivery run, design session, sub-task), activities (policy, approvals, integrations, agent-step and design-turn supervision, plan validation, diffs, write-back, compensation) and pollers (Schedules) | Node.js, TypeScript; Temporal SDK; MCP client | Control plane | Horizontal per task queue (min 1) | CAP-02, 03, 05, 06, 07, 09 |
 | `workspace-manager` | Creates, tracks and destroys workspaces; only identity allowed to manage sandboxes; reaper for orphaned workspaces | Node.js, TypeScript; Temporal worker on its own task queue | Control plane (privileged) | 1–2 replicas | CAP-04 |
@@ -256,7 +257,7 @@ Iteration 2 adds **no deployable**: the new agent roles, the design session and 
 | Module | Responsibility | Key interfaces |
 |---|---|---|
 | Edge | Entra ID sign-in (OIDC, authorization code with PKCE) as a backend-for-frontend: tokens stay server-side, browser holds an httpOnly, SameSite=strict session cookie; CSRF protection; request rate limits | HTTPS |
-| Conversation | Conversations and their messages, persisted in PostgreSQL. **Routing (AD-38):** in a run's conversation, a message goes to the architect while the run's design session is open (persist, then signal the `DesignSessionWorkflow`), otherwise to the front-door agent. Front-door agent: one Copilot session per conversation on the shared `copilot-runtime` (AD-15); the Copilot session is a cache, rebuilt from history when needed; idle sessions closed after 15–30 min | Copilot SDK (JSON-RPC to sidecar); Temporal signal |
+| Conversation | Conversations and their messages, persisted in PostgreSQL. **Routing (AD-38):** each conversation belongs to one agent; a message goes to that agent if it is available for the run's state (the architect: persist, then signal the `DesignSessionWorkflow`; the front-door agent: a turn on its Copilot session). **Pages (AD-44):** the run's and sub-task's pages are read from the orchestrator's cards, never from conversations. Front-door agent: one Copilot session per conversation on the shared `copilot-runtime` (AD-15); the Copilot session is a cache, rebuilt from history when needed; idle sessions closed after 15–30 min | Copilot SDK (JSON-RPC to sidecar); Temporal signal |
 | Channels / web | User view: AG-UI event stream over Server-Sent Events, resumable with `Last-Event-ID`, carrying catalog components. Operator view: REST queries on projections plus an SSE subscription to run events. Toggle state and landing-view preference | AG-UI; REST; SSE |
 | Channels / Teams | *Later release (AD-17)*: Teams SDK bot, A2UI → Adaptive Cards renderer | — |
 | Runs | Commands (start, pause, resume, cancel, change track, retry, take over) mapped to Temporal starts and signals; queries from projections, including plan versions, review reports and diffs | Temporal client; REST |
@@ -360,11 +361,11 @@ Two listeners: **sandbox-facing** (workspace control channel, bundles, MCP) and 
 
 | | User view | Operator view |
 |---|---|---|
-| Purpose | Ask for work, design it with the architect, follow it, answer questions, check changes and approve — in a conversation | See and control everything, in technical detail |
-| Interaction | Chat with the front-door agent and, during a design session, the architect agent; content appears as generative UI inside the conversation | Conventional pages: lists, graphs, timelines, transcripts, forms |
+| Purpose | Ask for work, design it with the architect, follow it, answer questions, check changes and approve — on pages for the work, with the agents beside them | See and control everything, in technical detail |
+| Interaction | Pages for each run and sub-task with the decisions on them; an agent panel with one conversation per agent (the assistant; the architect during a design session), where agents show text, tables and forms | Conventional pages: lists, graphs, timelines, transcripts, forms |
 | Who | Everyone | Everyone, scoped by role |
-| Who builds the screen | Composed at runtime from the component catalog by the agent and the orchestrator | Fixed pages designed and built by the team; no agent-generated UI |
-| Data channel | AG-UI stream (SSE) per conversation | REST queries on projections plus an SSE subscription to run events |
+| Who builds the screen | Pages: fixed layouts filled with orchestrator cards from the component catalog. Conversations: components the agent chooses from the catalog's agent-allowed part | Fixed pages designed and built by the team; no agent-generated UI |
+| Data channel | REST queries for pages and an SSE subscription to their changes; AG-UI stream (SSE) per conversation | REST queries on projections plus an SSE subscription to run events |
 | Channels | Web (Teams in a later release) | Web only |
 
 #### Toggle and navigation
@@ -374,40 +375,46 @@ Two listeners: **sandbox-facing** (workspace control channel, bundles, MCP) and 
 
 | From | To | Opens |
 |---|---|---|
-| A run's conversation, or one of its sub-tasks' | Operator view | That run's detail page |
-| A general chat | Operator view | The runs list (developers: their own runs) |
-| A run detail page | User view | That run's conversation for the person |
-| Any other operator page | User view | The last conversation |
+| A run's page, or one of its sub-tasks' pages | Operator view | That run's detail page |
+| The start page, or a chat with the assistant | Operator view | The runs list (developers: their own runs) |
+| A run detail page | User view | That run's page |
+| Any other operator page | User view | The last page the person opened |
 
 - **Landing view**: the last view each person used, stored as a server-side preference. First visit: user view for developers, operator view for operator roles.
-- **Addressable URLs** for both views (e.g., `/chat/<conversation>`, `/ops/runs/<run>`), used by notifications and links posted on tickets.
+- **Addressable URLs** for both views (e.g., `/runs/<run>`, `/runs/<run>/subtasks/<key>`, `/ops/runs/<run>`), used by notifications and links posted on tickets.
 
 #### User view
 
-**Layout.** The conversation fills the center. A **thin frame** around it holds a side panel and a **pending-actions badge** (approvals, questions waiting for the person). The side panel shows the **conversation hierarchy** (AD-43): tickets, under each ticket its runs (newest first), under a guided run its sub-tasks; general chats are listed below. A ticket opens by itself while its newest run is active, something waits for the person, or it holds the open conversation. Selecting a ticket opens its newest run; selecting a pending action opens the conversation it belongs to.
+**Layout (AD-44, §25).** Three parts. The **side panel** shows the work hierarchy (AD-43): tickets, under each ticket its runs (newest first), under a guided run its sub-tasks; each entry opens a page. The **page** in the centre shows a run or a sub-task. The **agent panel** on the right holds the conversations with the agents, and can be closed. A **pending-actions badge** in the header lists the decisions waiting for the person; each opens the page it belongs to. A ticket opens by itself in the side panel while its newest run is active, something waits for the person, or it holds the open page. At phone width the page fills the screen and the agent panel opens as a full-screen sheet over it (FR-C6).
 
-**Conversations and runs (AD-38).** Every run has **its own conversation** for its requester, created when the run starts. When the run was started from a chat, that chat shows a link card to the run's conversation and stays a general chat with the front-door agent. Other people involved in a run (e.g., an engineering lead asked to approve) get a conversation for that run the first time they are involved. The toggle uses the run of the open conversation.
+**Pages.** Written only by the orchestrator, from its records, and updated live:
 
-**Conversations and sub-tasks (AD-43).** In a guided run every sub-task gets its own conversation, created by its `SubTaskWorkflow` when the sub-task starts. Cards about one sub-task (its progress, review report, change review, pull request) are posted there; cards about the whole work (analysis, plan, story view) stay in the run's conversation, and the story view links to each sub-task's conversation. The fast track has a single change and no sub-task level.
+| Page | Sections |
+|---|---|
+| Run | Header: ticket, track with its switch (FR-A3), state, progress. **Needs you**: every decision waiting in the run and its sub-tasks. Analysis; plan with versions, what changed and Approve; story view. On the fast track, the single change: review, checks, pull request. Activity, folded away |
+| Sub-task | Description and acceptance criteria, progress, review report, check of the change, what blocks it, pull request. Later: a Changes section with the code (FR-N12) and the implementer's conversation (FR-N2) |
+| Start | The person's tickets that need them or are active, and the assistant in the agent panel |
 
-**Who answers.** The `api` routes each message by the run's state, never by asking a model:
+**Conversations (AD-38).** One per run and agent, created when the agent first takes part: the architect's when the run is classified as guided, the assistant's when the person first opens it on that run. A chat with the assistant outside any run is a general conversation; when it starts a run, it shows a link to the run's page. Other people involved in a run (e.g., an engineering lead asked to approve) see its pages within their scope and get their own conversations.
 
-| Run state | The requester's message goes to | Shown in the conversation |
+**Who answers.** The person picks the agent in the panel; a message goes to the agent of the conversation it is written in, after the `api` checks that the agent is available, from the run's state and never by asking a model:
+
+| Agent | Available | When not |
 |---|---|---|
-| Design session open (designing, or plan proposed and not yet approved) | The **architect agent** | A header strip: "Design session with the architect", with the session state (active, resuming) |
-| Any other state | The **front-door agent**, scoped to this run (status, showing cards) | Nothing extra |
-| A sub-task's conversation, in any state | The **front-door agent**, scoped to that sub-task. What should change in the sub-task is said on its change review card, never to an agent | Nothing extra |
+| **Architect** | From the guided classification until a plan is approved | Before: not listed. After: the conversation stays readable, the panel says the plan is approved |
+| **Assistant** (front-door agent) | Always; scoped to the run or sub-task of the page, or to the person's work on the start page | — |
+| Implementer of a sub-task (later, FR-N2) | While the sub-task is being built | Read-only after |
 
-Every agent message carries the name of the agent that wrote it. While a session workspace is starting or resuming, a status line appears within the acknowledgement time (NFR-PF-01), so the wait is never silent (NFR-PF-10).
+Every conversation shows its agent's name in the panel header. While a session workspace is starting or resuming, a status line appears in the architect's conversation within the acknowledgement time (NFR-PF-01), so the wait is never silent (NFR-PF-10).
 
-**Two sources of content** in the conversation timeline:
+**Two sources of content, in two places (AD-44):**
 
-1. **Agent turns** from the front-door agent or the architect agent: text and agent-allowed components (text, form, table). The architect uses a form to offer design options; the choice comes back as a message.
-2. **Orchestrator cards**: system-only components posted by the orchestrator from run events and approvals (analysis, plan, change review, review report, story, progress tracker, approval card, pull request summary). They are visually marked as coming from the orchestrator, so people can trust what an approval card says. Where a card shows text an agent wrote (a plan's approach, a finding, the evidence for an acceptance criterion), that text is validated by schema, shown as plain text and labelled with the agent that wrote it.
+1. **Orchestrator cards** on pages: system-only components built from run events and approvals (analysis, plan, change review, review report, story, progress tracker, approval card, pull request summary). Where a card shows text an agent wrote (a plan's approach, a finding, the evidence for an acceptance criterion), that text is validated by schema, shown as plain text and labelled with the agent that wrote it.
+2. **Agent turns** in conversations: text and agent-allowed components (text, form, table). The architect uses a form to offer design options; the choice comes back as a message.
 
-The agent can **bring up an orchestrator card by reference** — "show me the plan of PROJ-123" makes the agent call `show(runId, "plan")` — and the orchestrator renders it from its own data. The agent never writes the content of a system-only component; the `api` strips any that appear in agent output.
+An agent can **point to a record by reference** — "show me the plan of PROJ-123" makes the agent call `show(runId, "plan")` — and the conversation shows a link that opens that section of the page. A new plan version shows in the architect's conversation as a one-line marker with such a link. The agent never writes the content of a system-only component; the `api` strips any that appear in agent output.
 
-**Actions on cards** (approve a plan version, approve a change, request changes, drop a sub-task, change the track, answer, pause or cancel one's own run) are sent as typed events straight to the `api` and authorized by policy (CAP-08). They never pass through an agent: typing "approve" in the chat approves nothing (FR-P4).
+**Actions on cards** (approve a plan version, approve a change, request changes, drop a sub-task, change the track, answer, pause or cancel one's own run) are buttons on the pages, sent as typed events straight to the `api` and authorized by policy (CAP-08). They never pass through an agent: typing "approve" in the chat approves nothing (FR-P4).
 
 **Agent text is rendered defensively.** Markdown from agents is rendered without remote images or embedded content, and links show their full address and open only on a click; the web app's content security policy allows connections and images from its own origin only. An agent that has read confidential code cannot make the browser send it anywhere (§13).
 
@@ -419,9 +426,9 @@ The agent can **bring up an orchestrator card by reference** — "show me the pl
 | Form (text, choice, number, date) | Agent, orchestrator | Rendered | `Input.*` + `Action.Execute` |
 | Table | Agent, orchestrator | Rendered | Table |
 | Work item card | Orchestrator | Rendered | Card |
-| Analysis card | Orchestrator (analysis from the analyst, validated by schema) | Summary, products involved with reasons, size, track with reasons and a **change track** action; on the fast track, the intended approach | Summary + link |
-| Plan card | Orchestrator (plan versions from the architect, validated by schema) | Read-only: goal, approach, contracts, sub-tasks grouped by product and numbered in build order, dependencies; version selector and **what changed** since the previous version; failed checks; **Approve** once the version is proposed. One card per run: it moves below the architect's reply whenever a version is added or put up for approval | Summary + link |
-| Change review card | Orchestrator (changed files computed by the worker) | Summary, acceptance criteria with the implementer's evidence and the reviewer's judgment, files changed with line counts, test results, review report; **Approve**, **Request changes**, **Drop the sub-task**. No code on the card: a view of the code changes is a second stage (FR-N12) | Link to web |
+| Analysis card | Orchestrator (analysis from the analyst, validated by schema) | Summary, products involved with reasons, size, track with reasons; on the fast track, the intended approach. The track's switch sits in the run page's header (FR-A3) | Summary + link |
+| Plan card | Orchestrator (plan versions from the architect, validated by schema) | Read-only: goal, approach, contracts, sub-tasks grouped by product and numbered in build order, dependencies; version selector and **what changed** since the previous version; failed checks; **Approve** once the version is proposed. One card per run, in the plan section of the run's page; the architect's conversation links to it | Summary + link |
+| Change review card | Orchestrator (changed files computed by the worker) | Summary, acceptance criteria with the implementer's evidence and the reviewer's judgment, files changed with line counts, test results, review report; **Approve**, **Request changes**, **Drop the sub-task**. No code on the card: a view of the code changes comes later, as a Changes section of the sub-task's page (FR-N12) | Link to web |
 | Review report | Orchestrator (report from the reviewer, validated by schema) | Verdict, findings by severity with file and line | Summary + link |
 | Story view | Orchestrator | Sub-tasks grouped by product with status, links and merge order; warnings for pull requests merged out of order | Summary + link |
 | Approval card | **Orchestrator only** | Rendered | `Action.Execute` approve/reject |
@@ -451,7 +458,7 @@ Until Teams arrives, people need the corporate network or VPN to act on runs; no
 
 | Role | Sees in the operator view | Can do |
 |---|---|---|
-| Developer | Their own runs, including transcripts | Read only (pause and cancel happen in the conversation) |
+| Developer | Their own runs, including transcripts | Read only (pause and cancel happen on the run's page) |
 | Engineering lead | All runs in which one of their products is involved | Interventions on runs whose ticket belongs to their product; high-risk approvals for sub-tasks that change their product |
 | Agent developer | All runs, including transcripts | Manage agent profiles below production |
 | Platform admin | Everything operational | All interventions, configuration, promotion |
@@ -470,7 +477,7 @@ The Temporal Web UI stays a separate, low-level tool for platform admins.
 | Situation | Requester | Others involved (e.g., approver) |
 |---|---|---|
 | Question or approval waiting (plan proposed, change ready for the diff check, review findings unresolved, high-risk action) | Badge + browser notification | Badge + browser notification + Jira comment mentioning them |
-| The architect replied while the requester was away from the conversation | Badge + browser notification | — |
+| The architect replied while the requester was not looking at its conversation | Badge + browser notification | — |
 | Run finished, failed or paused | Badge + browser notification | — |
 | Linked credential expiring or invalid | Badge + browser notification; banner in the web app | — |
 
@@ -499,7 +506,7 @@ sequenceDiagram
   W->>W: Requester linked, credentials valid, ticket not claimed?
   W->>T: Start DeliveryRun (workflow ID from ticket key, duplicates rejected)
   T->>W: Run workflow, pin catalog and profile versions
-  W->>API: Create the run's conversation, work item card
+  W->>API: Create the run's page, work item card
   W->>WS: Analysis step with the home product's repositories and the catalog extract
   WS->>G: request_repository (another candidate product)
   G->>W: Access and limit checks, prepare bundle
@@ -511,8 +518,8 @@ sequenceDiagram
 
 - **Pickup time** is at most one polling interval plus processing: ≤ 2 min (NFR-PF-06). A chat request ("work on PROJ-123") starts at once.
 - **Requester not linked yet**: no run starts; the person gets a badge and browser notification asking them to link their accounts (if they have used the web app), and the intake connection comments on the ticket with a link to the web app. The ticket is picked up as soon as the links exist.
-- **Unclear ticket**: the analysis carries questions; they are posted on the ticket and in the conversation. The watch poller detects the requester's reply (or the person answers in the web app), and the analysis step runs again with the answers.
-- **Placing the work (FR-M2)**: the analyst starts from the product where the ticket lives and the catalog descriptions, and opens candidate repositories on demand. The requester can correct the product list in the conversation; the correction is an answer that re-runs the analysis.
+- **Unclear ticket**: the analysis carries questions; they are posted on the ticket and on the run's page. The watch poller detects the requester's reply (or the person answers in the web app), and the analysis step runs again with the answers.
+- **Placing the work (FR-M2)**: the analyst starts from the product where the ticket lives and the catalog descriptions, and opens candidate repositories on demand. The requester can correct the product list by answering on the run's page; the correction re-runs the analysis.
 - **Track rules (AD-32)**, applied by the workflow to the validated analysis: more than one product → guided; ticket type Story → guided; otherwise the analyst's proposal. The requester can change the track (§9).
 
 ### 8.2 Design session to approved plan
@@ -520,7 +527,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
   actor Dev as Requester
-  participant API as api (conversation)
+  participant API as api (pages, conversations)
   participant T as Temporal (DesignSession)
   participant W as worker
   participant M as workspace-manager
@@ -530,8 +537,8 @@ sequenceDiagram
   W->>M: Create session workspace (repositories of the products involved)
   S->>G: Connect, download brief and bundles
   S-->>API: Opening message streamed via gateway (approach, options, first questions)
-  Dev->>API: Message in the run's conversation
-  API->>API: Persist message, route to the architect
+  Dev->>API: Message in the architect's conversation
+  API->>API: Persist message, check the architect is available
   API->>T: Signal requesterMessage
   T->>W: runDesignTurn (queued messages)
   W->>G: Deliver turn to the workspace
@@ -540,7 +547,7 @@ sequenceDiagram
   G->>G: Validate against schema and catalog
   S->>G: propose_plan
   W->>W: Turn ends, store the plan version, compute what changed
-  W-->>API: Plan card shows the new version
+  W-->>API: Plan section of the run's page shows the new version
   T->>API: Create approval bound to the version hash, notify
   Dev->>API: Approve on the plan card
   API->>API: Policy and access checks, record decision with the hash
@@ -552,9 +559,9 @@ sequenceDiagram
 - **The session opens by itself.** As soon as the run is guided, the workflow starts the opening turn, so the workspace is already warm when the requester arrives.
 - **One turn at a time.** Messages that arrive during a turn are queued and delivered together as the next turn.
 - **Streaming** goes workspace → gateway → `LISTEN/NOTIFY` → `api` → browser as step progress; only the turn's start and end are workflow events (AD-35).
-- **Idle**: 20 minutes after the last turn the workflow checkpoints and destroys the workspace. The next message restores it; the conversation shows "resuming" at once, and the reply follows within the workspace start time (NFR-PF-10).
+- **Idle**: 20 minutes after the last turn the workflow checkpoints and destroys the workspace. The next message restores it; the architect's conversation shows "resuming" at once, and the reply follows within the workspace start time (NFR-PF-10).
 - **A new plan version after the proposal** (the requester asked for one more change) voids the pending approval; the architect proposes again when the version is ready. An approval for an older hash is refused.
-- **Before approval is possible (AD-42)** the `api` checks that the requester can push to every repository in the plan and, in the business deployment, create issues in every Jira project involved. Missing access is listed on the plan card.
+- **Before approval is possible (AD-42)** the `api` checks that the requester can push to every repository in the plan and, in the business deployment, create issues in every Jira project involved. Missing access is shown on the run's page, and the plan is not put up for approval until it is fixed.
 - **Products can change during the session (FR-M2)**: the architect adds a repository with `request_repository`; the plan version that follows shows the added or removed product.
 
 ### 8.3 Sub-task: implement, AI review, diff check, pull request
@@ -596,7 +603,7 @@ sequenceDiagram
 
 - **The reviewer starts clean (AD-39):** it gets the diff, the sub-task with its acceptance criteria, the plan's scope, constraints and contracts, the product's guidance at the base commit, and the test results — not the implementer's transcript.
 - **Fast track:** the same workflow runs once, without the diff check. Before the push the worker re-checks the fast-track limits against the real diff (files changed, one repository, no high-risk or contract paths). When they are exceeded, the run stops and asks the requester: continue, switch to guided, or cancel.
-- **The cards of a sub-task** (progress, review report, change review, pull request) are posted in the sub-task's own conversation; the run's conversation shows the story view (AD-43).
+- **A sub-task's page** shows its progress, review report, change review and pull request; the run's page shows the story view, which links to each sub-task's page (AD-43, AD-44).
 - **Request changes** at the diff check starts another implement and review round with the requester's feedback; the card returns with a new commit.
 - **Drop the sub-task** closes it as not done, and its sub-issue as not planned. When sub-tasks that have not started depend on it, the run asks the requester: drop them too, build them without it, or cancel the run. The same question is asked when a pull request is closed without merging or the requester takes over a branch; the other sub-tasks go on, and the run then ends as not fully delivered.
 - **The story is closed by the orchestrator** when the last pull request of the sub-tasks that were not dropped is merged: with several sub-tasks, no single pull request closes the ticket, because they can merge in any order.
@@ -646,17 +653,17 @@ In a story across products, the approver is a lead of **the product the sub-task
 ```mermaid
 sequenceDiagram
   actor Dev as Developer
-  participant API as api (conversation)
+  participant API as api (pages, conversations)
   participant CR as copilot-runtime
   participant T as Temporal
   Dev->>API: Work on PROJ-123
   API->>CR: Session message (requester token, mode empty)
   CR->>API: Tool call submit_work_item(PROJ-123)
   API->>T: Start DeliveryRun (same path as 8.1, no polling wait)
-  API-->>Dev: Link card to the run's own conversation
+  API-->>Dev: Link to the new run's page
 ```
 
-The front-door agent's tools are limited to: submit a work item, get run status, list the requester's runs, show an orchestrator card by reference, and render agent-allowed components. Approvals and track changes are never available as tools.
+The front-door agent's tools are limited to: submit a work item, get run status, list the requester's runs, point to a section of a page by reference, and render agent-allowed components. Approvals and track changes are never available as tools.
 
 ## 9. Run lifecycle and workflow design
 
@@ -800,7 +807,7 @@ Key entities (logical); new or changed in iteration 2 in **bold**:
 | `user`, `linked_credential` | Provider, encrypted secret, scopes, expires at, last verified |
 | **`catalog_version`**, **`product`**, **`product_repository`** | Catalog hash and content; per product: description, owners, ticket source (Jira project or GitHub repositories), intake connections, status mapping, risk overrides, budgets; per repository: role, toolchain image, commands, risk and contract paths, registries |
 | `agent_profile`, `policy_set` | Id, version, status, spec; Cedar source |
-| `work_item`, **`run`** | Run: home product (tenant), track and its history, pinned catalog and profile versions, conversation |
+| `work_item`, **`run`** | Run: home product (tenant), track and its history, pinned catalog and profile versions |
 | **`analysis`** | Run, version, document (understanding, products with reasons, size, proposed track, questions, fast-track approach) |
 | **`design_session`** | Run, state (active, suspended, closed), workspace, pinned repository commits, checkpoint reference, last turn |
 | **`plan_version`** | Run, number, hash, parent, document, status (draft, proposed, approved, superseded), author profile version, the message that prompted it |
@@ -809,7 +816,7 @@ Key entities (logical); new or changed in iteration 2 in **bold**:
 | **`review_report`** | Sub-task, round, head commit, verdict, findings (severity, file, line, explanation, suggestion) |
 | **`change_review`** | Sub-task, head commit, diff reference, state, the requester's feedback |
 | `approval` | Subject (plan version, change, unresolved findings, high-risk action), hash, required principal, state |
-| **`conversation`**, **`message`** | Conversation: kind (general, run or sub-task), run, sub-task. The ticket level is not stored: it is derived from the runs that share a ticket identity (AD-43). Message: author (requester, front-door, architect, orchestrator), text, components |
+| **`conversation`**, **`message`**, **`card`** | Conversation: agent (assistant, architect; later implementer), run, sub-task; neither for a general chat with the assistant. The ticket level is not stored: it is derived from the runs that share a ticket identity (AD-43). Message: author (requester or agent), text, components. Card: a section of a run's or sub-task's page, written only by the orchestrator, with its version (AD-44) |
 | `run_event`, `usage_record`, `poll_checkpoint`, `push_subscription`, `audit_record` | As before; usage is recorded per step and per design turn, with the product it served |
 
 - **Retention jobs** enforce NFR-DR-02: run events and audit 1 year; transcripts, progress and artifacts (including bundles and diffs) 90 days; design-session checkpoints until the run closes plus 7 days; deletion on request (NFR-DR-04).
@@ -824,7 +831,7 @@ Mapped from Entra app roles (business); the owner holds all roles (personal).
 
 | Role | Can |
 |---|---|
-| Developer | Request work; design it with the architect; change the track; approve own plan versions and changes (diff check); drop sub-tasks; follow, pause and cancel own runs from the conversation; answer questions; see the technical detail of own runs in the operator view (read-only) |
+| Developer | Request work; design it with the architect; change the track; approve own plan versions and changes (diff check); drop sub-tasks; follow, pause and cancel own runs from their pages; answer questions; see the technical detail of own runs in the operator view (read-only) |
 | Engineering lead (per product; the product's owners in the catalog) | Approve high-risk actions on sub-tasks that change their product, and budget increases; see every run their product is involved in and intervene in runs whose ticket belongs to it; provide an intake connection for the product |
 | Agent developer | See transcripts, tool calls, evaluation results; manage agent profiles below production |
 | Platform admin | Operate the system; promote profiles; manage policies and configuration; Temporal UI |
@@ -1086,7 +1093,7 @@ A design turn uses the same envelope with a turn ID, the requester's messages in
 
 ```
 apps/
-  api/                 control plane modules (edge, conversation, channels, runs, approvals, intake, registry, identity, notifications)
+  api/                 control plane modules (edge, pages, conversations, channels, runs, approvals, intake, registry, identity, notifications)
   worker/              Temporal workflows (delivery run, design session, sub-task), activities and pollers
   workspace-manager/   WorkspaceProvider adapters
   sandbox-gateway/     control channel, bundles and MCP tool endpoint
@@ -1123,7 +1130,7 @@ Quality gates in CI: type checks, unit tests, contract tests for adapters (recor
 | CAP-07 Work intake | Jira and GitHub pollers (Temporal Schedules); Atlassian MCP client; chat intake |
 | CAP-08 Identity, policy | Entra ID; linked credentials; Cedar; Bitbucket branch permissions |
 | CAP-09 Human in the loop | `api` approvals (plan version, diff check, unresolved findings, high risk); track change; signals; notifications and Jira mentions |
-| CAP-10 User view | Web app user view; one conversation per run with routing to the front-door or the architect agent; component catalog; orchestrator cards (Teams later) |
+| CAP-10 User view | Web app user view: pages for runs and sub-tasks, an agent panel with one conversation per agent (AD-25, AD-38, AD-44, §25); component catalog; orchestrator cards (Teams later) |
 | CAP-11 Operator view | Web app operator view (role-scoped pages); projections; Temporal UI for platform admins |
 | CAP-12 Guardrails (Tier 2) | Egress controls, secret scanning, track rules and fast-track limits, defensive rendering of agent text (Tier 1 essentials); `reviewer` agent; injection test suite |
 | CAP-13 Observability, audit (Tier 2) | OpenTelemetry; hash-chained audit |
@@ -1139,7 +1146,7 @@ Quality gates in CI: type checks, unit tests, contract tests for adapters (recor
 | FR-A2 Classification | Track rules on the validated analysis; fast-track limits re-checked on the real diff (AD-32) |
 | FR-A3 Change the track | `changeTrack` signal; track history on the run; `track:` label (§9) |
 | FR-A4 Clarifying questions | Questions in the analysis; watch poller and web app answers (§8.1) |
-| FR-P1 Design session | Session workspace (AD-34); `DesignSessionWorkflow`; conversation routing (AD-38); §8.2 |
+| FR-P1 Design session | Session workspace (AD-34); `DesignSessionWorkflow`; the architect's own conversation (AD-38); §8.2 |
 | FR-P2 Plan content and checks | Plan schema and validation in `submit_plan` (§7.4) |
 | FR-P3 Revise in the conversation | Immutable plan versions with the prompting message and computed differences (AD-36); no edit path in either view |
 | FR-P4 Approve | Approval bound to the version hash, UI action only; newer version voids it |
@@ -1158,8 +1165,12 @@ Quality gates in CI: type checks, unit tests, contract tests for adapters (recor
 | FR-M4 Product implementers | Specialization by composition (AD-33); product image and commands; reference copies of approved changes |
 | FR-M5 Pull requests across products | Pull request per repository; merge order in descriptions; `scm.merge_order_violated` (§8.4) |
 | FR-M6 Guidance kept by the product team | Guidance read at the base commit as untrusted content; high-risk path by default (§13, §15) |
-| FR-C1 Conversations grouped by ticket | Tickets derived from runs that share a ticket identity; pending decisions rolled up; the same grouping in the side panel and on the Runs page (AD-43, §7.5) |
-| FR-C2 A conversation for each sub-task | Conversation of kind sub-task created by the `SubTaskWorkflow`; sub-task cards posted there (AD-43, §8.3) |
+| FR-C1 Work grouped by ticket | Tickets derived from runs that share a ticket identity; pending decisions rolled up; the same grouping in the side panel and on the Runs page (AD-43, §7.5) |
+| FR-C2 The run's page | Page queries over the run's cards; Needs you from pending approvals (AD-44, §7.5, §25) |
+| FR-C3 A page for each sub-task | Cards keyed by sub-task, written by the `SubTaskWorkflow` (AD-43, §8.3) |
+| FR-C4 A conversation for each agent | Conversations per run and agent; routing by conversation with an availability check (AD-38) |
+| FR-C5 The assistant on every page | Front-door agent scoped to the page's run or to the person's work (§7.5) |
+| FR-C6 Narrow screens | Agent panel as a full-screen sheet (§7.5) |
 
 ### Key non-functional requirements
 
@@ -1231,7 +1242,7 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 | Workspaces | Several repositories per workspace; session workspace as a Docker container with idle checkpoint and restore; product image choice (`general`, optional JDK) | ACA Sandboxes; warm pools |
 | Control channel | Long-polling over HTTP between `workspace-host` and `sandbox-gateway` | WebSocket |
 | Workflows | Track rules; `DesignSessionWorkflow`; `SubTaskWorkflow` with AI review, fix loop, diff check, stacked and referenced dependencies; one sub-task at a time | Parallel sub-tasks (FR-N7); CI and review-comment fix loops (FR-N3); re-plan during execution (FR-N6) |
-| Conversation | One conversation per run; conversations grouped by ticket in both views, and a conversation per sub-task (AD-43); routing to the architect; agent labels; defensive rendering of agent text | AG-UI and A2UI transport (own SSE as in the MVP) |
+| Conversation | Built in iteration 2: one conversation per run, grouped by ticket, a conversation per sub-task, routing to the architect, agent labels, defensive rendering of agent text. Next: pages with an agent panel (§25) | AG-UI and A2UI transport (own SSE as in the MVP) |
 | Cards | Analysis, plan (versions, what changed), change review, review report, story view | A view of the code changes in the app (FR-N12); Teams renderers |
 | Source control and tickets | One branch and pull request per sub-task, in its repository; sub-issues; `track:` labels; merge-order notes and warnings | Jira, Bitbucket, Jenkins |
 | Policy | Track rules, access checks, approvals bound to hashes — in code | Cedar (AD-16); engineering-lead approvals (the owner holds every role locally) |
@@ -1249,6 +1260,49 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 | 4 | Change review card (without a view of the code, which moved to a second stage); dependencies (stacked, referenced); story view; merge-order warnings | **Demo scenario 2**: a story across two products | R-17 (GitHub side) |
 | 5 | Hardening: checkpoint restore paths, track switching, dropped sub-tasks, failure cases of §18; documentation | Pilot-ready | R-14 |
 
+## 25. Next: the user view as pages with an agent panel
+
+Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, AD-38, AD-43 revised, AD-44 new). Not built yet.
+
+**Why.** Through v2.4 a run's conversation held the orchestrator's cards, the architect's design session and the assistant's answers in one stream, and the composer's addressee followed the run's state. People could not always tell which agent they were addressing, decisions scrolled away in long runs, and trusted records sat between untrusted agent text. Five layouts were compared: one thread per agent in the side panel, a workspace with tabs, pages with an agent panel (chosen), threads attached to records, and conversations side by side (kept as a later add-on).
+
+**Shape.**
+
+| Part | Holds | Written by |
+|---|---|---|
+| Side panel | Tickets → runs → sub-tasks, with markers for waiting decisions | Orchestrator |
+| Page (centre) | A run or a sub-task: needs you, analysis, plan, story; or check, review, pull request | Orchestrator |
+| Agent panel (right; a sheet at phone width) | One conversation per run and agent; the agent switch with what is available and why not | The person and the agent |
+
+**Taken with the decision** (defaults; any can still change):
+
+- The assistant is available on every page; earlier chats with it are listed inside the agent panel, no longer in the side panel.
+- The implementer and the reviewer join the panel later, with FR-N2; the sub-task's page is where the implementer's conversation goes.
+- At phone width the agent panel is a full-screen sheet over the page.
+- The view of code changes (FR-N12) comes later, as a Changes section of the sub-task's page.
+
+**What changes where.**
+
+| Layer | Change |
+|---|---|
+| Store | Cards leave the conversations: a `card` table keyed by card key, with run, sub-task, section and version; a migration moves the existing ones. Conversations get an agent. Each existing run conversation is split by author into the architect's and the assistant's conversations |
+| Worker | Activities write cards to the run's or sub-task's page instead of a conversation. The architect's replies go to its conversation, with a one-line marker per new plan version. Notices become activity entries on the page |
+| `api` | Page queries (`GET /api/runs/:id/page`, `GET /api/runs/:id/subtasks/:key/page`): sections, needs you, the track switch, available agents. Conversations by run and agent; a message goes to the conversation's agent after the availability check (AD-38). Page and conversation changes share the one SSE stream |
+| Web app | Routes for run and sub-task pages built from today's card components; the agent panel with the agent switch, streaming, the design session's state and "start afresh"; the track switch in the run's header; the start page; the phone-width sheet |
+| Front-door agent | `show_card` becomes a link to a page section; its scope follows the page the panel is opened on |
+| Tests | End-to-end checks read pages and conversations through the new queries; browser checks for the panel, the agent switch and the phone-width sheet |
+
+**Build order.**
+
+| # | Step | Shows |
+|---|---|---|
+| U1 | **Pages.** The card table and page queries; run and sub-task pages from today's cards, with the decisions on them; the side panel, the pending badge and notifications open pages; the toggle maps to pages. Run conversations stay reachable meanwhile | Every decision of a run on one page |
+| U2 | **Agent panel.** Conversations per run and agent, the agent switch with availability, routing by conversation (AD-38), the architect's design session in the panel, migration of existing runs; run conversations retired | Designing a story with the plan in view, and no mixed stream |
+| U3 | **Everywhere.** The assistant on every page and the start page; the phone-width sheet; an accessibility pass of the new layout (NFR-UX-01) | The whole user view, at any width |
+| Later | The Changes section (FR-N12); the implementer in the panel (FR-N2); pages side by side | |
+
+**What stays.** The operator view; the workflows, signals and approvals (only where cards are written changes); decisions bound to hashes; defensive rendering of agent text; the hierarchy in the side panel.
+
 ## Change history
 
 | Version | Change |
@@ -1261,3 +1315,4 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 | 2.2 | Increment 3 built: status of §24, outcome of R-13, state of R-15; the plan card follows the conversation (§7.5) |
 | 2.3 | Increment 4 built: the change review card without a view of the code (AD-40, §7.5, FR-N12); when a dependent sub-task starts, what is checked out for it, and what happens on a conflict (§8.4); sub-tasks that are not delivered and who closes the story (§8.3); status of §24, state of R-17 |
 | 2.4 | Increment 5 built: track switching (§9), access checks (AD-42), failure handling of §18 as built, R-14 fallback; status of §24 |
+| 2.5 | User view as pages with an agent panel (layout C): AD-25, AD-38 and AD-43 revised, AD-44 new; §7.5 user view rewritten; flows, data model and traceability updated; build order in §25 |
