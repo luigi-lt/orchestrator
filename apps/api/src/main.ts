@@ -26,13 +26,15 @@ import {
   type Catalog,
   type OrchestratorCard,
   type TrackSwitchDto,
+  type DesignStateDto,
+  type RunPageDto,
+  type SubtaskPageDto,
 } from "@orch/contracts";
 import { GitHubClient } from "@orch/github";
 import {
   connectStore,
   createConversation,
   getApproval,
-  getCard,
   getConversation,
   getDesignSession,
   getLatestPlanVersion,
@@ -55,7 +57,9 @@ import {
   listen,
   resolveApproval,
   setPreference,
-  upsertCard,
+  listPageCards,
+  patchCard,
+  getSubtask,
 } from "@orch/store";
 import { FrontDoor, newConversationTitle } from "./frontdoor.js";
 import { StreamHub } from "./hub.js";
@@ -214,26 +218,30 @@ async function main(): Promise<void> {
     hub.broadcast({ t: "typing", c: conversationId, on: true });
   };
 
+  /** The run's design session while it is open: the requester is talking to the architect, and whether its workspace is up. */
+  const designStateOf = async (runId: string, conversationId: string | null): Promise<DesignStateDto | null> => {
+    const session = await getDesignSession(db, runId);
+    if (!session || session.state === "closed") return null;
+    return {
+      runId,
+      state: session.state,
+      turnRunning: await hasOpenDesignTurn(db, runId),
+      // Started afresh from the current plan, and the architect has not answered since (R-14).
+      fresh: !!session.historySince && !!conversationId && !(await architectRepliedSince(db, conversationId, session.historySince)),
+      hasPlan: !!(await getLatestPlanVersion(db, runId)),
+    };
+  };
+
   app.get<{ Params: { id: string }; Querystring: { after?: string } }>("/api/conversations/:id", async (req, reply) => {
     const conversation = await getConversation(db, req.params.id);
     if (!conversation) return notFound(reply, "Conversation");
     const messages = await listMessages(db, req.params.id, Number(req.query.after ?? 0) || 0);
-    const session = await openDesignSession(req.params.id);
-    const turnRunning = session ? await hasOpenDesignTurn(db, session.runId) : false;
+    const design = conversation.kind === "run" && conversation.focusedRunId ? await designStateOf(conversation.focusedRunId, conversation.id) : null;
     return {
       conversation,
       messages,
-      busy: frontDoor.isBusy(req.params.id) || turnRunning,
-      // Shown as a strip above the conversation: the requester is talking to the architect, and whether its workspace is up.
-      design: session
-        ? {
-            runId: session.runId,
-            state: session.state,
-            turnRunning,
-            // Started afresh from the current plan, and the architect has not answered since (R-14).
-            fresh: !!session.historySince && !(await architectRepliedSince(db, req.params.id, session.historySince)),
-          }
-        : null,
+      busy: frontDoor.isBusy(req.params.id) || !!design?.turnRunning,
+      design,
       // The track of the run, and whether the requester can switch it now (FR-A3).
       track: conversation.kind === "run" && conversation.focusedRunId ? await trackSwitchOf(conversation.focusedRunId) : null,
     };
@@ -270,65 +278,64 @@ async function main(): Promise<void> {
 
   // --- Decisions on orchestrator cards (never routed through the agent) ---------
   // A decision goes to the workflow that asked for it (the run's, or one of its sub-tasks'),
-  // and its card lives in the conversation of that run or sub-task.
+  // and its card lives on the page of that run or sub-task.
   const loadPendingApproval = async (id: string, kind: ApprovalKind) => {
     const approval = await getApproval(db, id);
     if (!approval || approval.kind !== kind) throw new UserError("Unknown approval");
     if (approval.state !== "pending") throw new UserError("This decision was already made");
     const run = await getRun(db, approval.runId);
     const workflowId = approval.workflowId ?? (await getRunWorkflowId(db, approval.runId));
-    const conversationId = approval.conversationId ?? run?.conversationId;
-    if (!run || !workflowId || !conversationId) throw new UserError("Run not found");
-    return { approval, run, workflowId, conversationId };
+    if (!run || !workflowId) throw new UserError("Run not found");
+    return { approval, run, workflowId };
   };
 
-  const updateCard = async (conversationId: string, cardKey: string, patch: Partial<OrchestratorCard>) => {
-    const card = await getCard(db, cardKey);
-    if (card) await upsertCard(db, conversationId, cardKey, { ...card, ...patch } as OrchestratorCard);
+  // The decision shows on its card at once, on the page that holds it; the workflow goes on from the signal.
+  const updateCard = async (cardKey: string, patch: Partial<OrchestratorCard>) => {
+    await patchCard(db, cardKey, patch as Record<string, unknown>);
   };
 
   // Approval of one plan version: a button on the plan card, bound to the version's hash (FR-P4).
   // Changes to a plan are asked for in the conversation with the architect; there is no way to edit one here.
   app.post<{ Params: { id: string } }>("/api/approvals/:id/plan", async (req) => {
     const body = PlanDecision.parse(req.body);
-    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "plan");
+    const { approval, run, workflowId } = await loadPendingApproval(req.params.id, "plan");
     if (body.hash !== approval.hash) throw new UserError("The plan changed since you looked at it; reload and decide on the version shown now");
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: "approve" });
     await resolveApproval(db, approval.id, { decision: "approve", by: me.login });
-    await updateCard(conversationId, `run:${run.id}:plan`, { status: "approved" } as Partial<OrchestratorCard>);
+    await updateCard(`run:${run.id}:plan`, { status: "approved" } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
   app.post<{ Params: { id: string } }>("/api/approvals/:id/risk", async (req) => {
     const body = RiskDecision.parse(req.body);
-    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "risk");
+    const { approval, run, workflowId } = await loadPendingApproval(req.params.id, "risk");
     if (body.hash !== approval.hash) throw new UserError("The change set differs from the one you reviewed; reload and decide again");
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
     await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
-    await updateCard(conversationId, `run:${run.id}:risk:${approval.id}`, { status: body.decision === "approve" ? "approved" : "rejected" } as Partial<OrchestratorCard>);
+    await updateCard(`run:${run.id}:risk:${approval.id}`, { status: body.decision === "approve" ? "approved" : "rejected" } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
   // Findings still blocking after the fix rounds: open anyway, guide and retry, take over the branch, or cancel (FR-R2).
   app.post<{ Params: { id: string } }>("/api/approvals/:id/findings", async (req) => {
     const body = FindingsDecision.parse(req.body);
-    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "findings");
+    const { approval, run, workflowId } = await loadPendingApproval(req.params.id, "findings");
     if (body.hash !== approval.hash) throw new UserError("The findings changed since you looked at them; reload and decide again");
     if (body.decision === "retry" && !body.guidance?.trim()) throw new UserError("Say what the agent should do differently");
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision, feedback: body.guidance });
     await resolveApproval(db, approval.id, { decision: body.decision, guidance: body.guidance ?? null, by: me.login });
-    await updateCard(conversationId, `run:${run.id}:findings:${approval.id}`, { status: body.decision, guidance: body.guidance } as Partial<OrchestratorCard>);
+    await updateCard(`run:${run.id}:findings:${approval.id}`, { status: body.decision, guidance: body.guidance } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
   // A fast-track change beyond the fast-track limits: continue, switch to the guided track, or cancel (FR-A2).
   app.post<{ Params: { id: string } }>("/api/approvals/:id/limits", async (req) => {
     const body = LimitsDecision.parse(req.body);
-    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "limits");
+    const { approval, run, workflowId } = await loadPendingApproval(req.params.id, "limits");
     if (body.hash !== approval.hash) throw new UserError("The change differs from the one you looked at; reload and decide again");
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
     await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
-    await updateCard(conversationId, `run:${run.id}:limits:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
+    await updateCard(`run:${run.id}:limits:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
@@ -336,45 +343,45 @@ async function main(): Promise<void> {
   // to the commit on the card: exactly that commit is published (AD-40).
   app.post<{ Params: { id: string } }>("/api/approvals/:id/change", async (req) => {
     const body = ChangeDecision.parse(req.body);
-    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "change");
+    const { approval, run, workflowId } = await loadPendingApproval(req.params.id, "change");
     if (body.hash !== approval.hash) throw new UserError("The change differs from the one you looked at; reload and decide on the commit shown now");
     if (body.decision === "changes" && !body.feedback?.trim()) throw new UserError("Say what should change");
     const feedback = body.decision === "changes" ? body.feedback : undefined;
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision, feedback });
     await resolveApproval(db, approval.id, { decision: body.decision, feedback: feedback ?? null, by: me.login });
     const status = body.decision === "approve" ? "approved" : body.decision === "drop" ? "dropped" : "changes";
-    await updateCard(conversationId, `run:${run.id}:change:${approval.id}`, { status, feedback } as Partial<OrchestratorCard>);
+    await updateCard(`run:${run.id}:change:${approval.id}`, { status, feedback } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
   // Sub-tasks that depend on one that was not delivered: drop them too, build them anyway, or cancel the run (FR-R4).
   app.post<{ Params: { id: string } }>("/api/approvals/:id/dependents", async (req) => {
     const body = DependentsDecision.parse(req.body);
-    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "dependents");
+    const { approval, run, workflowId } = await loadPendingApproval(req.params.id, "dependents");
     if (body.hash !== approval.hash) throw new UserError("The sub-tasks changed since you looked; reload and decide again");
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
     await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
-    await updateCard(conversationId, `run:${run.id}:dependents:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
+    await updateCard(`run:${run.id}:dependents:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
   // A sub-task blocked by missing access: retry once the access is fixed, or cancel (AD-42).
   app.post<{ Params: { id: string } }>("/api/approvals/:id/blocked", async (req) => {
     const body = BlockedDecision.parse(req.body);
-    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "blocked");
+    const { approval, run, workflowId } = await loadPendingApproval(req.params.id, "blocked");
     if (body.hash !== approval.hash) throw new UserError("This card is out of date; reload and decide again");
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
     await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
-    await updateCard(conversationId, `run:${run.id}:blocked:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
+    await updateCard(`run:${run.id}:blocked:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
   app.post<{ Params: { id: string } }>("/api/approvals/:id/answer", async (req) => {
     const body = QuestionAnswer.parse(req.body);
-    const { approval, run, workflowId, conversationId } = await loadPendingApproval(req.params.id, "questions");
+    const { approval, run, workflowId } = await loadPendingApproval(req.params.id, "questions");
     await signalRun(services, workflowId, "answer", { approvalId: approval.id, answer: body.answer, source: "chat" });
     await resolveApproval(db, approval.id, { answer: body.answer, source: "chat", by: me.login });
-    await updateCard(conversationId, `run:${run.id}:questions:${approval.id}`, { status: "answered", answer: body.answer } as Partial<OrchestratorCard>);
+    await updateCard(`run:${run.id}:questions:${approval.id}`, { status: "answered", answer: body.answer } as Partial<OrchestratorCard>);
     return { ok: true };
   });
 
@@ -430,6 +437,36 @@ async function main(): Promise<void> {
     if (await hasOpenDesignTurn(db, req.params.id)) throw new UserError("The architect is still replying; try again when it has finished");
     await signalRun(services, designWorkflowId(req.params.id), "freshSession", { by: me.login });
     return reply.code(202).send({ accepted: true });
+  });
+
+  // --- Pages (user view, AD-44): what the orchestrator records and asks, by run and by sub-task -----------
+  app.get<{ Params: { id: string } }>("/api/runs/:id/page", async (req, reply): Promise<RunPageDto | undefined> => {
+    const run = await getRun(db, req.params.id);
+    if (!run) return notFound(reply, "Run");
+    const [cards, needsYou, tickets, track, design] = await Promise.all([
+      listPageCards(db, run.id, null),
+      listPendingApprovals(db, run.id),
+      listTickets(db, 1, run.ticketKey),
+      trackSwitchOf(run.id),
+      designStateOf(run.id, run.conversationId),
+    ]);
+    const ticketRun = tickets[0]?.runs.find((r) => r.runId === run.id);
+    return {
+      run,
+      ordinal: ticketRun?.ordinal ?? 1,
+      runsOfTicket: tickets[0]?.runs.length ?? 1,
+      cards,
+      needsYou,
+      subtasks: ticketRun?.subtasks ?? [],
+      track,
+      design,
+    };
+  });
+  app.get<{ Params: { id: string; key: string } }>("/api/runs/:id/subtasks/:key/page", async (req, reply): Promise<SubtaskPageDto | undefined> => {
+    const [run, subtask] = await Promise.all([getRun(db, req.params.id), getSubtask(db, req.params.id, req.params.key)]);
+    if (!run || !subtask) return notFound(reply, "Sub-task");
+    const [cards, pending] = await Promise.all([listPageCards(db, run.id, subtask.key), listPendingApprovals(db, run.id)]);
+    return { run, subtask, cards, needsYou: pending.filter((p) => p.subtaskKey === subtask.key) };
   });
 
   // Every version of a run's plan, oldest first: earlier versions stay viewable (FR-P3).

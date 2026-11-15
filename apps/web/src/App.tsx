@@ -2,10 +2,14 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import type { ApprovalDto, RunDto } from "@orch/contracts";
 import { api, put, subscribe } from "./api";
+import { runPath, subtaskPath } from "./components/TicketTree";
 import { ChatView } from "./views/ChatView";
 import { RunDetail } from "./views/RunDetail";
+import { RunPage } from "./views/RunPage";
 import { Products } from "./views/Products";
 import { RunsList } from "./views/RunsList";
+import { SubtaskPage } from "./views/SubtaskPage";
+import { UserLayout } from "./views/UserLayout";
 
 export interface Me {
   login: string;
@@ -31,9 +35,18 @@ export const useApp = () => useContext(AppContext);
 
 const FINAL = new Set(["completed", "closed", "cancelled", "failed"]);
 
-function notify(title: string, body: string) {
+/** The page where a decision is taken: the run's, or one of its sub-tasks' (AD-44). */
+export const pageOfApproval = (a: ApprovalDto) => `${a.subtaskKey ? subtaskPath(a.runId, a.subtaskKey) : runPath(a.runId)}#needs-you`;
+
+/** A browser notification while the app is in the background; clicking it opens the page it is about. */
+function notify(title: string, body: string, open: () => void) {
   if ("Notification" in window && Notification.permission === "granted" && document.visibilityState !== "visible") {
-    new Notification(title, { body });
+    const n = new Notification(title, { body });
+    n.onclick = () => {
+      window.focus();
+      open();
+      n.close();
+    };
   }
 }
 
@@ -45,6 +58,9 @@ export function App() {
   const location = useLocation();
   const navigate = useNavigate();
   const knownPending = useRef<Set<string> | null>(null);
+  // Notifications open pages; the latest navigate is used without subscribing again on every move.
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
   const runStates = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
@@ -55,7 +71,7 @@ export function App() {
   const loadPending = useCallback(async () => {
     const list = await api<ApprovalDto[]>("/api/pending");
     if (knownPending.current) {
-      for (const p of list) if (!knownPending.current.has(p.id)) notify("Action needed", p.title);
+      for (const p of list) if (!knownPending.current.has(p.id)) notify("Action needed", p.title, () => navigateRef.current(pageOfApproval(p)));
     }
     knownPending.current = new Set(list.map((p) => p.id));
     setPending(list);
@@ -69,7 +85,7 @@ export function App() {
         void api<{ run: RunDto }>(`/api/runs/${n.r}`).then(({ run }) => {
           const before = runStates.current.get(run.id);
           runStates.current.set(run.id, run.state);
-          if (before && !FINAL.has(before) && FINAL.has(run.state)) notify(`Run ${run.state}`, `#${run.issueNumber} ${run.title}`);
+          if (before && !FINAL.has(before) && FINAL.has(run.state)) notify(`Run ${run.state}`, `#${run.issueNumber} ${run.title}`, () => navigateRef.current(runPath(run.id)));
         });
       }
     });
@@ -108,7 +124,7 @@ export function App() {
             <button
               className={`pending-badge ${pending.length ? "has" : ""}`}
               title={pending.map((p) => p.title).join("\n") || "Nothing waiting for you"}
-              onClick={() => firstPending?.conversationId && navigate(`/chat/${firstPending.conversationId}`)}
+              onClick={() => firstPending && navigate(pageOfApproval(firstPending))}
             >
               {pending.length} pending
             </button>
@@ -119,8 +135,12 @@ export function App() {
         <main className="content">
           <Routes>
             <Route path="/" element={me ? <Navigate to={me.landingView === "operator" ? "/ops/runs" : "/chat"} replace /> : null} />
-            <Route path="/chat" element={<ChatView />} />
-            <Route path="/chat/:conversationId" element={<ChatView />} />
+            <Route element={<UserLayout />}>
+              <Route path="/chat" element={<ChatView />} />
+              <Route path="/chat/:conversationId" element={<ChatView />} />
+              <Route path="/runs/:runId" element={<RunPage />} />
+              <Route path="/runs/:runId/subtasks/:key" element={<SubtaskPage />} />
+            </Route>
             <Route path="/ops/runs" element={<RunsList />} />
             <Route path="/ops/runs/:runId" element={<RunDetail />} />
             <Route path="/ops/products" element={<Products />} />

@@ -255,4 +255,34 @@ alter table subtasks
 alter table design_sessions add column history_since timestamptz;
 `,
   },
+  {
+    // User view as pages (AD-44): the orchestrator's cards leave the conversations for the pages of runs and
+    // sub-tasks. A link to a run is the one card that stays in a conversation (the chat that started the run).
+    version: 7,
+    sql: `
+create table cards (
+  card_key text primary key,
+  run_id text not null references runs(id) on delete cascade,
+  subtask_key text,
+  card jsonb not null,
+  version bigint not null default nextval('message_version_seq'),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index cards_page_idx on cards (run_id, subtask_key, created_at);
+create index cards_approval_idx on cards ((card->>'approvalId'));
+
+insert into cards (card_key, run_id, subtask_key, card, version, created_at, updated_at)
+  select m.card_key, c.focused_run_id, c.subtask_key, m.components->0, m.version, m.created_at, m.updated_at
+  from messages m
+  join conversations c on c.id = m.conversation_id
+  join runs r on r.id = c.focused_run_id
+  where m.role = 'orchestrator' and m.card_key is not null and c.kind in ('run', 'subtask')
+    and jsonb_array_length(m.components) > 0 and m.components->0->>'type' <> 'run_link';
+delete from messages m using cards k where m.card_key = k.card_key;
+-- Copies of cards the assistant showed in a run's conversation: the cards are on the page now.
+delete from messages m using conversations c
+  where c.id = m.conversation_id and c.kind in ('run', 'subtask') and m.role = 'orchestrator' and m.card_key is null;
+`,
+  },
 ];

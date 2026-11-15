@@ -42,6 +42,8 @@ import {
   getRun,
   getSubtask,
   insertMessage,
+  listRunCards,
+  putCard,
   notify,
   insertRun,
   insertSubtask,
@@ -244,12 +246,11 @@ export async function recordTicketAnswer(input: { runId: string; conversationId:
 
 const planCardKey = (runId: string) => key(runId, "plan");
 
-/** The plan card shows the latest version: read-only, with what changed since the version before. */
 /**
- * Shows a plan version on the run's one plan card. With `toEnd` the card moves below the architect's reply, so
- * a new version, or the Approve button, is where the requester is reading.
+ * Shows a plan version on the run's one plan card, on the run's page: read-only, with what changed since the
+ * version before. While it is proposed, the card is under Needs you with its Approve button.
  */
-async function showPlan(db: Db, runId: string, conversationId: string, version: PlanVersionDto, approvalId: string | null, toEnd: boolean): Promise<void> {
+async function showPlan(db: Db, runId: string, conversationId: string, version: PlanVersionDto, approvalId: string | null): Promise<void> {
   const catalog = await runCatalog(runId);
   const card: OrchestratorCard = {
     type: "plan",
@@ -263,7 +264,7 @@ async function showPlan(db: Db, runId: string, conversationId: string, version: 
     promptedBy: version.promptedBy,
     products: Object.fromEntries(catalog.products.map((p) => [p.id, p.name])),
   };
-  await upsertCard(db, conversationId, planCardKey(runId), card, { toEnd });
+  await upsertCard(db, conversationId, planCardKey(runId), card);
 }
 
 /**
@@ -338,7 +339,7 @@ export async function recordDesignTurn(input: {
     await setPlanVersionStatus(db, runId, latest.version, "proposed");
     latest = { ...latest, status: "proposed" };
   }
-  if (created || proposedApprovalId) await showPlan(db, runId, conversationId, latest, proposedApprovalId, true);
+  if (created || proposedApprovalId) await showPlan(db, runId, conversationId, latest, proposedApprovalId);
   return { version: latest.version, created, changes: latest.changes.length, voidedApproval, proposedApprovalId };
 }
 
@@ -357,7 +358,7 @@ export async function finalizePlan(input: {
   const order = buildOrder(latest.plan);
   if (!order) throw ApplicationFailure.nonRetryable("The approved plan has a dependency cycle");
   await setPlanVersionStatus(db, input.runId, latest.version, "approved");
-  await showPlan(db, input.runId, input.conversationId, { ...latest, status: "approved" }, null, false);
+  await showPlan(db, input.runId, input.conversationId, { ...latest, status: "approved" }, null);
   // The products of the run are those of the approved plan: the architect may have added or removed one (FR-M2).
   const products = [...new Set(order.map((st) => st.product))];
   const before = (await getRun(db, input.runId))?.products ?? [];
@@ -842,25 +843,22 @@ export async function postNotice(input: {
 const DECISION_CARDS = new Set(["plan", "questions", "risk", "findings", "limits", "change", "dependents", "blocked"]);
 
 /**
- * Expires the pending decisions of a run (or of one sub-task) and marks their cards as expired,
- * each in the conversation that holds it.
+ * Expires the pending decisions of a run (or of one sub-task) and marks their cards as expired, each on the
+ * page that holds it.
  */
 export async function closeOutApprovals(input: { runId: string; subtaskKey?: string }): Promise<void> {
   const { db } = ctx();
   await expireApprovalsForRun(db, input.runId, input.subtaskKey);
-  const { rows } = await db.query<{ card_key: string; conversation_id: string; components: OrchestratorCard[] }>(
-    "select card_key, conversation_id, components from messages where card_key like $1",
-    [`${key(input.runId)}:%`],
-  );
-  for (const row of rows) {
-    const card = row.components[0];
+  for (const row of await listRunCards(db, input.runId)) {
+    const card = row.card;
+    const page = { runId: row.runId, subtaskKey: row.subtaskKey };
     // A plan that was never approved is closed with the run, or when the run moves to the fast track.
-    if (card?.type === "plan" && !input.subtaskKey && (card.status === "draft" || card.status === "proposed")) {
-      await upsertCard(db, row.conversation_id, row.card_key, { ...card, status: "expired", approvalId: undefined });
+    if (card.type === "plan" && !input.subtaskKey && (card.status === "draft" || card.status === "proposed")) {
+      await putCard(db, page, row.key, { ...card, status: "expired", approvalId: undefined });
       continue;
     }
-    if (!card || !DECISION_CARDS.has(card.type) || !("status" in card) || card.status !== "pending") continue;
+    if (!DECISION_CARDS.has(card.type) || !("status" in card) || card.status !== "pending") continue;
     if (input.subtaskKey && (!("subtaskKey" in card) || card.subtaskKey !== input.subtaskKey)) continue;
-    await upsertCard(db, row.conversation_id, row.card_key, { ...card, status: "expired" } as OrchestratorCard);
+    await putCard(db, page, row.key, { ...card, status: "expired" } as OrchestratorCard);
   }
 }

@@ -20,6 +20,7 @@ import type {
   MessageDto,
   MessageRole,
   OrchestratorCard,
+  PageCardDto,
   Plan,
   ProgressDto,
   ProgressEvent,
@@ -40,7 +41,7 @@ import type {
   Track,
   Verification,
 } from "@orch/contracts";
-import { groupTickets } from "@orch/contracts";
+import { groupTickets, isFastTrackKey } from "@orch/contracts";
 import { type Db, type Queryable, notify, withTx } from "./db.js";
 
 const iso = (d: Date | string | null): string | null => (d == null ? null : new Date(d).toISOString());
@@ -136,12 +137,10 @@ export async function findLatestRunByWorkflowId(db: Queryable, workflowId: strin
   return rows[0] ? toRun(rows[0]) : null;
 }
 
-export async function findLatestCardByPrefix(db: Queryable, prefix: string): Promise<OrchestratorCard | null> {
-  const { rows } = await db.query<{ components: OrchestratorCard[] }>(
-    "select components from messages where card_key like $1 order by created_at desc limit 1",
-    [`${prefix}%`],
-  );
-  return rows[0]?.components[0] ?? null;
+/** The newest card whose key starts with `prefix`, with the page it is on. */
+export async function findLatestCardByPrefix(db: Queryable, prefix: string): Promise<PageCardDto | null> {
+  const { rows } = await db.query<CardRow>("select * from cards where card_key like $1 order by updated_at desc limit 1", [`${prefix}%`]);
+  return rows[0] ? toPageCard(rows[0]) : null;
 }
 
 export async function listRuns(db: Queryable, limit = 100): Promise<RunDto[]> {
@@ -170,13 +169,15 @@ export async function listTickets(db: Queryable, limit = 200, onlyKey?: string):
     pendingByRun[p.run_id] = (pendingByRun[p.run_id] ?? 0) + Number(p.n);
     if (p.subtask_key) pendingBySubtask[`${p.run_id}:${p.subtask_key}`] = Number(p.n);
   }
-  // Sub-tasks with their own conversation form the third level of the hierarchy (AD-43).
-  const subtasks = await db.query<{ run_id: string; key: string; idx: number; title: string; state: SubtaskState; conversation_id: string }>(
-    "select run_id, key, idx, title, state, conversation_id from subtasks where conversation_id is not null and run_id = any($1) order by idx",
+  // The sub-tasks of an approved plan form the third level of the hierarchy (AD-43), each with its own page. The single
+  // change of the fast track is not one: everything about it is on the run's page.
+  const subtasks = await db.query<{ run_id: string; key: string; idx: number; title: string; state: SubtaskState; conversation_id: string | null }>(
+    "select run_id, key, idx, title, state, conversation_id from subtasks where run_id = any($1) order by idx",
     [rows.map((r) => r.id)],
   );
   const subtasksByRun: Record<string, TicketSubtaskDto[]> = {};
   for (const st of subtasks.rows) {
+    if (isFastTrackKey(st.key)) continue;
     (subtasksByRun[st.run_id] ??= []).push({
       key: st.key,
       index: st.idx,
@@ -968,10 +969,25 @@ export async function expireApprovalsForRun(db: Queryable, runId: string, subtas
   if ((res.rowCount ?? 0) > 0) await notify(db, { t: "pending" });
 }
 
-export async function listPendingApprovals(db: Queryable): Promise<ApprovalDto[]> {
-  const { rows } = await db.query<{ id: string; run_id: string; kind: ApprovalDto["kind"]; created_at: Date; conversation_id: string | null; title: string; issue_number: number }>(
-    `select a.id, a.run_id, a.kind, a.created_at, coalesce(a.conversation_id, r.conversation_id) as conversation_id, r.title, r.issue_number
-     from approvals a join runs r on r.id = a.run_id where a.state = 'pending' order by a.created_at`,
+/** The decisions waiting for the requester, oldest first; `runId` keeps those of one run. */
+export async function listPendingApprovals(db: Queryable, runId?: string): Promise<ApprovalDto[]> {
+  // Where the decision is taken is where its card is: the page of the run or of one of its sub-tasks.
+  const { rows } = await db.query<{
+    id: string;
+    run_id: string;
+    kind: ApprovalDto["kind"];
+    created_at: Date;
+    conversation_id: string | null;
+    subtask_key: string | null;
+    title: string;
+    issue_number: number;
+  }>(
+    `select a.id, a.run_id, a.kind, a.created_at, coalesce(a.conversation_id, r.conversation_id) as conversation_id,
+       case when k.card_key is not null then k.subtask_key else a.subtask_key end as subtask_key, r.title, r.issue_number
+     from approvals a join runs r on r.id = a.run_id
+     left join lateral (select card_key, subtask_key from cards where card->>'approvalId' = a.id and run_id = a.run_id limit 1) k on true
+     where a.state = 'pending' ${runId ? "and a.run_id = $1" : ""} order by a.created_at`,
+    runId ? [runId] : [],
   );
   const label: Record<ApprovalKind, string> = {
     plan: "Approve plan",
@@ -989,6 +1005,8 @@ export async function listPendingApprovals(db: Queryable): Promise<ApprovalDto[]
     kind: r.kind,
     state: "pending",
     conversationId: r.conversation_id,
+    subtaskKey: r.subtask_key,
+    label: label[r.kind],
     title: `${label[r.kind]} · #${r.issue_number} ${r.title}`,
     createdAt: iso(r.created_at)!,
   }));
@@ -1090,31 +1108,105 @@ export async function insertMessage(
   return msg;
 }
 
-/** Posts an orchestrator card, or updates it in place when a card with the same key exists. */
-export async function upsertCard(
-  db: Queryable,
-  conversationId: string,
-  cardKey: string,
-  card: OrchestratorCard,
-  /** `toEnd` moves an existing card to the end of its conversation, for a card that must stay next to what is being said. */
-  options: { toEnd?: boolean } = {},
-): Promise<MessageDto> {
+// ---------------------------------------------------------------------------
+// Cards: the orchestrator's records, on the pages of runs and sub-tasks (AD-44)
+// ---------------------------------------------------------------------------
+
+interface CardRow {
+  card_key: string;
+  run_id: string;
+  subtask_key: string | null;
+  card: OrchestratorCard;
+  version: string;
+  created_at: Date;
+  updated_at: Date;
+}
+
+const toPageCard = (r: CardRow): PageCardDto => ({
+  key: r.card_key,
+  runId: r.run_id,
+  subtaskKey: r.subtask_key,
+  card: r.card,
+  version: Number(r.version),
+  createdAt: iso(r.created_at)!,
+  updatedAt: iso(r.updated_at)!,
+});
+
+/** Writes a card on the page of a run (or of one of its sub-tasks), or updates it in place: a card stays on the page it was first written on. */
+export async function putCard(db: Queryable, page: { runId: string; subtaskKey?: string | null }, cardKey: string, card: OrchestratorCard): Promise<PageCardDto> {
+  const { rows } = await db.query<CardRow>(
+    `insert into cards (card_key, run_id, subtask_key, card) values ($1,$2,$3,$4)
+     on conflict (card_key) do update set card = excluded.card, version = nextval('message_version_seq'), updated_at = now()
+     returning *`,
+    [cardKey, page.runId, page.subtaskKey ?? null, JSON.stringify(card)],
+  );
+  const written = toPageCard(rows[0]!);
+  await notify(db, { t: "card", r: written.runId, s: written.subtaskKey, v: written.version });
+  return written;
+}
+
+/**
+ * Posts an orchestrator card from an activity that knows the conversation of a run or a sub-task: the card goes
+ * on the page of that run or sub-task. A link to a run is the one card posted in a conversation (the chat that
+ * started the run, or where the assistant pointed to it).
+ */
+export async function upsertCard(db: Queryable, conversationId: string, cardKey: string, card: OrchestratorCard): Promise<void> {
+  if (card.type !== "run_link") {
+    const { rows } = await db.query<{ focused_run_id: string; subtask_key: string | null }>(
+      "select focused_run_id, subtask_key from conversations where id = $1 and kind in ('run', 'subtask') and focused_run_id is not null",
+      [conversationId],
+    );
+    if (rows[0]) {
+      await putCard(db, { runId: rows[0].focused_run_id, subtaskKey: rows[0].subtask_key }, cardKey, card);
+      return;
+    }
+  }
   const { rows } = await db.query<MessageRow>(
     `insert into messages (id, conversation_id, role, components, card_key) values ($1,$2,'orchestrator',$3,$4)
-     on conflict (card_key) do update set components = excluded.components, version = nextval('message_version_seq'), updated_at = now(),
-       created_at = case when $5::boolean then now() else messages.created_at end
+     on conflict (card_key) do update set components = excluded.components, version = nextval('message_version_seq'), updated_at = now()
      returning *`,
-    [newId("msg"), conversationId, JSON.stringify([card]), cardKey, options.toEnd === true],
+    [newId("msg"), conversationId, JSON.stringify([card]), cardKey],
   );
   await db.query("update conversations set updated_at = now() where id = $1", [conversationId]);
   const msg = toMessage(rows[0]!);
   await notify(db, { t: "msg", c: msg.conversationId, v: msg.version });
-  return msg;
+}
+
+export async function getPageCard(db: Queryable, cardKey: string): Promise<PageCardDto | null> {
+  const { rows } = await db.query<CardRow>("select * from cards where card_key = $1", [cardKey]);
+  return rows[0] ? toPageCard(rows[0]) : null;
 }
 
 export async function getCard(db: Queryable, cardKey: string): Promise<OrchestratorCard | null> {
+  const onPage = await getPageCard(db, cardKey);
+  if (onPage) return onPage.card;
   const { rows } = await db.query<{ components: OrchestratorCard[] }>("select components from messages where card_key = $1", [cardKey]);
   return rows[0]?.components[0] ?? null;
+}
+
+/** Changes fields of a card on a page, where it is. Returns false when there is no such card. */
+export async function patchCard(db: Queryable, cardKey: string, patch: Record<string, unknown>): Promise<boolean> {
+  const found = await getPageCard(db, cardKey);
+  if (!found) return false;
+  await putCard(db, { runId: found.runId, subtaskKey: found.subtaskKey }, cardKey, { ...found.card, ...patch } as OrchestratorCard);
+  return true;
+}
+
+/** The cards of a run's page (`subtaskKey` null) or of one sub-task's page, oldest first. */
+export async function listPageCards(db: Queryable, runId: string, subtaskKey: string | null): Promise<PageCardDto[]> {
+  const { rows } = await db.query<CardRow>(
+    subtaskKey === null
+      ? "select * from cards where run_id = $1 and subtask_key is null order by created_at, version"
+      : "select * from cards where run_id = $1 and subtask_key = $2 order by created_at, version",
+    subtaskKey === null ? [runId] : [runId, subtaskKey],
+  );
+  return rows.map(toPageCard);
+}
+
+/** Every card of a run, on its page and its sub-tasks' pages. */
+export async function listRunCards(db: Queryable, runId: string): Promise<PageCardDto[]> {
+  const { rows } = await db.query<CardRow>("select * from cards where run_id = $1 order by created_at, version", [runId]);
+  return rows.map(toPageCard);
 }
 
 export async function listMessages(db: Queryable, conversationId: string, afterVersion = 0): Promise<MessageDto[]> {

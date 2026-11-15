@@ -5,6 +5,9 @@ import { api, post, subscribe } from "../api";
 import { useApp } from "../App";
 import { Checks, FindingList, SUBTASK_STATE_LABEL } from "../components/Cards";
 
+/** The single change of the fast track has no page of its own: it is on the run's page. */
+const isFastTrackKey = (key: string) => /^change(-\d+)?$/.test(key);
+
 interface RunDetailData {
   run: RunDto;
   steps: StepDto[];
@@ -48,9 +51,9 @@ export function RunDetail() {
   }, [load, runId]);
 
   useEffect(() => {
-    setToggleTarget(data?.run.conversationId ? `/chat/${data.run.conversationId}` : "/chat");
+    setToggleTarget(data?.run.id ? `/runs/${data.run.id}` : "/chat");
     return () => setToggleTarget(null);
-  }, [data?.run.conversationId, setToggleTarget]);
+  }, [data?.run.id, setToggleTarget]);
 
   // Follow the latest step unless the operator picked one.
   const steps = data?.steps ?? [];
@@ -117,7 +120,7 @@ export function RunDetail() {
       {pending.length > 0 && (
         <div className="callout">
           Waiting for: {pending.map((p) => p.title).join(", ")} —{" "}
-          {run.conversationId && <Link to={`/chat/${run.conversationId}`}>decide in the conversation</Link>}
+          <Link to={`/runs/${run.id}#needs-you`}>decide on the run's page</Link>
         </div>
       )}
 
@@ -203,7 +206,7 @@ export function RunDetail() {
                     Sub-issue #{st.ticketNumber}
                   </a>
                 )}
-                {st.conversationId && <Link to={`/chat/${st.conversationId}`}>Conversation</Link>}
+                {!isFastTrackKey(st.key) && <Link to={`/runs/${run.id}/subtasks/${encodeURIComponent(st.key)}`}>Page</Link>}
               </div>
               {(st.dependsOn.length > 0 || st.headCommit) && (
                 <p className="muted small">

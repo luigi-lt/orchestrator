@@ -65,7 +65,23 @@ const waitForState = (runId, states, timeoutMs = 600_000) =>
     timeoutMs,
   );
 
-const cardsOf = async (conversationId) => (await api(`/api/conversations/${conversationId}`)).messages.flatMap((m) => m.components);
+/** The run's page and a sub-task's page (AD-44): the orchestrator's cards and what waits for the requester. */
+const pageOf = (runId) => api(`/api/runs/${runId}/page`);
+const subtaskPageOf = (runId, key) => api(`/api/runs/${runId}/subtasks/${encodeURIComponent(key)}/page`);
+/**
+ * The cards a requester sees for a conversation: those on the page of its run or sub-task, which the conversation
+ * sits beside, and those posted in the conversation itself (links, in a chat).
+ */
+const cardsOf = async (conversationId) => {
+  const { conversation, messages } = await api(`/api/conversations/${conversationId}`);
+  const page =
+    conversation.kind === "run"
+      ? await pageOf(conversation.focusedRunId)
+      : conversation.kind === "subtask"
+        ? await subtaskPageOf(conversation.focusedRunId, conversation.subtaskKey)
+        : { cards: [] };
+  return [...page.cards.map((c) => c.card), ...messages.flatMap((m) => m.components)];
+};
 const issueOf = async (number) => (await gh("/_test/state")).issues.find((i) => i.number === number);
 const newIssue = (title, body, labels, repo = "acme/demo") => gh("/_test/issues", { method: "POST", body: { title, body, labels, repo } });
 const say = (conversationId, text) => api(`/api/conversations/${conversationId}/messages`, { method: "POST", body: { text } });
@@ -223,7 +239,7 @@ async function main() {
   await say(chat.id, `work on issue #${story.number}`);
   const crossRun = await runFor(story.number);
   const linkCard = await waitFor("link card in the chat", async () => (await cardsOf(chat.id)).find((c) => c.type === "run_link" && c.runId === crossRun.id), 60_000);
-  check(linkCard.conversationId !== chat.id, "the chat shows a link to the run's own conversation");
+  check(linkCard.conversationId !== chat.id && !linkCard.section, "the chat shows a link to the run's own page");
   const crossConversation = linkCard.conversationId;
   const draft = await waitForPlan(crossConversation, "the architect's first draft", (c) => c.version === 1);
   const cross = await api(`/api/runs/${crossRun.id}`);
@@ -281,9 +297,15 @@ async function main() {
   check(/do not touch/.test(v2.promptedBy ?? "") && v2.hash !== v1.hash, "version 2 records the request that prompted it");
   const timeline = (await api(`/api/conversations/${conv}`)).messages;
   check(
-    timeline.findIndex((m) => m.components.some((c) => c.type === "plan")) > timeline.findLastIndex((m) => m.author === "architect"),
-    "the plan card moved below the architect's reply, where the requester is reading",
+    timeline.some((m) => m.author === "architect") && timeline.every((m) => m.role !== "orchestrator"),
+    "the conversation holds only the requester and the architect: the plan is on the run's page beside it",
   );
+  const draftPage = await pageOf(again.runId);
+  check(
+    draftPage.cards.filter((c) => c.card.type === "plan").length === 1 && draftPage.cards.some((c) => c.card.type === "analysis") && draftPage.needsYou.length === 0,
+    "the run's page holds the analysis and one plan card, and nothing waits for the requester yet",
+  );
+  check(draftPage.design?.state === "active" && draftPage.design.hasPlan && draftPage.track?.current === "guided" && draftPage.ordinal === 2 && draftPage.runsOfTicket === 2, "the page's header knows the open design session, the track, and that this is run 2 of 2");
   let versions = await api(`/api/runs/${again.runId}/plans`);
   check(versions.map((v) => v.status).join() === "superseded,draft" && versions.every((v) => /^architect@/.test(v.author)), "version 1 stays viewable as superseded; both were written by the architect");
   check(stream.notices.some((n) => n.t === "delta" && n.c === conv && n.text), "the architect's reply reached the conversation while it was being written");
@@ -295,6 +317,24 @@ async function main() {
   check(proposed.version === 2 && waiting.run.state === "awaiting_approval" && waiting.pending.some((p) => p.id === proposed.approvalId), "version 2 is up for approval and the run waits for the requester");
   ticket = (await api("/api/tickets")).find((t) => t.issueNumber === story.number);
   check(ticket.pending === 1 && ticket.runs[0].pending === 1, "the hierarchy shows a decision waiting on the ticket and its run");
+  const proposedPage = await pageOf(again.runId);
+  check(
+    proposedPage.needsYou.some((a) => a.id === proposed.approvalId && a.kind === "plan" && a.subtaskKey === null && a.label === "Approve plan") &&
+      proposedPage.cards.some((c) => c.card.type === "plan" && c.card.approvalId === proposed.approvalId),
+    "the run's page lists the plan under Needs you, with the card that carries the Approve button",
+  );
+  // The assistant points to a record on the page instead of copying it into the chat.
+  const shownBefore = (await api(`/api/conversations/${chat.id}`)).messages.length;
+  await say(chat.id, `show me the plan of ${again.runId}`);
+  const pointed = await waitFor("the assistant's link to the plan", async () => {
+    const { messages } = await api(`/api/conversations/${chat.id}`);
+    return messages.length >= shownBefore + 3 ? messages.slice(shownBefore) : null;
+  }, 60_000);
+  const planLink = pointed.flatMap((m) => m.components).find((c) => c.type === "run_link");
+  check(
+    planLink?.runId === again.runId && planLink.section === "plan" && !pointed.some((m) => m.components.some((c) => c.type === "plan")),
+    "asked for the plan, the assistant shows a link to the plan section of the run's page, not a copy of it",
+  );
 
   await say(conv, "One more constraint: do not rename anything");
   const v3 = await waitForPlan(conv, "plan version 3", (c) => c.version === 3);
@@ -336,6 +376,22 @@ async function main() {
   // The requester's check of the change: bound to the commit, with nothing pushed before it.
   const check1 = await pendingCheck(c1);
   check(firstCheck.run.state === "awaiting_approval" && (await api("/api/pending")).some((p) => p.id === check1.approvalId && p.kind === "change"), "the change waits for the requester's check");
+  const c1Page = await subtaskPageOf(again.runId, "calc-negate");
+  check(
+    c1Page.needsYou.map((a) => a.id).join() === check1.approvalId && c1Page.cards.some((c) => c.card.type === "change" && c.card.approvalId === check1.approvalId) && c1Page.subtask.key === "calc-negate",
+    "the check waits under Needs you on the sub-task's page, with its card",
+  );
+  const runPageNow = await pageOf(again.runId);
+  check(
+    runPageNow.needsYou.some((a) => a.id === check1.approvalId && a.subtaskKey === "calc-negate") && !runPageNow.cards.some((c) => c.card.type === "change"),
+    "the run's page lists the check under Needs you as a link to the sub-task's page, without its card",
+  );
+  check((await api("/api/pending")).find((p) => p.id === check1.approvalId)?.subtaskKey === "calc-negate", "the pending badge knows on which page the decision is taken");
+  const listed = (await api("/api/tickets")).find((t) => t.issueNumber === story.number).runs[0].subtasks;
+  check(
+    runPageNow.subtasks.map((st) => st.key).join() === "calc-negate,shop-page" && listed.map((st) => st.key).join() === "calc-negate,shop-page" && listed[1].conversationId === null,
+    "the side panel and the run's page list every sub-task of the plan, also the one not started yet",
+  );
   check(check1.hash === c1.headCommit && check1.files.map((f) => `${f.path} +${f.added} -${f.removed}`).join() === "negate.js +2 -0", `the card shows the commit and the files changed: ${check1.files.map((f) => f.path)}`);
   check(
     check1.criteria.length === 1 && check1.criteria[0].criterion === "negate(2) returns -2" && /negate\.js/.test(check1.criteria[0].evidence ?? "") && check1.criteria[0].met === true,
@@ -375,7 +431,7 @@ async function main() {
     "it links the story across repositories, closes its own sub-issue and states the merge order",
   );
   storyCard = await storyOf(conv);
-  check(storyCard.subtasks.every((st) => st.state === "pr_open" && st.prNumber) && storyCard.subtasks[0].conversationId === c1.conversationId, "the story view shows both pull requests open, each with the link to its conversation");
+  check(storyCard.subtasks.every((st) => st.state === "pr_open" && st.prNumber) && storyCard.subtasks[0].conversationId === c1.conversationId, "the story view shows both pull requests open, each knowing its sub-task");
 
   // Merge order is advice the orchestrator watches: the shop pull request is merged first.
   await gh(`/_test/pulls/${crossPr2.number}/merge`, { method: "POST" });
@@ -473,9 +529,10 @@ async function main() {
   check(s1.headCommit === mCheck2.hash && s1.checkRounds === 1, "the pull request opened with the commit approved at the second check");
   check(!!s1.conversationId && s1.conversationId !== firstOpen.run.conversationId, "the sub-task has its own conversation");
   const s1Cards = (await cardsOf(s1.conversationId)).map((c) => c.type);
-  check(["subtask", "progress", "review", "change", "pull_request"].every((t) => s1Cards.includes(t)), `its conversation holds its own cards: ${[...new Set(s1Cards)].join(", ")}`);
+  check(["subtask", "progress", "review", "change", "pull_request"].every((t) => s1Cards.includes(t)), `its page holds its own cards: ${[...new Set(s1Cards)].join(", ")}`);
   const runCards = await cardsOf(firstOpen.run.conversationId);
-  check(!runCards.some((c) => c.type === "review" || c.type === "pull_request" || c.type === "change"), "the sub-task's cards are not in the run's conversation");
+  check(!runCards.some((c) => c.type === "review" || c.type === "pull_request" || c.type === "change"), "the sub-task's cards are not on the run's page");
+  check((await api(`/api/conversations/${s1.conversationId}`)).messages.length === 0, "no card is in the sub-task's conversation: they are all on its page");
   const guidedTicket = (await api("/api/tickets")).find((t) => t.issueNumber === guided.number);
   check(guidedTicket.runs[0].subtasks.map((st) => st.conversationId).includes(s1.conversationId), "the hierarchy lists the sub-task under its run");
   const pr1 = await pullOf(s1.branch);
@@ -594,7 +651,7 @@ async function main() {
   const tricky = await newIssue("Add a ratio helper", "A small helper; it may need a new dependency. [file:package.json]", ["ai-ready", "bug"]);
   const trickyRun = await runFor(tricky.number);
   const atRisk = await waitForState(trickyRun.id, ["awaiting_approval"]);
-  let trackNow = (await api(`/api/conversations/${atRisk.run.conversationId}`)).track;
+  let trackNow = (await pageOf(atRisk.run.id)).track;
   check(
     atRisk.run.track === "fast" && (await api("/api/pending")).some((p) => p.runId === trickyRun.id && p.kind === "risk") && trackNow?.current === "fast" && trackNow.to === "guided",
     "while the fast-track change waits for its high-risk approval, the conversation offers the switch to the guided track",
@@ -618,7 +675,7 @@ async function main() {
   );
   check(switched.subtasks.find((st) => st.key === "change")?.state === "cancelled" && hub.pulls.every((p) => p.head !== switched.run.branch), "the change was set aside and nothing was pushed");
   check((await cardsOf(switched.run.conversationId)).find((c) => c.type === "risk")?.status === "expired", "the high-risk approval it waited for is closed");
-  trackNow = (await api(`/api/conversations/${switched.run.conversationId}`)).track;
+  trackNow = (await pageOf(switched.run.id)).track;
   check(trackNow?.current === "guided" && trackNow.to === "fast", "in the design session the plan stays in one repository: the switch back to the fast track is offered");
 
   await api(`/api/runs/${trickyRun.id}/track`, { method: "POST", body: { track: "fast" } });
@@ -638,7 +695,7 @@ async function main() {
   const risk2Card = (await cardsOf(backToFast.run.conversationId)).filter((c) => c.type === "risk" && c.status === "pending").pop();
   await api(`/api/approvals/${risk2.id}/risk`, { method: "POST", body: { decision: "approve", hash: risk2Card.hash } });
   const opened11 = await waitForState(trickyRun.id, ["awaiting_merge"]);
-  trackNow = (await api(`/api/conversations/${opened11.run.conversationId}`)).track;
+  trackNow = (await pageOf(opened11.run.id)).track;
   check(trackNow?.to === null && /pull request is open/.test(trackNow.why ?? ""), "once the pull request is open the track can no longer be switched");
   check(await refused(api(`/api/runs/${trickyRun.id}/track`, { method: "POST", body: { track: "guided" } })), "and a request to switch is refused");
   const pr11 = await pullOf(change2.branch);

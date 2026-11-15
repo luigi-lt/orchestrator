@@ -728,7 +728,10 @@ export const AnalysisCard = z.object({
   risks: z.array(z.string()),
   assumptions: z.array(z.string()),
 });
-/** Shown in the chat that started a run: the run lives in its own conversation (AD-38). */
+/**
+ * Shown in a chat: a link to a run's page (AD-44), or to one section of it, or to one of its sub-tasks' pages.
+ * The one card that lives in a conversation; every other card is on a page.
+ */
 export const RunLinkCard = z.object({
   type: z.literal("run_link"),
   runId: z.string(),
@@ -736,8 +739,11 @@ export const RunLinkCard = z.object({
   repo: z.string(),
   number: z.number(),
   title: z.string(),
+  /** The section of the page to open, e.g. "plan" or "analysis". */
+  section: z.string().optional(),
+  subtaskKey: z.string().optional(),
 });
-/** The header of a sub-task's own conversation (FR-C2). */
+/** The header of a sub-task's page (FR-C3). */
 export const SubtaskCard = z.object({
   type: z.literal("subtask"),
   runId: z.string(),
@@ -1023,13 +1029,14 @@ export interface SubtaskDto {
   updatedAt: string;
 }
 
-/** A sub-task as listed under its run in the conversation hierarchy (AD-43). */
+/** A sub-task as listed under its run in the hierarchy ticket → run → sub-task (AD-43); each has its own page. */
 export interface TicketSubtaskDto {
   key: string;
   index: number;
   title: string;
   state: SubtaskState;
-  conversationId: string;
+  /** Set once its sub-task workflow has started. */
+  conversationId: string | null;
   pending: number;
 }
 
@@ -1043,7 +1050,7 @@ export interface TicketRunDto {
   track: Track | null;
   /** Decisions waiting for the requester in this run, its sub-tasks included. */
   pending: number;
-  /** Sub-tasks that have their own conversation, in plan order (guided track). */
+  /** The sub-tasks of the approved plan, in plan order (guided track). */
   subtasks: TicketSubtaskDto[];
   prNumber: number | null;
   prUrl: string | null;
@@ -1146,8 +1153,59 @@ export interface ApprovalDto {
   kind: ApprovalKind;
   state: "pending" | "resolved" | "expired";
   conversationId: string | null;
+  /** The sub-task whose page holds the decision; null when it is on the run's page. */
+  subtaskKey: string | null;
+  /** What is asked, e.g. "Approve plan"; `title` adds the ticket. */
+  label: string;
   title: string;
   createdAt: string;
+}
+
+/** A card on a page: written only by the orchestrator, on the page of a run or of one of its sub-tasks (AD-44). */
+export interface PageCardDto {
+  key: string;
+  runId: string;
+  /** Null for the run's page. */
+  subtaskKey: string | null;
+  card: OrchestratorCard;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Whether the run's design session is open, and so whether the architect answers in the run's conversation (AD-38). */
+export interface DesignStateDto {
+  runId: string;
+  state: DesignSessionState;
+  turnRunning: boolean;
+  /** Started afresh from the current plan, and the architect has not answered since (R-14). */
+  fresh: boolean;
+  /** Whether the architect has written a plan yet: starting afresh needs one. */
+  hasPlan: boolean;
+}
+
+/** The page of a run (FR-C2): its header, what needs the requester, and the cards of its sections. */
+export interface RunPageDto {
+  run: RunDto;
+  /** The run's number among the runs of its ticket, and how many there are. */
+  ordinal: number;
+  runsOfTicket: number;
+  /** The cards of the run's own page, oldest first; the sub-tasks' cards are on their pages. */
+  cards: PageCardDto[];
+  /** Every decision waiting for the requester in this run, its sub-tasks included. */
+  needsYou: ApprovalDto[];
+  subtasks: TicketSubtaskDto[];
+  track: TrackSwitchDto | null;
+  design: DesignStateDto | null;
+}
+
+/** The page of one sub-task of a guided run (FR-C3). */
+export interface SubtaskPageDto {
+  run: RunDto;
+  subtask: SubtaskDto;
+  cards: PageCardDto[];
+  /** The decisions waiting for the requester on this page. */
+  needsYou: ApprovalDto[];
 }
 
 export interface ProgressDto {
@@ -1161,6 +1219,8 @@ export interface ProgressDto {
 /** Notifications pushed over the single server-sent event stream; clients fetch details over REST. */
 export type StreamNotice =
   | { t: "msg"; c: string; v: number }
+  /** A card changed on the page of run `r` (`s`: of its sub-task). */
+  | { t: "card"; r: string; s: string | null; v: number }
   | { t: "delta"; c: string; tempId: string; text: string }
   | { t: "typing"; c: string; on: boolean }
   | { t: "run"; r: string }

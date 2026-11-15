@@ -382,8 +382,11 @@ function decide(body) {
   if (names.includes("submit_work_item")) {
     if (lastIsToolResult(messages)) {
       const lastTool = used[used.length - 1]?.name;
-      return [{ type: "text", text: lastTool === "render" ? "Here is the table you asked for." : "Done — the orchestrator is on it." }];
+      const said = { render: "Here is the table you asked for.", show_card: "It is on the run's page: follow the link." }[lastTool];
+      return [{ type: "text", text: said ?? "Done — the orchestrator is on it." }];
     }
+    const showing = /show (?:me )?the (analysis|plan|progress) of (\S+)/i.exec(prompt);
+    if (showing) return [{ type: "tool_use", id: id("toolu"), name: "show_card", input: { runId: showing[2], card: showing[1].toLowerCase() } }];
     const issue = /(?:issue\s*#?|#)(\d+)/i.exec(prompt);
     if (issue) return [{ type: "tool_use", id: id("toolu"), name: "submit_work_item", input: { repo: "acme/demo", issueNumber: Number(issue[1]) } }];
     if (/table/i.test(prompt)) {

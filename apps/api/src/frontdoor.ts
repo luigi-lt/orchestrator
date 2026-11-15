@@ -176,7 +176,8 @@ export class FrontDoor {
         },
       }),
       defineTool("show_card", {
-        description: "Show a run's card in this conversation: its analysis, plan, progress, pull request or work item.",
+        description:
+          "Point the person to one of a run's records: its analysis, plan, progress, pull request or work item. Shows a link to that section of the run's page; the record itself is not copied into the conversation.",
         parameters: z.object({ runId: z.string(), card: z.enum(["analysis", "plan", "progress", "pull_request", "work_item"]) }),
         skipPermission: true,
         handler: async ({ runId, card }: { runId: string; card: "analysis" | "plan" | "progress" | "pull_request" | "work_item" }) => {
@@ -188,9 +189,26 @@ export class FrontDoor {
             work_item: `run:${runId}:work_item`,
           }[card];
           const found = await findLatestCardByPrefix(s.db, prefix);
-          if (!found) return { error: `Run ${runId} has no ${card} card yet` };
-          await insertMessage(s.db, { conversationId, role: "orchestrator", components: [found] });
-          return { shown: true };
+          const run = await getRun(s.db, runId);
+          if (!found || !run?.conversationId) return { error: `Run ${runId} has no ${card} yet` };
+          // Records live on the run's page (AD-44): the conversation gets a link to the section, never a copy of it.
+          await insertMessage(s.db, {
+            conversationId,
+            role: "orchestrator",
+            components: [
+              {
+                type: "run_link",
+                runId,
+                conversationId: run.conversationId,
+                repo: run.repo,
+                number: run.issueNumber,
+                title: run.title,
+                section: card,
+                ...(found.subtaskKey ? { subtaskKey: found.subtaskKey } : {}),
+              },
+            ],
+          });
+          return { shown: true, linkedTo: `the ${card} section of the run's page` };
         },
       }),
       defineTool("render", {

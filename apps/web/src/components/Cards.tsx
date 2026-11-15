@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import type { HandoffPlan, OrchestratorCard, PlanVersionDto, TrackedFinding, Verification } from "@orch/contracts";
 import { api, post } from "../api";
+import { runPath, subtaskPath } from "./TicketTree";
 
 type CardOf<T extends OrchestratorCard["type"]> = Extract<OrchestratorCard, { type: T }>;
 
@@ -87,19 +88,24 @@ function WorkItemCard({ card }: { card: CardOf<"work_item"> }) {
   );
 }
 
+const SECTION_NAME: Record<string, string> = { analysis: "analysis", plan: "plan", progress: "progress", pull_request: "pull request", work_item: "work item" };
+
+/** A link to a run's page, or to one section of it: the record itself stays on the page (AD-44). */
 function RunLinkCard({ card }: { card: CardOf<"run_link"> }) {
+  const page = card.subtaskKey ? subtaskPath(card.runId, card.subtaskKey) : runPath(card.runId);
+  const to = card.section ? `${page}#${card.section}` : page;
   return (
     <div className="card">
       <div className="card-head">
-        <span className="kicker">Run started · it has its own conversation</span>
+        <span className="kicker">{card.section ? `The ${SECTION_NAME[card.section] ?? card.section} of a run` : "Run started · it has its own page"}</span>
         <Link className="small" to={`/ops/runs/${card.runId}`}>
           Run details
         </Link>
       </div>
-      <Link to={`/chat/${card.conversationId}`} className="card-title">
-        Open the conversation of {card.repo}#{card.number} · {card.title}
+      <Link to={to} className="card-title">
+        {card.section ? `Open the ${SECTION_NAME[card.section] ?? card.section} of` : "Open the page of"} {card.repo}#{card.number} · {card.title}
       </Link>
-      <p className="muted small">The analysis, questions and approvals for this work appear there.</p>
+      {!card.section && <p className="muted small">The analysis, the plan, the questions and every decision for this work are on its page.</p>}
     </div>
   );
 }
@@ -293,8 +299,8 @@ function PlanBody({ plan, products }: { plan: HandoffPlan; products: Record<stri
 }
 
 const PLAN_STATUS = {
-  draft: "The architect is still shaping this plan with you. Ask for changes in the conversation.",
-  proposed: "The architect put this version up for your approval. To change it, ask in the conversation; a new version replaces this one.",
+  draft: "The architect is still shaping this plan with you. Ask for changes in the conversation beside this page.",
+  proposed: "The architect put this version up for your approval. To change it, ask the architect in the conversation; a new version replaces this one.",
   approved: "You approved this version. It is what the agents build.",
   expired: "This plan was not approved: the run ended, or moved to the fast track.",
 } as const;
@@ -714,7 +720,7 @@ function ChangeCard({ card }: { card: CardOf<"change"> }) {
       <p className="muted small">
         {card.review.rounds} review round(s), {card.review.fixRounds} fix round(s) · {card.review.resolved} finding(s) fixed ·{" "}
         {card.review.blocking ? <strong className="error">{card.review.blocking} blocking or major finding(s) still open</strong> : "no blocking or major finding open"}
-        {card.review.minor ? ` · ${card.review.minor} minor note(s)` : ""}. The review card above has the details.
+        {card.review.minor ? ` · ${card.review.minor} minor note(s)` : ""}. The Review section of this page has the details.
       </p>
       {card.status === "changes" && card.feedback && <blockquote className="answer">You asked: {card.feedback}</blockquote>}
       {pending && (
@@ -867,7 +873,7 @@ function StoryCard({ card }: { card: CardOf<"story"> }) {
                 <li key={st.key} value={st.index + 1}>
                   <div>
                     <span className={`badge ${st.state}`}>{SUBTASK_STATE_LABEL[st.state] ?? st.state.replace(/_/g, " ")}</span>{" "}
-                    {st.conversationId ? <Link to={`/chat/${st.conversationId}`}>{st.title}</Link> : st.title}
+                    <Link to={subtaskPath(card.runId, st.key)}>{st.title}</Link>
                   </div>
                   <div className="muted small story-meta">
                     {st.repository}

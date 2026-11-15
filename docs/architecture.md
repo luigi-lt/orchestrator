@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed (v2.6) — for review |
+| **Status** | Proposed (v2.7) — for review |
 | **Date** | 2026-11-15 |
 | **Phase** | Reference architecture — follows the [capability map](capabilities.md), the [non-functional requirements](non-functional-requirements.md) and the [functional requirements](functional-requirements.md) of iteration 2 |
 
@@ -819,7 +819,7 @@ Key entities (logical); new or changed in iteration 2 in **bold**:
 | **`review_report`** | Sub-task, round, head commit, verdict, findings (severity, file, line, explanation, suggestion) |
 | **`change_review`** | Sub-task, head commit, diff reference, state, the requester's feedback |
 | `approval` | Subject (plan version, change, unresolved findings, high-risk action), hash, required principal, state |
-| **`conversation`**, **`message`**, **`card`** | Conversation: agent (assistant, architect; later implementer), run, sub-task; neither for a general chat with the assistant. The ticket level is not stored: it is derived from the runs that share a ticket identity (AD-43). Message: author (requester or agent), text, components. Card: a section of a run's or sub-task's page, written only by the orchestrator, with its version (AD-44) |
+| **`conversation`**, **`message`**, **`card`** | Conversation: agent (assistant, architect; later implementer), run, sub-task; neither for a general chat with the assistant. The ticket level is not stored: it is derived from the runs that share a ticket identity (AD-43). Message: author (requester or agent), text, components. Card: a record on a run's or sub-task's page, written only by the orchestrator, keyed by its card key, with its version; the section it shows in follows from its type (AD-44) |
 | `run_event`, `usage_record`, `poll_checkpoint`, `push_subscription`, `audit_record` | As before; usage is recorded per step and per design turn, with the product it served |
 
 - **Retention jobs** enforce NFR-DR-02: run events and audit 1 year; transcripts, progress and artifacts (including bundles and diffs) 90 days; design-session checkpoints until the run closes plus 7 days; deletion on request (NFR-DR-04).
@@ -1266,7 +1266,7 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 
 ## 25. Next: the user view as pages with an agent panel
 
-Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, AD-38, AD-43 revised, AD-44 new). Not built yet.
+Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, AD-38, AD-43 revised, AD-44 new). **U1 is built**; U2 and U3 are not.
 
 **Why.** Through v2.4 a run's conversation held the orchestrator's cards, the architect's design session and the assistant's answers in one stream, and the composer's addressee followed the run's state. People could not always tell which agent they were addressing, decisions scrolled away in long runs, and trusted records sat between untrusted agent text. Five layouts were compared: one thread per agent in the side panel, a workspace with tabs, pages with an agent panel (chosen), threads attached to records, and conversations side by side (kept as a later add-on).
 
@@ -1290,7 +1290,7 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 
 | Layer | Change |
 |---|---|
-| Store | Cards leave the conversations: a `card` table keyed by card key, with run, sub-task, section and version; a migration moves the existing ones. Conversations get an agent. Each existing run conversation is split by author into the architect's and the assistant's conversations |
+| Store | Cards leave the conversations: a `card` table keyed by card key, with run, sub-task and version (the section follows from the card's type); a migration moves the existing ones (U1). Conversations get an agent. Each existing run conversation is split by author into the architect's and the assistant's conversations (U2) |
 | Worker | Activities write cards to the run's or sub-task's page instead of a conversation. The architect's replies go to its conversation, with a one-line marker per new plan version. Notices become activity entries on the page |
 | `api` | Page queries (`GET /api/runs/:id/page`, `GET /api/runs/:id/subtasks/:key/page`): sections, needs you, the track switch, available agents. Conversations by run and agent; a message goes to the conversation's agent after the availability check (AD-38). Page and conversation changes share the one SSE stream |
 | Web app | Routes for run and sub-task pages built from today's card components; the agent panel with the agent switch, streaming, the design session's state and "start afresh"; the track switch in the run's header; the start page; the phone-width sheet |
@@ -1308,6 +1308,14 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 
 **What stays.** The operator view; the workflows, signals and approvals (only where cards are written changes); decisions bound to hashes; defensive rendering of agent text; the hierarchy in the side panel.
 
+**U1 as built.**
+
+- *Store.* Migration 7 creates `cards` (card key, run, sub-task or none, card, version) and moves every orchestrator card of a run's or sub-task's conversation into it, on the page of that run or sub-task. The link to a run stays in the chat that started it; copies of cards the assistant had shown in a run's conversation are dropped, and copies in a general chat stay. Activities still name a conversation when they write a card; the store puts the card on that conversation's page (U2 names the page directly). A card stays on the page it was first written on. A change notifies `{t: "card", r: run, s: sub-task}` on the one stream.
+- *Where a decision is taken* is where its card is: `GET /api/pending` and the pages give each waiting decision its sub-task (or none), found from the card that carries its approval.
+- *Pages.* `GET /api/runs/:id/page` returns the run, its number among the runs of its ticket, its cards, what waits for the requester in the run and its sub-tasks, its sub-tasks, the track switch and the design session's state. `GET /api/runs/:id/subtasks/:key/page` returns the sub-task, its cards and what waits on it. The web app splits the cards into Needs you (a card whose approval is waiting), the sections of the page and the activity (notices, folded). The work item and sub-task cards become the page's header.
+- *Navigation.* The side panel lists every sub-task of an approved plan, also before it starts; each entry opens its page. The pending badge and browser notifications open the page of the decision; the toggle maps a page to the operator's run detail and back. Old links to a run's or sub-task's conversation open its page. The assistant's `show_card` posts a link to a section of the page instead of a copy.
+- *Meanwhile.* The run's conversation is shown beside the run's page, routed as before (the architect while the design session is open, the assistant otherwise); a sub-task's conversation beside its page. The plan no longer moves next to the architect's reply: it is on the page, under Needs you while proposed.
+
 ## Change history
 
 | Version | Change |
@@ -1322,3 +1330,4 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 | 2.4 | Increment 5 built: track switching (§9), access checks (AD-42), failure handling of §18 as built, R-14 fallback; status of §24 |
 | 2.5 | User view as pages with an agent panel (layout C): AD-25, AD-38 and AD-43 revised, AD-44 new; §7.5 user view rewritten; flows, data model and traceability updated; build order in §25 |
 | 2.6 | The roles of the orchestrator and of the assistant: the assistant keeps its name and lives on the start page only (AD-38, §7.5); it reads other agents' conversations and prepares actions the requester confirms (AD-45, §8.6, threat model); §25 updated |
+| 2.7 | U1 built (§25): the card table and its migration, page queries, run and sub-task pages with Needs you, navigation to pages; data model of `card` |

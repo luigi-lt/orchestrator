@@ -1,160 +1,65 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import type { ConversationDto, MessageDto, TicketDto, Track, TrackSwitchDto } from "@orch/contracts";
+import type { ConversationDto, DesignStateDto, MessageDto } from "@orch/contracts";
 import { api, post, put, subscribe } from "../api";
 import { useApp } from "../App";
 import { MessageView } from "../components/MessageView";
-import { TicketTree } from "../components/TicketTree";
+import { runPath, subtaskPath } from "../components/TicketTree";
+import { useUserNav } from "./UserLayout";
 
+/** Where a conversation lives now: a run's and a sub-task's are shown beside their pages (AD-44). */
+const pageOf = (c: ConversationDto): string | null =>
+  c.focusedRunId && c.kind === "run" ? runPath(c.focusedRunId) : c.focusedRunId && c.kind === "subtask" && c.subtaskKey ? subtaskPath(c.focusedRunId, c.subtaskKey) : null;
+
+/** A chat with the assistant, outside any run. */
 export function ChatView() {
   const { conversationId } = useParams();
   const navigate = useNavigate();
   const { me, setToggleTarget } = useApp();
-  const [conversations, setConversations] = useState<ConversationDto[]>([]);
-  const [tickets, setTickets] = useState<TicketDto[]>([]);
-
-  // The side panel shows conversations grouped by ticket, and the general chats.
-  const loadConversations = useCallback(async () => {
-    const [list, grouped] = await Promise.all([api<ConversationDto[]>("/api/conversations"), api<TicketDto[]>("/api/tickets")]);
-    setConversations(list);
-    setTickets(grouped);
-  }, []);
-
-  useEffect(() => {
-    void loadConversations();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    return subscribe((n) => {
-      if (n.t === "msg" || n.t === "pending" || n.t === "run") {
-        clearTimeout(timer);
-        timer = setTimeout(() => void loadConversations(), 400);
-      }
-    });
-  }, [loadConversations]);
-
-  // Without an id, open the last conversation or start a new one.
-  useEffect(() => {
-    if (conversationId || !me) return;
-    const target = me.lastConversationId && conversations.some((c) => c.id === me.lastConversationId) ? me.lastConversationId : conversations[0]?.id;
-    if (target) navigate(`/chat/${target}`, { replace: true });
-  }, [conversationId, me, conversations, navigate]);
-
-  useEffect(() => {
-    if (conversationId) void put("/api/preferences", { lastConversationId: conversationId });
-  }, [conversationId]);
-
+  const { conversations, loaded, newChat } = useUserNav();
   const current = conversations.find((c) => c.id === conversationId);
+
+  // Without an id, open the last conversation (its page, for a run's) or the newest chat.
   useEffect(() => {
-    setToggleTarget(current?.focusedRunId ? `/ops/runs/${current.focusedRunId}` : "/ops/runs");
+    if (conversationId || !me || !loaded) return;
+    const last = me.lastConversationId ? conversations.find((c) => c.id === me.lastConversationId) : undefined;
+    const target = last ?? conversations.find((c) => c.kind === "general");
+    if (target) navigate(pageOf(target) ?? `/chat/${target.id}`, { replace: true });
+  }, [conversationId, me, loaded, conversations, navigate]);
+
+  // An old link to a run's or sub-task's conversation opens its page.
+  useEffect(() => {
+    const page = current ? pageOf(current) : null;
+    if (page) navigate(page, { replace: true });
+  }, [current, navigate]);
+
+  useEffect(() => {
+    if (conversationId && current?.kind === "general") void put("/api/preferences", { lastConversationId: conversationId });
+  }, [conversationId, current?.kind]);
+
+  useEffect(() => {
+    setToggleTarget("/ops/runs");
     return () => setToggleTarget(null);
-  }, [current?.focusedRunId, setToggleTarget]);
+  }, [setToggleTarget]);
 
-  const newConversation = async () => {
-    const c = await post<ConversationDto>("/api/conversations", {});
-    await loadConversations();
-    navigate(`/chat/${c.id}`);
-  };
-
-  return (
-    <div className="chat-layout">
-      <aside className="sidebar">
-        <button className="primary block" onClick={() => void newConversation()}>
-          + New conversation
-        </button>
-        <TicketTree
-          tickets={tickets}
-          chats={conversations.filter((c) => c.kind === "general")}
-          currentId={conversationId}
-          onOpen={(id) => navigate(`/chat/${id}`)}
-        />
-      </aside>
-      {conversationId ? (
-        <Conversation key={conversationId} id={conversationId} kind={current?.kind ?? "general"} />
-      ) : (
-        <EmptyState onStart={() => void newConversation()} />
-      )}
-    </div>
-  );
+  // Until the list is there it is not known whether the address names a chat or a run's conversation.
+  if (!loaded || (current && pageOf(current))) return null;
+  return conversationId ? <Conversation key={conversationId} id={conversationId} kind="general" /> : <EmptyState onStart={() => void newChat()} />;
 }
 
 function EmptyState({ onStart }: { onStart: () => void }) {
   const { me } = useApp();
   return (
     <section className="empty-state">
-      <h2>Start a conversation</h2>
+      <h2>Start a chat</h2>
       <p className="muted">
         Ask the assistant to work on an issue (for example <em>"work on {me?.repos[0] ?? "owner/repo"}#12"</em>), or label an issue{" "}
-        <code>{me?.triggerLabel ?? "ai-ready"}</code> on GitHub and it will appear here automatically.
+        <code>{me?.triggerLabel ?? "ai-ready"}</code> on GitHub and it will appear under Tickets automatically.
       </p>
       <button className="primary" onClick={onStart}>
-        New conversation
+        New chat
       </button>
     </section>
-  );
-}
-
-interface DesignState {
-  runId: string;
-  state: "active" | "suspending" | "suspended" | "closed";
-  turnRunning: boolean;
-  /** Started afresh from the current plan; the next message starts the new session. */
-  fresh: boolean;
-}
-
-const TRACK_TEXT: Record<Track, string> = {
-  fast: "Fast track: the change is built, reviewed by an agent and opened as a pull request, with no stops before it.",
-  guided: "Guided track: you agree the plan with the architect agent, and check each change before its pull request opens.",
-};
-
-/**
- * Switching the track of a run (FR-A3), shown in its conversation while it is allowed. The orchestrator checks
- * again when the request arrives: the work may have moved on meanwhile.
- */
-function TrackSwitch({ runId, track }: { runId: string; track: TrackSwitchDto }) {
-  const [open, setOpen] = useState(false);
-  const [reason, setReason] = useState("");
-  const [state, setState] = useState<"idle" | "busy" | "sent">("idle");
-  const [error, setError] = useState<string | null>(null);
-  const to = track.to;
-  if (!to || state === "sent") return null;
-  const label = to === "guided" ? "Switch to the guided track" : "Switch to the fast track";
-  const submit = async () => {
-    setState("busy");
-    setError(null);
-    try {
-      await post(`/api/runs/${runId}/track`, { track: to, reason: reason.trim() || undefined });
-      setState("sent");
-    } catch (e) {
-      setError((e as Error).message);
-      setState("idle");
-    }
-  };
-  return (
-    <div className="track-switch" role="group" aria-label="Track">
-      {!open ? (
-        <>
-          <span className="muted small">{TRACK_TEXT[track.current ?? (to === "guided" ? "fast" : "guided")]}</span>
-          <button className="ghost small" onClick={() => setOpen(true)}>
-            {label}
-          </button>
-        </>
-      ) : (
-        <>
-          <span className="small">
-            {to === "guided"
-              ? "The change being built is set aside, nothing is pushed, and a design session with the architect agent starts from the analysis."
-              : "The design session ends; the current plan, if there is one, becomes a single change built with no stops before the pull request."}
-          </span>
-          <input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="Why? (optional, recorded on the ticket)" maxLength={500} aria-label="Why" />
-          <button className="primary small" disabled={state === "busy"} onClick={() => void submit()}>
-            {label}
-          </button>
-          <button className="ghost small" onClick={() => setOpen(false)}>
-            Keep the {track.current} track
-          </button>
-        </>
-      )}
-      {error && <span className="error small">{error}</span>}
-    </div>
   );
 }
 
@@ -193,12 +98,15 @@ function FreshSession({ runId }: { runId: string }) {
   );
 }
 
-function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] }) {
+/**
+ * One conversation: the messages, the state of the design session while it is open (the requester is talking
+ * to the architect, AD-38), the reply as it streams, and the composer. A chat fills the page; a run's
+ * conversation sits in the panel beside the run's page.
+ */
+export function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] }) {
   const [messages, setMessages] = useState<MessageDto[]>([]);
   // Set while the run's design session is open: messages here go to the architect agent (AD-38).
-  const [design, setDesign] = useState<DesignState | null>(null);
-  const [track, setTrack] = useState<TrackSwitchDto | null>(null);
-  const [runId, setRunId] = useState<string | null>(null);
+  const [design, setDesign] = useState<DesignStateDto | null>(null);
   const [streaming, setStreaming] = useState("");
   const [typing, setTyping] = useState(false);
   const [draft, setDraft] = useState("");
@@ -216,13 +124,11 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
   }, []);
 
   const loadAfter = useCallback(async () => {
-    const data = await api<{ conversation: ConversationDto; messages: MessageDto[]; busy: boolean; design: DesignState | null; track: TrackSwitchDto | null }>(
+    const data = await api<{ conversation: ConversationDto; messages: MessageDto[]; busy: boolean; design: DesignStateDto | null }>(
       `/api/conversations/${id}?after=${maxVersion.current}`,
     );
     merge(data.messages);
     setDesign(data.design);
-    setTrack(data.track);
-    setRunId(data.conversation.focusedRunId ?? null);
     return data;
   }, [id, merge]);
 
@@ -266,9 +172,6 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
     }
   };
 
-  // Starting afresh needs a plan to start from.
-  const hasPlan = messages.some((m) => m.components.some((c) => c.type === "plan"));
-
   const timeline = useMemo(
     () => messages.map((m) => <MessageView key={m.id} message={m} onSubmitForm={submitForm} />),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -283,16 +186,18 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
           {design.fresh && !design.turnRunning
             ? "A fresh session starts from the current plan with your next message: the architect will not see the conversation before this point."
             : design.state === "active"
-            ? "Your messages here go to the architect. Ask about the code, set constraints, ask for changes to the plan."
-            : design.turnRunning
-              ? "Resuming: the architect's workspace is starting again. This can take a minute."
-              : "The architect's workspace was saved while you were away. Your next message resumes it, which can take a minute."}{" "}
-          {!design.turnRunning && !typing && hasPlan && !design.fresh && <FreshSession key={`${design.state}-${messages.length}`} runId={design.runId} />}
+              ? "Your messages here go to the architect. Ask about the code, set constraints, ask for changes to the plan; the plan on the page shows each new version."
+              : design.turnRunning
+                ? "Resuming: the architect's workspace is starting again. This can take a minute."
+                : "The architect's workspace was saved while you were away. Your next message resumes it, which can take a minute."}{" "}
+          {!design.turnRunning && !typing && design.hasPlan && !design.fresh && <FreshSession key={`${design.state}-${messages.length}`} runId={design.runId} />}
         </div>
       )}
-      {runId && track?.to && <TrackSwitch key={`${track.current}-${track.to}`} runId={runId} track={track} />}
       <div className="timeline">
         {timeline}
+        {messages.length === 0 && !typing && (
+          <p className="muted small">{kind === "general" ? "Ask about your runs, or start work on an issue." : "No messages yet. What the orchestrator records and asks is on the page."}</p>
+        )}
         {typing && (
           <div className="message agent">
             {design && <div className="origin agent-origin">Architect agent</div>}
@@ -312,13 +217,7 @@ function Conversation({ id, kind }: { id: string; kind: ConversationDto["kind"] 
         <textarea
           value={draft}
           placeholder={
-            design
-              ? "Message the architect…"
-              : kind === "run"
-                ? "Ask about this run…"
-                : kind === "subtask"
-                  ? "Ask about this sub-task…"
-                  : "Ask about runs, or start work on an issue…"
+            design ? "Message the architect…" : kind === "run" ? "Ask the assistant about this run…" : kind === "subtask" ? "Ask the assistant about this sub-task…" : "Ask about runs, or start work on an issue…"
           }
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
