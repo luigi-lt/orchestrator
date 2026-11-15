@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed (v2.5) — for review |
+| **Status** | Proposed (v2.6) — for review |
 | **Date** | 2026-11-15 |
 | **Phase** | Reference architecture — follows the [capability map](capabilities.md), the [non-functional requirements](non-functional-requirements.md) and the [functional requirements](functional-requirements.md) of iteration 2 |
 
@@ -37,6 +37,8 @@ Out of scope for this document: detailed API specifications, database DDL and UI
 | Workspace | The isolated sandbox in which an agent reads, changes and builds code. A **step workspace** lives for one step; a **session workspace** lives for a design session and is saved when idle (AD-34) |
 | Requester | The person a run acts for: who sent the chat request, or who added the `ai-ready` label (AD-05) |
 | Agent profile | A versioned agent definition: instructions, tools, model, limits (CAP-01) |
+| Orchestrator | The system itself: workflows, `api`, worker. It hands work to the agents, decides by rules, asks people for decisions, publishes and keeps the record. It contains no model and never chats; in the user view it writes the pages (AD-44) |
+| Assistant | The front-door agent, on the start page of the user view: starts work, answers about the person's runs, reads other agents' conversations, prepares actions the person confirms on a page (AD-45). It decides nothing |
 | Linked credential | A token or OAuth connection a user links to their orchestrator account (AD-28) |
 | Intake connection | A linked Atlassian connection used to discover new tickets for a project (AD-27) |
 
@@ -121,13 +123,14 @@ New decisions of this phase. They complement D1–D15 in the capability map.
 | AD-35 | **Design turns are durable workflow work; token streaming is out of band.** A message is persisted, signalled to the `DesignSessionWorkflow` and delivered by an activity; the reply streams workspace → gateway → `api` → browser without entering Temporal history | One owner of the workspace lifecycle; turns survive restarts and are never lost or run twice | The `api` talking to the workspace directly: two owners, lost turns on restart |
 | AD-36 | **Plans are immutable versions written only by the architect through a tool.** The orchestrator validates each version (schema, catalog, dependencies), stores it with the request that prompted it, computes what changed, and renders it. Approval is a user action bound to a version hash; a newer version voids a pending approval | The requester steers, the architect writes, and what is approved is exactly what is built (FR-P3, FR-P4) | An editable plan (v1.2): changes without explanation. Patch operations from the agent: harder to validate, versions drift |
 | AD-37 | **Workspaces hold several repositories; at most one is writable.** Read-only workspaces (analysis, design, review) get the repositories of the products involved as separate bundles and can ask for more catalog repositories, within a limit. An implementer workspace gets its one repository writable, plus read-only copies of approved changes it depends on. Only the writable repository's branch can leave a workspace | Agents see what they need across products; the damage a step can do stays one branch in one repository | One workspace per repository: no cross-product reasoning. All repositories writable: cross-repository changes outside the plan |
-| AD-38 | **One conversation per run and agent; the person chooses the agent, the orchestrator says which are available.** Each conversation belongs to one agent, and a message goes to the agent of the conversation it is written in. The `api` checks, from the run's state and never by asking a model, that the agent is available: the architect from the guided classification until a plan is approved, the assistant (front-door agent, scoped to the run or sub-task) at any time. Revised in v2.5; until then one conversation per run whose addressee followed the run's state | Exactly one agent per thread; no message reaches an agent the person did not choose; routing cannot be talked into anything | Sharing the chat that started the run; one conversation per run whose addressee follows the run's state (v2.0 to v2.4) |
+| AD-38 | **One conversation per run and agent; the person chooses the agent, the orchestrator says which are available.** Each conversation belongs to one agent, and a message goes to the agent of the conversation it is written in. The `api` checks, from the run's state and never by asking a model, that the agent is available: the architect from the guided classification until a plan is approved; the assistant (front-door agent) on the start page only, for all the person's runs. Revised in v2.5; until then one conversation per run whose addressee followed the run's state | Exactly one agent per thread; no message reaches an agent the person did not choose; routing cannot be talked into anything | Sharing the chat that started the run; one conversation per run whose addressee follows the run's state (v2.0 to v2.4) |
 | AD-39 | **Every change is reviewed by the reviewer agent in a fresh read-only workspace**, from the change, the sub-task, the plan and the product's guidance — not from the implementer's transcript. Where a deployment offers several model families, the reviewer's default model differs from the implementer's. The verdict drives the fix loop and fast-track publishing only | An independent second look; errors of the first agent are less likely to be repeated | Self-review by the implementer: same context, same blind spots |
 | AD-40 | **The diff check approves a commit.** The worker computes what changed from the result commit; the change review card is rendered from it (files and line counts; the code itself is not on the card, a view of it is a second stage, FR-N12); the approval carries the commit hash, and exactly that commit is pushed | What the requester saw is what is published | Approving a description of the change |
 | AD-41 | **Dependent sub-tasks: stacked in one repository, referenced across repositories.** In the same repository the dependent branch starts from the approved commit of the one it depends on, and its pull request targets that branch until it merges. Across repositories the dependent implementer gets a read-only copy of the approved change and the contract; pull requests state the merge order and the orchestrator flags violations | Work continues without waiting for merges; reviewers see only each sub-task's own diff | Waiting for each merge: days of idle time. One long-lived branch per story: one huge review |
 | AD-42 | **Access is checked before commitment.** Analysis needs the requester's read access to each repository it opens; a plan can be approved only when the requester can push to every repository in it and (business) create issues in every Jira project involved. As built: the repository must be visible, the user must have write access, and a push that sends nothing (`git push --dry-run` of a branch deletion) must be accepted; a refusal found later makes the sub-task wait for the requester | No story is left half-built because a credential cannot reach one product | Finding out at push time |
 | AD-43 | **The work forms a hierarchy: ticket → run → sub-task.** A ticket groups all its runs; a run has a page for what concerns the whole work (analysis, plan, story view), and in a guided run each sub-task has a page under it (its check, review and pull request). Agent conversations attach to a run, later also to a sub-task (AD-38). The ticket is not stored: it is the identity runs already share (the workflow ID that claims the ticket). Waiting decisions roll up from sub-task to run to ticket. Revised in v2.5: conversations became pages | Everything about a ticket in one place, in the shape people know from story → sub-issues; a diff check stays with its sub-task | A flat list; one long page or thread per run for everything |
 | AD-44 | **Pages for the orchestrator's records, conversations for agents.** Cards, decisions and progress are sections of the run's and sub-task's pages, written only by the orchestrator. Agents' text appears only in their conversations, where an agent can show tables and forms of its own and point to a section of a page, but never place a card or a decision | The trust boundary is visible in the layout; a decision is never inside a chat; a long run stays readable; the person reads the plan while talking to the architect | Cards and agent turns in one timeline (v2.0 to v2.4); threads attached to records, which cramp a long design session; a tab per agent, which hides the plan while designing |
+| AD-45 | **The assistant prepares, the person confirms.** The assistant can prepare two run actions the requester asks for in its chat, cancelling a run and switching its track; each appears on the run's page under Needs you, marked as prepared by the assistant with the request quoted, bound to a hash, and happens only when the requester confirms it there. Approvals are never prepared. The assistant can also read the other agents' conversations of the requester's runs, read-only, as quoted untrusted text | Fewer clicks for common requests, while every action is still taken by a person, on a page, with what was prepared in view | The assistant acting directly (a model taking decisions); no assistant actions at all; the assistant writing in other agents' conversations |
 
 ## 5. System context
 
@@ -393,16 +396,16 @@ Two listeners: **sandbox-facing** (workspace control channel, bundles, MCP) and 
 |---|---|
 | Run | Header: ticket, track with its switch (FR-A3), state, progress. **Needs you**: every decision waiting in the run and its sub-tasks. Analysis; plan with versions, what changed and Approve; story view. On the fast track, the single change: review, checks, pull request. Activity, folded away |
 | Sub-task | Description and acceptance criteria, progress, review report, check of the change, what blocks it, pull request. Later: a Changes section with the code (FR-N12) and the implementer's conversation (FR-N2) |
-| Start | The person's tickets that need them or are active, and the assistant in the agent panel |
+| Start | The person's tickets that need them or are active, and the **assistant** in the agent panel, with the person's earlier chats |
 
-**Conversations (AD-38).** One per run and agent, created when the agent first takes part: the architect's when the run is classified as guided, the assistant's when the person first opens it on that run. A chat with the assistant outside any run is a general conversation; when it starts a run, it shows a link to the run's page. Other people involved in a run (e.g., an engineering lead asked to approve) see its pages within their scope and get their own conversations.
+**Conversations (AD-38).** One per run and agent, created when the agent first takes part: the architect's when the run is classified as guided (later, an implementer's when its sub-task is built). The assistant's conversations are not tied to a run: they are the person's chats on the start page; when one starts a run, it shows a link to the run's page. Other people involved in a run (e.g., an engineering lead asked to approve) see its pages within their scope and get their own conversations.
 
 **Who answers.** The person picks the agent in the panel; a message goes to the agent of the conversation it is written in, after the `api` checks that the agent is available, from the run's state and never by asking a model:
 
 | Agent | Available | When not |
 |---|---|---|
 | **Architect** | From the guided classification until a plan is approved | Before: not listed. After: the conversation stays readable, the panel says the plan is approved |
-| **Assistant** (front-door agent) | Always; scoped to the run or sub-task of the page, or to the person's work on the start page | — |
+| **Assistant** (front-door agent) | On the start page, for all the person's runs | On a run's page: not listed; the panel links to the start page with the run named |
 | Implementer of a sub-task (later, FR-N2) | While the sub-task is being built | Read-only after |
 
 Every conversation shows its agent's name in the panel header. While a session workspace is starting or resuming, a status line appears in the architect's conversation within the acknowledgement time (NFR-PF-01), so the wait is never silent (NFR-PF-10).
@@ -663,7 +666,7 @@ sequenceDiagram
   API-->>Dev: Link to the new run's page
 ```
 
-The front-door agent's tools are limited to: submit a work item, get run status, list the requester's runs, point to a section of a page by reference, and render agent-allowed components. Approvals and track changes are never available as tools.
+The assistant's tools (AD-45) are limited to: submit or create a work item, get run status, list the requester's runs, read another agent's conversation in one of the requester's runs (read-only; returned as quoted, untrusted text), point to a section of a page by reference, prepare a cancel or a track switch that the requester confirms on the run's page, and render agent-allowed components. Approvals are never available as tools, not even prepared.
 
 ## 9. Run lifecycle and workflow design
 
@@ -884,6 +887,7 @@ Linked credentials are decrypted only in memory, at the moment of use, by the cr
 | Threat | Example | Mitigation |
 |---|---|---|
 | Prompt injection via ticket or repository | A ticket instructs the agent to leak code or change CI | No source-control or ticket credentials in the sandbox; no route to source control; egress allowlist; policy enforced outside the model; high-risk actions need approval. Guided track: plan approval before execution and a diff check before each pull request. Fast track: limits re-checked on the real diff, and a person reviews the pull request before anything merges |
+| Prompted assistant | Text the assistant reads (a ticket, another agent's conversation) makes it prepare an action the requester did not ask for | The assistant only prepares; the action happens when the requester confirms it on the run's page, where the card names the assistant and quotes the request it acted on; approvals can never be prepared (AD-45) |
 | Malicious ticket triggers a run | Someone labels a ticket with harmful instructions | Requester must be a linked user and is the person who added the label (AD-05); agent tools bounded by profile and policy; nothing reaches a protected branch without a person's review |
 | Credential theft from the sandbox | Agent reads environment or files | Copilot token injected at egress; workspace token scoped to one step; no other credentials present |
 | Theft of linked credentials | Attacker reaches the database | Envelope encryption with a Key Vault key; decrypted only in memory by the credential broker; audit of every use; expiry and revocation on leavers |
@@ -944,7 +948,7 @@ Rules:
 
 | Profile | Purpose | Workspace | Tools | Result |
 |---|---|---|---|---|
-| `front-door` | Conversation, intent, collecting details | None (shared runtime, `mode: "empty"`) | Orchestrator tools only | Chat text, agent components |
+| `front-door` (the Assistant) | Conversation on the start page: starting work, questions across runs, reading other agents' conversations, preparing actions to confirm | None (shared runtime, `mode: "empty"`) | Orchestrator tools only (AD-45) | Chat text, agent components, prepared actions |
 | `analyst` | Preliminary analysis of every work item: understand it, place it in products, size it, propose a track, ask questions (replaces `readiness-analyst`) | Step, read-only, several repositories | Read tools, ticket read, `request_repository` | `submit_analysis` |
 | `architect` | Design the solution with the requester and write the hand-off plan (replaces `planner`); guided track only | Session, read-only, several repositories | Read tools, git history, ticket read, `request_repository`, agent components | Chat text; `submit_plan`, `propose_plan` |
 | `implementer` | Implement one sub-task with tests, or fix review findings | Step, one repository writable, references read-only | Shell, edit, the product's build and test commands | `submit_result` with evidence per acceptance criterion; result bundle |
@@ -1169,7 +1173,7 @@ Quality gates in CI: type checks, unit tests, contract tests for adapters (recor
 | FR-C2 The run's page | Page queries over the run's cards; Needs you from pending approvals (AD-44, §7.5, §25) |
 | FR-C3 A page for each sub-task | Cards keyed by sub-task, written by the `SubTaskWorkflow` (AD-43, §8.3) |
 | FR-C4 A conversation for each agent | Conversations per run and agent; routing by conversation with an availability check (AD-38) |
-| FR-C5 The assistant on every page | Front-door agent scoped to the page's run or to the person's work (§7.5) |
+| FR-C5 The assistant on the start page | Front-door agent on the start page, for all the person's runs; `read_conversation` and `prepare_action` tools; prepared actions confirmed on the run's page (AD-45, §7.5, §8.6) |
 | FR-C6 Narrow screens | Agent panel as a full-screen sheet (§7.5) |
 
 ### Key non-functional requirements
@@ -1276,7 +1280,8 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 
 **Taken with the decision** (defaults; any can still change):
 
-- The assistant is available on every page; earlier chats with it are listed inside the agent panel, no longer in the side panel.
+- The assistant keeps its name and lives on the start page only, for all the person's runs; earlier chats with it are listed inside the agent panel there, no longer in the side panel. A run's page links to it with the run named (v2.6).
+- The assistant can read the other agents' conversations of the person's runs, read-only and quoted, and prepare a cancel or a track switch that the person confirms on the run's page; never an approval (AD-45, v2.6).
 - The implementer and the reviewer join the panel later, with FR-N2; the sub-task's page is where the implementer's conversation goes.
 - At phone width the agent panel is a full-screen sheet over the page.
 - The view of code changes (FR-N12) comes later, as a Changes section of the sub-task's page.
@@ -1289,7 +1294,7 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 | Worker | Activities write cards to the run's or sub-task's page instead of a conversation. The architect's replies go to its conversation, with a one-line marker per new plan version. Notices become activity entries on the page |
 | `api` | Page queries (`GET /api/runs/:id/page`, `GET /api/runs/:id/subtasks/:key/page`): sections, needs you, the track switch, available agents. Conversations by run and agent; a message goes to the conversation's agent after the availability check (AD-38). Page and conversation changes share the one SSE stream |
 | Web app | Routes for run and sub-task pages built from today's card components; the agent panel with the agent switch, streaming, the design session's state and "start afresh"; the track switch in the run's header; the start page; the phone-width sheet |
-| Front-door agent | `show_card` becomes a link to a page section; its scope follows the page the panel is opened on |
+| Assistant (front-door agent) | `show_card` becomes a link to a page section. New tools: `read_conversation` (another agent's conversation in one of the person's runs, read-only, quoted) and `prepare_action` (cancel or switch track, as a prepared action on the run's page). Its instructions are rewritten for the current tracks, checks and pages |
 | Tests | End-to-end checks read pages and conversations through the new queries; browser checks for the panel, the agent switch and the phone-width sheet |
 
 **Build order.**
@@ -1298,7 +1303,7 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 |---|---|---|
 | U1 | **Pages.** The card table and page queries; run and sub-task pages from today's cards, with the decisions on them; the side panel, the pending badge and notifications open pages; the toggle maps to pages. Run conversations stay reachable meanwhile | Every decision of a run on one page |
 | U2 | **Agent panel.** Conversations per run and agent, the agent switch with availability, routing by conversation (AD-38), the architect's design session in the panel, migration of existing runs; run conversations retired | Designing a story with the plan in view, and no mixed stream |
-| U3 | **Everywhere.** The assistant on every page and the start page; the phone-width sheet; an accessibility pass of the new layout (NFR-UX-01) | The whole user view, at any width |
+| U3 | **Start page and the assistant.** The start page with the assistant; its new tools (reading other agents' conversations, preparing a cancel or a track switch) and prepared actions confirmed on the run's page; the phone-width sheet; an accessibility pass of the new layout (NFR-UX-01) | Starting and steering work from one place, at any width |
 | Later | The Changes section (FR-N12); the implementer in the panel (FR-N2); pages side by side | |
 
 **What stays.** The operator view; the workflows, signals and approvals (only where cards are written changes); decisions bound to hashes; defensive rendering of agent text; the hierarchy in the side panel.
@@ -1316,3 +1321,4 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 | 2.3 | Increment 4 built: the change review card without a view of the code (AD-40, §7.5, FR-N12); when a dependent sub-task starts, what is checked out for it, and what happens on a conflict (§8.4); sub-tasks that are not delivered and who closes the story (§8.3); status of §24, state of R-17 |
 | 2.4 | Increment 5 built: track switching (§9), access checks (AD-42), failure handling of §18 as built, R-14 fallback; status of §24 |
 | 2.5 | User view as pages with an agent panel (layout C): AD-25, AD-38 and AD-43 revised, AD-44 new; §7.5 user view rewritten; flows, data model and traceability updated; build order in §25 |
+| 2.6 | The roles of the orchestrator and of the assistant: the assistant keeps its name and lives on the start page only (AD-38, §7.5); it reads other agents' conversations and prepares actions the requester confirms (AD-45, §8.6, threat model); §25 updated |

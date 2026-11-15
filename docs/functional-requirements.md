@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Agreed baseline (v1.7) |
+| **Status** | Agreed baseline (v1.8) |
 | **Date** | 2026-11-15 |
 | **Scope** | The next iteration after the [MVP](mvp.md): pilot-ready experience, focused on understanding the work, shaping the plan and reviewing the result |
 
@@ -29,7 +29,8 @@ The [capability map](capabilities.md) says what the orchestrator must be able to
 | Architect agent | On the guided track, designs the solution with the requester in its own conversation, beside the run's page, and writes the hand-off plan |
 | Implementer agent | Implements a sub-task in a sandbox, set up for the sub-task's product (its guidance, toolchain and commands) |
 | Reviewer agent | Reviews every change before a pull request opens |
-| Front-door agent | The chat assistant in the user view |
+| Orchestrator | The system that runs the work: it hands work to the agents, decides by rules, asks the requester for decisions, publishes to GitHub and keeps the record. It contains no model and never chats; it speaks through the pages of the user view |
+| Assistant | The front-door agent, on the start page of the user view: starts work, answers questions about the requester's runs, reads the other agents' conversations, and prepares actions the requester confirms on a run's page. It decides nothing |
 | Track | Fast (bugs, small changes) or guided (stories, larger features) |
 | Hand-off plan | The plan of a guided-track item, written by the architect agent and approved by the requester: goal, approach and sub-tasks, each built by an agent |
 | Product | Something a team owns and ships, made of one or more repositories (for example a service and its web client) |
@@ -279,14 +280,16 @@ As a requester on the guided track, I follow and decide each sub-task on its own
 #### FR-C4 A conversation for each agent · Now · CAP-10
 As a requester, I always know which agent I am talking to, so that I never instruct the wrong one.
 - An **agent panel** beside every page holds the conversations with the agents. Each conversation belongs to one agent and one run (or, later, one sub-task); the panel always shows the agent's name.
-- I choose the agent. The panel lists the agents available for the page I am on and says why one is not: the **architect** from the moment the work is classified as guided until a plan is approved (then its conversation stays readable, without new messages); the **assistant** at any time, for questions about the run, its status and its records.
+- I choose the agent. The panel lists the agents available for the page I am on and says why one is not. On a run's page: the **architect** from the moment the work is classified as guided until a plan is approved (then its conversation stays readable, without new messages); later, on a sub-task's page, its **implementer** (FR-N2). The **assistant** is on the start page only (FR-C5); a run's page links to it, with the run already named. On a fast-track run no agent talks with me, and the panel says so.
 - No decision is ever taken in a conversation. Agents can show tables and forms of their own; when an agent refers to a record ("show me the plan"), the conversation links to that section of the page instead of copying it.
 - A reply that arrives while I am on another page marks the agent in the panel and the run in the side panel.
 
-#### FR-C5 The assistant on every page · Now · CAP-10
-As a requester, I can ask the assistant anything from wherever I am.
-- On a page outside any run (the start page), the agent panel opens the assistant. My earlier chats with it are listed inside the panel.
-- When I start work from a chat ("work on PROJ-123"), the chat shows a link to the new run's page.
+#### FR-C5 The assistant on the start page · Now · CAP-10
+As a requester, I have one place to start work and to ask about all my runs, so that a run's page holds only the agents working on that run.
+- The start page shows my tickets that need me or are active, with the assistant in the agent panel. My earlier chats with it are listed inside the panel. The assistant keeps its name, **Assistant**; the orchestrator itself never appears as a voice in a chat.
+- **Start work**: on an existing ticket, or on a new one it creates from my description. The chat then links to the new run's page.
+- **Answer** about any of my runs: state, what waits for me, why a track was chosen. It can **read** the other agents' conversations of my runs, read-only, and quotes them as such ("the architect said: …"); it never writes in them.
+- **Prepare an action** I ask for in the chat: cancel a run, or switch its track. The action appears on that run's page under Needs you, marked as prepared by the assistant with my request quoted, and happens only when I confirm it there. Approvals (plans, changes, findings, high-risk changes, access) are never prepared by the assistant.
 
 #### FR-C6 Narrow screens · Now · NFR-UX-01
 - At phone width the page fills the screen and the agent panel opens over it as a full-screen sheet, with a way back to the page. Decisions stay on the page.
@@ -361,3 +364,4 @@ Detailed in the [reference architecture](architecture.md) v2.0: decisions AD-30 
 | 1.5 | Conversation hierarchy ticket → run → sub-task: conversations grouped by ticket in both views (FR-C1), a conversation for each sub-task under its run (FR-C2); the change review card moves to the sub-task's conversation (FR-R4) |
 | 1.6 | The change review card no longer shows the code: the view of code changes is a second stage (FR-R4, FR-N12). A dependent sub-task starts when the one it depends on has passed its check and its pull request is open (FR-B1, FR-M4). What happens when a sub-task is not delivered, and who closes the story (FR-R7) |
 | 1.7 | User view as pages and an agent panel (layout C): pages for runs and sub-tasks with every decision on them (FR-C1 to FR-C3), one conversation per agent with the agent chosen by the requester (FR-C4), the assistant on every page (FR-C5), narrow screens (FR-C6); the design session moves to the architect's own conversation (FR-P1); the code view gets its place on the sub-task's page (FR-R4, FR-N12) |
+| 1.8 | The roles of the orchestrator and of the assistant (§1, FR-C4, FR-C5): the assistant keeps its name, lives on the start page only, reads the other agents' conversations read-only, and prepares cancel and track-switch actions that the requester confirms on the run's page |
