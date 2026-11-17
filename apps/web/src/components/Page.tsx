@@ -178,7 +178,6 @@ const narrow = () => typeof window !== "undefined" && window.matchMedia?.("(max-
 const STATE_WORD: Record<AgentAvailabilityDto["state"], string> = {
   available: "talk now",
   read_only: "read only",
-  elsewhere: "in your chats",
   not_yet: "not yet",
   not_available: "not on this run",
 };
@@ -190,7 +189,8 @@ const firstChoice = (agents: AgentAvailabilityDto[]) =>
 /**
  * The agent panel beside a page (FR-C4, AD-38): the agents of this page, which of them the requester can talk
  * with and why not, and the conversation with the one chosen. Each conversation belongs to one agent; the
- * requester chooses the agent, the orchestrator says which are available.
+ * requester chooses the agent, the orchestrator says which are available. The assistant is not one of them: it
+ * is on the start page, and the panel links there with the run named.
  */
 export function AgentPanel({ agents, runId }: { agents: AgentAvailabilityDto[]; runId: string }) {
   const [open, setOpen] = useState(() => {
@@ -281,13 +281,12 @@ export function AgentPanel({ agents, runId }: { agents: AgentAvailabilityDto[]; 
             <strong>{selected.name}</strong> · <span className="muted">{STATE_WORD[selected.state]}</span>
           </p>
           {selected.why && <p className="muted">{selected.why}</p>}
-          {selected.agent === "assistant" && (
-            <Link className="primary-link" to={`/chat/new?about=${encodeURIComponent(runId)}`}>
-              Ask the assistant about this run
-            </Link>
-          )}
         </div>
       )}
+      {/* The assistant is on the start page only (FR-C5): the page links to it with the run named. */}
+      <Link className="ask-assistant small" to={`/start?about=${encodeURIComponent(runId)}`}>
+        Questions about this run? Ask the assistant on the start page →
+      </Link>
     </aside>
   );
 }

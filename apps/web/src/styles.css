@@ -382,3 +382,26 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); cur
   display: inline-block; max-width: 100%; padding: 4px 12px; border-radius: 999px; font-size: 12.5px;
   background: color-mix(in srgb, var(--orch) 9%, var(--surface)); color: var(--orch); border: 1px solid color-mix(in srgb, var(--orch) 25%, var(--border));
 }
+
+/* Start page: the requester's work, and the assistant in the agent panel (FR-C5, U3) */
+.start-entry {
+  width: 100%; text-align: left; display: flex; flex-direction: column; gap: 0; padding: 8px 10px; margin-bottom: 4px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface);
+}
+.start-entry .title { font-weight: 600; }
+.start-entry.active { background: var(--accent-soft); border-color: var(--accent); }
+.ticket-card {
+  display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; padding: 10px 12px; max-width: 680px;
+  background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: var(--radius); color: var(--text);
+}
+.ticket-card:hover { text-decoration: none; border-color: var(--accent); }
+.ticket-card .ticket-ref { color: var(--muted); font-size: 12px; }
+.ticket-card-title { font-weight: 600; min-width: 0; overflow-wrap: anywhere; }
+.ticket-card > .small { grid-column: 2; }
+.agent-panel-actions { display: flex; gap: 4px; flex: none; }
+.assistant-intro p { margin: 0; color: var(--muted); font-size: 13px; }
+.chat-list { display: flex; flex-direction: column; gap: 2px; }
+.chat-list .conversation-item { width: 100%; border-radius: 8px; }
+.chat-list .conversation-item:hover { background: var(--surface-2); }
+.chat-title { padding: 6px 16px; border-bottom: 1px solid var(--border); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ask-assistant { display: block; padding: 8px 16px; border-top: 1px solid var(--border); background: var(--surface); }

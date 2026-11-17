@@ -27,7 +27,7 @@ export function Products() {
 
   useEffect(() => {
     void api<ProductsData>("/api/products").then(setData);
-    setToggleTarget("/chat");
+    setToggleTarget("/start");
     return () => setToggleTarget(null);
   }, [setToggleTarget]);
 

@@ -111,6 +111,13 @@ const subtaskIn = (runId, key, states) =>
 /** The requester's pending check of a sub-task's change: the card in the sub-task's conversation. */
 const pendingCheck = (st, round = 0) =>
   waitFor(`the check of ${st.key}`, async () => (await cardsOf(st.conversationId)).find((c) => c.type === "change" && c.status === "pending" && c.round === round), 120_000);
+/** A decision and its card: both are written a moment after the run's state says it waits. */
+const decisionCard = (runId, conversationId, kind) =>
+  waitFor(`the ${kind} decision`, async () => {
+    const approval = (await api("/api/pending")).find((p) => p.runId === runId && p.kind === kind);
+    const card = approval && (await cardsOf(conversationId)).find((c) => c.approvalId === approval.id);
+    return card ? { approval, card } : null;
+  }, 60_000);
 const decideChange = (card, decision, feedback) => api(`/api/approvals/${card.approvalId}/change`, { method: "POST", body: { decision, hash: card.hash, feedback } });
 const pullOf = async (branch) => (await gh("/_test/state")).pulls.find((p) => p.head === branch);
 
@@ -178,8 +185,8 @@ async function main() {
   check(fastConversation?.kind === "run" && fastConversation.agent === "architect" && fastConversation.focusedRunId === fastRun.id, "the run has its own conversation, the architect's");
   const fastAgents = (await pageOf(fastRun.id)).agents;
   check(
-    fastAgents.map((a) => `${a.agent}:${a.state}`).join() === "architect:not_available,assistant:elsewhere" && /fast track/.test(fastAgents[0].why) && fastAgents[0].conversationId === null,
-    "the agent panel of a fast-track run says that no agent talks with the requester, and that the assistant is in the chats",
+    fastAgents.map((a) => `${a.agent}:${a.state}`).join() === "architect:not_available" && /fast track/.test(fastAgents[0].why) && fastAgents[0].conversationId === null,
+    "the agent panel of a fast-track run says that no agent talks with the requester; the assistant is not listed (it is on the start page)",
   );
   check(await refused(say(fast.run.conversationId, "Can I talk to someone?")), "a message to a fast-track run's conversation is refused");
   const fastCards = await cardsOf(fast.run.conversationId);
@@ -266,8 +273,8 @@ async function main() {
   check(!cross.pending.some((p) => p.kind === "plan"), "a draft is not up for approval");
   const crossAgents = (await pageOf(crossRun.id)).agents;
   check(
-    crossAgents[0].agent === "architect" && crossAgents[0].state === "available" && crossAgents[0].conversationId === crossConversation && crossAgents[1].state === "elsewhere",
-    "the agent panel offers the architect, with its conversation, while the design session is open",
+    crossAgents[0].agent === "architect" && crossAgents[0].state === "available" && crossAgents[0].conversationId === crossConversation && crossAgents.length === 1,
+    "the agent panel offers the architect, with its conversation, while the design session is open, and no other agent",
   );
   const routed = await say(crossConversation, "Why two sub-tasks?");
   check(routed.to === "architect", "a message in the architect's conversation goes to the architect while the session is open");
@@ -406,7 +413,9 @@ async function main() {
 
   // The requester's check of the change: bound to the commit, with nothing pushed before it.
   const check1 = await pendingCheck(c1);
-  check(firstCheck.run.state === "awaiting_approval" && (await api("/api/pending")).some((p) => p.id === check1.approvalId && p.kind === "change"), "the change waits for the requester's check");
+  // The run's state follows the sub-task's a moment later; the card is written after both, so read the run again now.
+  const waitingRun = (await api(`/api/runs/${again.runId}`)).run;
+  check(waitingRun.state === "awaiting_approval" && (await api("/api/pending")).some((p) => p.id === check1.approvalId && p.kind === "change"), "the change waits for the requester's check");
   const c1Page = await subtaskPageOf(again.runId, "calc-negate");
   check(
     c1Page.needsYou.map((a) => a.id).join() === check1.approvalId && c1Page.cards.some((c) => c.card.type === "change" && c.card.approvalId === check1.approvalId) && c1Page.subtask.key === "calc-negate",
@@ -418,7 +427,7 @@ async function main() {
     "the run's page lists the check under Needs you as a link to the sub-task's page, without its card",
   );
   check((await api("/api/pending")).find((p) => p.id === check1.approvalId)?.subtaskKey === "calc-negate", "the pending badge knows on which page the decision is taken");
-  check(c1Page.agents.map((a) => `${a.agent}:${a.state}`).join() === "implementer:not_yet,assistant:elsewhere", "the sub-task's agent panel says the implementer joins later");
+  check(c1Page.agents.map((a) => `${a.agent}:${a.state}`).join() === "implementer:not_yet", "the sub-task's agent panel says the implementer joins later, and lists no other agent");
   check(await refused(say(c1.conversationId, "Hi")), "a message to a sub-task's conversation is refused: no agent talks there yet");
   const listed = (await api("/api/tickets")).find((t) => t.issueNumber === story.number).runs[0].subtasks;
   check(
@@ -476,7 +485,9 @@ async function main() {
       hub.comments[storyKey].some((c) => /Merge order/.test(c.body)),
     "a pull request merged before the one it depends on is flagged on the story and on the ticket",
   );
-  check(hub.issues.find((i) => i.k === children[1].k).state === "closed" && (await api(`/api/runs/${again.runId}`)).run.state !== "completed", "its sub-issue is closed; the story is not complete yet");
+  // The sub-issue is closed in the step after the sub-task is recorded as merged.
+  const shopIssueClosed = await waitFor("the shop sub-issue to close", async () => (await gh("/_test/state")).issues.find((i) => i.k === children[1].k && i.state === "closed"), 60_000).catch(() => null);
+  check(!!shopIssueClosed && (await api(`/api/runs/${again.runId}`)).run.state !== "completed", "its sub-issue is closed; the story is not complete yet");
   await gh(`/_test/pulls/${crossPr1.number}/merge`, { method: "POST" });
   const crossDone = await waitForState(again.runId, ["completed"], 180_000);
   hub = await gh("/_test/state");
@@ -606,8 +617,7 @@ async function main() {
     undecided.steps.map((s) => s.kind).join(",") === "analyse,implement,review,implement,review,implement,review",
     "two fix rounds were tried, each reviewed again",
   );
-  const findingsApproval = (await api("/api/pending")).find((p) => p.runId === stubbornRun.id && p.kind === "findings");
-  const findingsCard = (await cardsOf(undecided.run.conversationId)).find((c) => c.type === "findings");
+  const { approval: findingsApproval, card: findingsCard } = await decisionCard(stubbornRun.id, undecided.run.conversationId, "findings");
   check(!!findingsApproval && findingsCard?.status === "pending" && findingsCard.findings[0]?.severity === "blocking", "the open blocking finding is put to the requester");
   check((await gh("/_test/state")).pulls.every((p) => p.head !== undecided.run.branch), "nothing was pushed while the decision is open");
   const staleFindings = await api(`/api/approvals/${findingsApproval.id}/findings`, { method: "POST", body: { decision: "open", hash: "stale" } }).then(
@@ -627,8 +637,7 @@ async function main() {
   const big = await newIssue("Add a big thing", "Looks small. [big] [file:big.js]", ["ai-ready", "bug"]);
   const bigRun = await runFor(big.number);
   const tooBig = await waitForState(bigRun.id, ["awaiting_approval"]);
-  const limitsApproval = (await api("/api/pending")).find((p) => p.runId === bigRun.id && p.kind === "limits");
-  const limitsCard = (await cardsOf(tooBig.run.conversationId)).find((c) => c.type === "limits");
+  const { approval: limitsApproval, card: limitsCard } = await decisionCard(bigRun.id, tooBig.run.conversationId, "limits");
   check(!!limitsApproval && /7 files \(the fast-track limit is 5\)/.test(limitsCard?.reasons.join()), `the change is stopped: ${limitsCard?.reasons[0]}`);
   await api(`/api/approvals/${limitsApproval.id}/limits`, { method: "POST", body: { decision: "guided", hash: limitsCard.hash } });
   const redesign = await waitFor(

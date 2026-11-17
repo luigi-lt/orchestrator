@@ -199,13 +199,6 @@ async function main(): Promise<void> {
     if (!run.track) return { ...base, state: "not_yet", why: "The analysis decides the track first. On the guided track the architect opens a design session here.", conversationId: null };
     return { ...base, state: "not_yet", why: "The design session is starting.", conversationId: null };
   };
-  const ASSISTANT: AgentAvailabilityDto = {
-    agent: "assistant",
-    name: "Assistant",
-    state: "elsewhere",
-    why: "The assistant is in your chats, for all your runs: ask it there about this one.",
-    conversationId: null,
-  };
   const IMPLEMENTER: AgentAvailabilityDto = {
     agent: "implementer",
     name: "Implementer agent",
@@ -511,14 +504,14 @@ async function main(): Promise<void> {
       subtasks: ticketRun?.subtasks ?? [],
       track,
       design,
-      agents: [architect, ASSISTANT],
+      agents: [architect],
     };
   });
   app.get<{ Params: { id: string; key: string } }>("/api/runs/:id/subtasks/:key/page", async (req, reply): Promise<SubtaskPageDto | undefined> => {
     const [run, subtask] = await Promise.all([getRun(db, req.params.id), getSubtask(db, req.params.id, req.params.key)]);
     if (!run || !subtask) return notFound(reply, "Sub-task");
     const [cards, pending] = await Promise.all([listPageCards(db, run.id, subtask.key), listPendingApprovals(db, run.id)]);
-    return { run, subtask, cards, needsYou: pending.filter((p) => p.subtaskKey === subtask.key), agents: [IMPLEMENTER, ASSISTANT] };
+    return { run, subtask, cards, needsYou: pending.filter((p) => p.subtaskKey === subtask.key), agents: [IMPLEMENTER] };
   });
 
   // Every version of a run's plan, oldest first: earlier versions stay viewable (FR-P3).

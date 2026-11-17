@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { ConversationDto, TicketDto, TicketRunDto } from "@orch/contracts";
+import type { TicketDto, TicketRunDto } from "@orch/contracts";
 import { SUBTASK_STATE_LABEL } from "./Cards";
 
 const label = (state: string) => state.replace(/_/g, " ");
@@ -12,18 +12,16 @@ export const subtaskPath = (runId: string, key: string) => `/runs/${runId}/subta
 
 /**
  * The side panel of the user view: tickets, each with its runs newest first and, under a guided run, its
- * sub-tasks; every entry opens a page (AD-43, AD-44). The chats with the assistant are listed below. A ticket
+ * sub-tasks; every entry opens a page (AD-43, AD-44). The chats with the assistant are on the start page. A ticket
  * opens by itself while it is active, waits for a decision or holds the open page; the caret overrides that.
  */
 export function TicketTree({
   tickets,
-  chats,
   currentPath,
   replied = new Set(),
   onOpen,
 }: {
   tickets: TicketDto[];
-  chats: ConversationDto[];
   currentPath: string;
   /** Runs whose architect wrote while their page was not open. */
   replied?: Set<string>;
@@ -114,13 +112,6 @@ export function TicketTree({
       })}
       {tickets.length === 0 && <p className="muted small pad">No tickets yet.</p>}
 
-      <div className="tree-section">Chats</div>
-      {chats.map((c) => (
-        <button key={c.id} className={`conversation-item ${currentPath === `/chat/${c.id}` ? "active" : ""}`} onClick={() => onOpen(`/chat/${c.id}`)}>
-          <span className="title">{c.title}</span>
-        </button>
-      ))}
-      {chats.length === 0 && <p className="muted small pad">No chats yet.</p>}
     </nav>
   );
 }

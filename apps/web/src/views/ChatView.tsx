@@ -1,69 +1,43 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Navigate, useLocation, useParams } from "react-router-dom";
 import type { ConversationDto, DesignStateDto, MessageDto, RunDto } from "@orch/contracts";
-import { api, post, put, subscribe } from "../api";
+import { api, post, subscribe } from "../api";
 import { useApp } from "../App";
 import { MessageView } from "../components/MessageView";
 import { runPath, subtaskPath } from "../components/TicketTree";
 import { useUserNav } from "./UserLayout";
 
-/** Where a conversation lives now: a run's and a sub-task's are shown beside their pages (AD-44). */
-const pageOf = (c: ConversationDto): string | null =>
-  c.focusedRunId && c.kind === "run" ? runPath(c.focusedRunId) : c.focusedRunId && c.kind === "subtask" && c.subtaskKey ? subtaskPath(c.focusedRunId, c.subtaskKey) : null;
+/** Where a conversation lives now: a run's and a sub-task's beside their pages, a chat on the start page (AD-44). */
+export const homeOf = (c: ConversationDto): string =>
+  c.focusedRunId && c.kind === "run"
+    ? runPath(c.focusedRunId)
+    : c.focusedRunId && c.kind === "subtask" && c.subtaskKey
+      ? subtaskPath(c.focusedRunId, c.subtaskKey)
+      : `/start?chat=${encodeURIComponent(c.id)}`;
 
-/** A chat with the assistant, outside any run. */
-export function ChatView() {
+/** Old links to /chat, /chat/new and /chat/<id> open where the conversation lives now. */
+export function LegacyChat() {
   const { conversationId } = useParams();
-  const navigate = useNavigate();
-  const { me, setToggleTarget } = useApp();
+  const { search } = useLocation();
   const { conversations, loaded } = useUserNav();
-  const current = conversations.find((c) => c.id === conversationId);
-
-  // Without an id, open the last conversation (its page, for a run's) or the newest chat.
-  useEffect(() => {
-    if (conversationId || !me || !loaded) return;
-    const last = me.lastConversationId ? conversations.find((c) => c.id === me.lastConversationId) : undefined;
-    const target = last ?? conversations.find((c) => c.kind === "general");
-    if (target) navigate(pageOf(target) ?? `/chat/${target.id}`, { replace: true });
-  }, [conversationId, me, loaded, conversations, navigate]);
-
-  // An old link to a run's or sub-task's conversation opens its page.
-  useEffect(() => {
-    const page = current ? pageOf(current) : null;
-    if (page) navigate(page, { replace: true });
-  }, [current, navigate]);
-
-  useEffect(() => {
-    if (conversationId && current?.kind === "general") void put("/api/preferences", { lastConversationId: conversationId });
-  }, [conversationId, current?.kind]);
-
-  useEffect(() => {
-    setToggleTarget("/ops/runs");
-    return () => setToggleTarget(null);
-  }, [setToggleTarget]);
-
-  // Until the list is there it is not known whether the address names a chat or a run's conversation.
-  if (!loaded || (current && pageOf(current))) return null;
-  return conversationId ? <Conversation key={conversationId} id={conversationId} kind="general" /> : <EmptyState onStart={() => navigate("/chat/new")} />;
+  if (!conversationId || conversationId === "new") {
+    const about = new URLSearchParams(search).get("about");
+    return <Navigate to={about ? `/start?about=${encodeURIComponent(about)}` : "/start"} replace />;
+  }
+  if (!loaded) return null;
+  const c = conversations.find((x) => x.id === conversationId);
+  return <Navigate to={c ? homeOf(c) : `/start?chat=${encodeURIComponent(conversationId)}`} replace />;
 }
 
 /**
- * A new chat with the assistant. It is created with its first message, so no empty chats are left behind. From
- * a run's page the composer starts with the run named.
+ * A new chat with the assistant, in the agent panel of the start page. It is created with its first message, so
+ * no empty chats are left behind. From a run's page the composer starts with the run named.
  */
-export function NewChat() {
-  const [params] = useSearchParams();
-  const about = params.get("about");
-  const navigate = useNavigate();
-  const { me, setToggleTarget } = useApp();
+export function NewChat({ about, onCreated, children }: { about: string | null; onCreated: (id: string) => void; children?: React.ReactNode }) {
+  const { me } = useApp();
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setToggleTarget("/ops/runs");
-    return () => setToggleTarget(null);
-  }, [setToggleTarget]);
 
   useEffect(() => {
     if (!about) return;
@@ -81,7 +55,7 @@ export function NewChat() {
     try {
       const c = await post<ConversationDto>("/api/conversations", {});
       await post(`/api/conversations/${c.id}/messages`, { text });
-      navigate(`/chat/${c.id}`, { replace: true });
+      onCreated(c.id);
     } catch (e) {
       setError((e as Error).message);
       setBusy(false);
@@ -91,13 +65,13 @@ export function NewChat() {
   return (
     <section className="conversation">
       <div className="timeline">
-        <div className="empty-state">
-          <h2>New chat with the assistant</h2>
-          <p className="muted">
-            Ask about any of your runs, or start work on an issue (for example <em>"work on {me?.repos[0] ?? "owner/repo"}#12"</em>). Decisions are taken on the
-            run's page, never in a chat.
+        <div className="assistant-intro">
+          <p>
+            Ask about any of your runs, or start work on an issue (for example <em>"work on {me?.repos[0] ?? "owner/repo"}#12"</em>). Decisions are taken on the run's
+            page, never in a chat.
           </p>
         </div>
+        {children}
       </div>
       {error && <div className="error-banner">{error}</div>}
       <form
@@ -109,7 +83,7 @@ export function NewChat() {
       >
         <textarea
           value={draft}
-          autoFocus
+          autoFocus={!!about}
           placeholder="Ask about runs, or start work on an issue…"
           onChange={(e) => setDraft(e.target.value)}
           onKeyDown={(e) => {
@@ -120,28 +94,12 @@ export function NewChat() {
           }}
           rows={2}
           disabled={busy}
-          aria-label="Message"
+          aria-label="Message to the assistant"
         />
         <button className="primary" type="submit" disabled={busy || !draft.trim()}>
           Send
         </button>
       </form>
-    </section>
-  );
-}
-
-function EmptyState({ onStart }: { onStart: () => void }) {
-  const { me } = useApp();
-  return (
-    <section className="empty-state">
-      <h2>Start a chat</h2>
-      <p className="muted">
-        Ask the assistant to work on an issue (for example <em>"work on {me?.repos[0] ?? "owner/repo"}#12"</em>), or label an issue{" "}
-        <code>{me?.triggerLabel ?? "ai-ready"}</code> on GitHub and it will appear under Tickets automatically.
-      </p>
-      <button className="primary" onClick={onStart}>
-        New chat
-      </button>
     </section>
   );
 }

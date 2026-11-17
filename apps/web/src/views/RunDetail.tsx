@@ -51,7 +51,7 @@ export function RunDetail() {
   }, [load, runId]);
 
   useEffect(() => {
-    setToggleTarget(data?.run.id ? `/runs/${data.run.id}` : "/chat");
+    setToggleTarget(data?.run.id ? `/runs/${data.run.id}` : "/start");
     return () => setToggleTarget(null);
   }, [data?.run.id, setToggleTarget]);
 

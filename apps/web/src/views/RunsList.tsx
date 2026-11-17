@@ -26,9 +26,9 @@ export function RunsList() {
   }, [load]);
 
   useEffect(() => {
-    setToggleTarget(me?.lastConversationId ? `/chat/${me.lastConversationId}` : "/chat");
+    setToggleTarget("/start");
     return () => setToggleTarget(null);
-  }, [me?.lastConversationId, setToggleTarget]);
+  }, [setToggleTarget]);
 
   useEffect(() => {
     if (!repo && me?.repos[0]) setRepo(me.repos[0]);

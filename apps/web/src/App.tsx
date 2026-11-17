@@ -3,11 +3,12 @@ import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-
 import type { ApprovalDto, RunDto } from "@orch/contracts";
 import { api, put, subscribe } from "./api";
 import { runPath, subtaskPath } from "./components/TicketTree";
-import { ChatView, NewChat } from "./views/ChatView";
+import { LegacyChat } from "./views/ChatView";
 import { RunDetail } from "./views/RunDetail";
 import { RunPage } from "./views/RunPage";
 import { Products } from "./views/Products";
 import { RunsList } from "./views/RunsList";
+import { StartPage } from "./views/StartPage";
 import { SubtaskPage } from "./views/SubtaskPage";
 import { UserLayout } from "./views/UserLayout";
 
@@ -95,7 +96,7 @@ export function App() {
   const switchView = () => {
     const next = isOps ? "user" : "operator";
     void put("/api/preferences", { landingView: next });
-    navigate(toggleTarget ?? (isOps ? "/chat" : "/ops/runs"));
+    navigate(toggleTarget ?? (isOps ? "/start" : "/ops/runs"));
   };
 
   const firstPending = pending[0];
@@ -134,11 +135,11 @@ export function App() {
         {me?.catalogError && <div className="error-banner">Product catalog problem: {me.catalogError}</div>}
         <main className="content">
           <Routes>
-            <Route path="/" element={me ? <Navigate to={me.landingView === "operator" ? "/ops/runs" : "/chat"} replace /> : null} />
+            <Route path="/" element={me ? <Navigate to={me.landingView === "operator" ? "/ops/runs" : "/start"} replace /> : null} />
             <Route element={<UserLayout />}>
-              <Route path="/chat" element={<ChatView />} />
-              <Route path="/chat/new" element={<NewChat />} />
-              <Route path="/chat/:conversationId" element={<ChatView />} />
+              <Route path="/start" element={<StartPage />} />
+              <Route path="/chat" element={<LegacyChat />} />
+              <Route path="/chat/:conversationId" element={<LegacyChat />} />
               <Route path="/runs/:runId" element={<RunPage />} />
               <Route path="/runs/:runId/subtasks/:key" element={<SubtaskPage />} />
             </Route>

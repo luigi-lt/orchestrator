@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import type { RunPageDto } from "@orch/contracts";
-import { api, put, subscribe } from "../api";
+import { api, subscribe } from "../api";
 import { useApp } from "../App";
 import { Activity, AgentPanel, NeedsYou, RUN_SECTIONS, Sections, splitCards, useScrollToHash } from "../components/Page";
 import { TrackSwitch } from "../components/TrackSwitch";
@@ -58,11 +58,6 @@ export function RunPage() {
     return () => setToggleTarget(null);
   }, [runId, setToggleTarget]);
 
-  // Opening the user view again comes back here.
-  const conversationId = page?.run.conversationId ?? null;
-  useEffect(() => {
-    if (conversationId) void put("/api/preferences", { lastConversationId: conversationId });
-  }, [conversationId]);
 
   if (error && !page) return <section className="page empty-state">{error}</section>;
   if (!page) return <section className="page muted pad">Loading…</section>;

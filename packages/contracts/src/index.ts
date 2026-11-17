@@ -1202,15 +1202,18 @@ export interface DesignStateDto {
   hasPlan: boolean;
 }
 
-/** Whether the requester can talk with an agent from a page, and why not (FR-C4). Decided by the orchestrator, never by a model. */
+/**
+ * Whether the requester can talk with an agent of a page, and why not (FR-C4). Decided by the orchestrator, never
+ * by a model. The assistant is not an agent of a run's or sub-task's page: it is on the start page (FR-C5).
+ */
 export interface AgentAvailabilityDto {
-  agent: "architect" | "assistant" | "implementer";
+  agent: "architect" | "implementer";
   name: string;
   /**
-   * available: its conversation takes messages now; read_only: it can be read but takes no messages; elsewhere: it
-   * is on another page; not_yet: it may join this page later; not_available: it does not take part here.
+   * available: its conversation takes messages now; read_only: it can be read but takes no messages; not_yet: it
+   * may join this page later; not_available: it does not take part here.
    */
-  state: "available" | "read_only" | "elsewhere" | "not_yet" | "not_available";
+  state: "available" | "read_only" | "not_yet" | "not_available";
   why: string | null;
   /** The conversation with it, when there is one to show. */
   conversationId: string | null;

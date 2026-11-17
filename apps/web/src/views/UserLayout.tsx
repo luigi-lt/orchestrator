@@ -14,8 +14,8 @@ export interface UserNav {
 export const useUserNav = () => useOutletContext<UserNav>();
 
 /**
- * The user view (AD-25, AD-44): the side panel with tickets → runs → sub-tasks, each opening a page, and the chats
- * with the assistant below; the page or chat that is open fills the rest.
+ * The user view (AD-25, AD-44): the side panel with the start page and the work (tickets → runs → sub-tasks), each
+ * opening a page; the page that is open fills the rest. The chats with the assistant are on the start page.
  */
 export function UserLayout() {
   const location = useLocation();
@@ -66,12 +66,16 @@ export function UserLayout() {
   return (
     <div className="chat-layout">
       <aside className="sidebar">
-        <button className="primary block" onClick={() => navigate("/chat/new")}>
-          + New chat
+        <button
+          className={`start-entry ${location.pathname === "/start" ? "active" : ""}`}
+          aria-current={location.pathname === "/start" ? "page" : undefined}
+          onClick={() => navigate("/start")}
+        >
+          <span className="title">Start</span>
+          <span className="muted small">your work and the assistant</span>
         </button>
         <TicketTree
           tickets={tickets}
-          chats={conversations.filter((c) => c.kind === "general")}
           currentPath={location.pathname}
           replied={replied}
           onOpen={(path) => navigate(path)}
