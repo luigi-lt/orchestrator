@@ -1,0 +1,43 @@
+# Product catalog: what each product owns, where its code lives and how agents may work on it.
+# ./bin/orchestrator init copies this file to products.yaml (git-ignored). Edit that copy.
+#
+# The catalog is trusted configuration. Nothing an agent can read (a ticket, a repository) can change it:
+# sandbox image, commands, registries and high-risk paths come from here, never from a repository.
+# A run keeps the catalog version it started with; changes apply to new runs.
+
+products:
+  - id: payments-api # lowercase letters, digits and dashes
+    name: Payments API
+    # Say what the product owns AND what it does not own. The analyst agent uses this text
+    # to decide which products a work item touches, so keep it accurate.
+    description: >
+      Owns payment authorization and capture, and the public REST API for them.
+      Does not own the checkout pages (web shop) or the accounting ledger.
+    owners: [your-github-login] # people responsible for the product; they review its pull requests
+    # Settings for every repository of the product; a repository can override each of them.
+    defaults:
+      commands: # how agents build and test (used from the next increment on)
+        build: "npm run build"
+        test: "npm test"
+      highRiskPaths: ["deploy/**"] # added to the built-in list: CI/CD, infrastructure, dependencies, CODEOWNERS, agent guidance
+    repositories:
+      - id: your-account/payments-api # owner/name on GitHub; a repository belongs to exactly one product
+        role: service
+        # Where the product's interfaces live. Work expected to touch them never takes the fast track.
+        contractPaths: ["api/openapi.yaml", "src/events/**"]
+      - id: your-account/payments-client
+        role: library
+
+  - id: web-shop
+    name: Web shop
+    description: >
+      Owns the shop's pages, including checkout, and calls the Payments API.
+      Does not own payment processing itself.
+    owners: [your-github-login]
+    repositories:
+      - id: your-account/web-shop
+        role: web client
+
+# Product teams keep their guidance for agents in their own repository, in AGENTS.md or
+# .github/copilot-instructions.md: conventions, architecture notes, areas not to touch, how to test.
+# Agents read it as information; it cannot change their tools, the commands above or any approval.

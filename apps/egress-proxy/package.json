@@ -1,0 +1,14 @@
+{
+  "name": "@orch/egress-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "start": "node dist/main.js"
+  },
+  "dependencies": {
+    "undici": "^7.10.0",
+    "@orch/common": "*"
+  }
+}
