@@ -382,9 +382,20 @@ function decide(body) {
   if (names.includes("submit_work_item")) {
     if (lastIsToolResult(messages)) {
       const lastTool = used[used.length - 1]?.name;
+      if (lastTool === "get_run_status") {
+        // Answers from what the tool returned, as the real assistant would.
+        const result = messages[messages.length - 1].content.find((b) => b.type === "tool_result");
+        const raw = typeof result?.content === "string" ? result.content : (result?.content ?? []).map((c) => c.text ?? "").join("");
+        const state = /"state"\s*:\s*"([a-z_]+)"/.exec(raw)?.[1];
+        return [{ type: "text", text: state ? `That run is ${state.replace(/_/g, " ")}. Its page has the details.` : "I could not read that run." }];
+      }
       const said = { render: "Here is the table you asked for.", show_card: "It is on the run's page: follow the link." }[lastTool];
       return [{ type: "text", text: said ?? "Done — the orchestrator is on it." }];
     }
+    // A chat started from a run's page names the run: the assistant looks it up.
+    // The runtime may put context before the person's words, so the pattern is not anchored.
+    const named = /About \S+ \(run (run_[a-z0-9]+)\)/i.exec(prompt);
+    if (named) return [{ type: "tool_use", id: id("toolu"), name: "get_run_status", input: { runId: named[1] } }];
     const showing = /show (?:me )?the (analysis|plan|progress) of (\S+)/i.exec(prompt);
     if (showing) return [{ type: "tool_use", id: id("toolu"), name: "show_card", input: { runId: showing[2], card: showing[1].toLowerCase() } }];
     const issue = /(?:issue\s*#?|#)(\d+)/i.exec(prompt);

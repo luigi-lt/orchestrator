@@ -339,8 +339,22 @@ export async function recordDesignTurn(input: {
     await setPlanVersionStatus(db, runId, latest.version, "proposed");
     latest = { ...latest, status: "proposed" };
   }
-  if (created || proposedApprovalId) await showPlan(db, runId, conversationId, latest, proposedApprovalId);
+  if (created || proposedApprovalId) {
+    await showPlan(db, runId, conversationId, latest, proposedApprovalId);
+    // The plan is on the run's page; the conversation gets a one-line marker where the requester is reading (AD-44).
+    const changed = latest.changes.length;
+    await markPage(db, runId, conversationId, `turn:${input.turn.turnId}`, proposedApprovalId ? "needs-you" : "plan",
+      proposedApprovalId
+        ? `Plan version ${latest.version} is up for your approval: approve it on the run's page.`
+        : `Plan version ${latest.version} is on the run's page${latest.version > 1 && changed ? `: ${changed} change${changed === 1 ? "" : "s"}` : ""}.`,
+    );
+  }
   return { version: latest.version, created, changes: latest.changes.length, voidedApproval, proposedApprovalId };
+}
+
+/** A one-line marker in the architect's conversation that points to a section of the run's page; written once per key. */
+async function markPage(db: Db, runId: string, conversationId: string, markerKey: string, section: string, text: string): Promise<void> {
+  await insertMessage(db, { conversationId, role: "orchestrator", components: [{ type: "page_marker", runId, section, text }], key: key(runId, "marker", markerKey) });
 }
 
 /**
@@ -359,6 +373,7 @@ export async function finalizePlan(input: {
   if (!order) throw ApplicationFailure.nonRetryable("The approved plan has a dependency cycle");
   await setPlanVersionStatus(db, input.runId, latest.version, "approved");
   await showPlan(db, input.runId, input.conversationId, { ...latest, status: "approved" }, null);
+  await markPage(db, input.runId, input.conversationId, "approved", "plan", `You approved plan version ${latest.version}. The design session is closed; this conversation stays readable.`);
   // The products of the run are those of the approved plan: the architect may have added or removed one (FR-M2).
   const products = [...new Set(order.map((st) => st.product))];
   const before = (await getRun(db, input.runId))?.products ?? [];

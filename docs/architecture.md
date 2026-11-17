@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed (v2.7) — for review |
+| **Status** | Proposed (v2.8) — for review |
 | **Date** | 2026-11-15 |
 | **Phase** | Reference architecture — follows the [capability map](capabilities.md), the [non-functional requirements](non-functional-requirements.md) and the [functional requirements](functional-requirements.md) of iteration 2 |
 
@@ -1266,7 +1266,7 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 
 ## 25. Next: the user view as pages with an agent panel
 
-Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, AD-38, AD-43 revised, AD-44 new). **U1 is built**; U2 and U3 are not.
+Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, AD-38, AD-43 revised, AD-44 new). **U1 and U2 are built**; U3 is not.
 
 **Why.** Through v2.4 a run's conversation held the orchestrator's cards, the architect's design session and the assistant's answers in one stream, and the composer's addressee followed the run's state. People could not always tell which agent they were addressing, decisions scrolled away in long runs, and trusted records sat between untrusted agent text. Five layouts were compared: one thread per agent in the side panel, a workspace with tabs, pages with an agent panel (chosen), threads attached to records, and conversations side by side (kept as a later add-on).
 
@@ -1314,7 +1314,16 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 - *Where a decision is taken* is where its card is: `GET /api/pending` and the pages give each waiting decision its sub-task (or none), found from the card that carries its approval.
 - *Pages.* `GET /api/runs/:id/page` returns the run, its number among the runs of its ticket, its cards, what waits for the requester in the run and its sub-tasks, its sub-tasks, the track switch and the design session's state. `GET /api/runs/:id/subtasks/:key/page` returns the sub-task, its cards and what waits on it. The web app splits the cards into Needs you (a card whose approval is waiting), the sections of the page and the activity (notices, folded). The work item and sub-task cards become the page's header.
 - *Navigation.* The side panel lists every sub-task of an approved plan, also before it starts; each entry opens its page. The pending badge and browser notifications open the page of the decision; the toggle maps a page to the operator's run detail and back. Old links to a run's or sub-task's conversation open its page. The assistant's `show_card` posts a link to a section of the page instead of a copy.
-- *Meanwhile.* The run's conversation is shown beside the run's page, routed as before (the architect while the design session is open, the assistant otherwise); a sub-task's conversation beside its page. The plan no longer moves next to the architect's reply: it is on the page, under Needs you while proposed.
+- *Meanwhile.* The run's conversation is shown beside the run's page, routed as before (the architect while the design session is open, the assistant otherwise); a sub-task's conversation beside its page. The plan no longer moves next to the architect's reply: it is on the page, under Needs you while proposed. (Replaced by the agent panel in U2.)
+
+**U2 as built.**
+
+- *Conversations get an agent.* Migration 8 adds `agent` to conversations: a run's conversation is the architect's, a chat is the assistant's, a sub-task's has none until its implementer joins (FR-N2). What the assistant said in a run's or sub-task's conversation, and the requester's messages it answered (a requester's message belongs to whoever answered it next; one not answered yet to the architect while the design session is open), moves to a chat of its own, "About …". The architect's turns stay where they are.
+- *Routing by conversation (AD-38).* A message goes to the agent of its conversation: the architect while the run's design session is open, the assistant in a chat. Anything else is refused before it is recorded, with the reason (the plan is approved, the run has ended, the fast track, no agent on a sub-task yet). The conversation query returns whether it takes messages and why not.
+- *Availability.* The page queries list the agents of the page with a state (available, read-only, elsewhere, not yet, not on this run), the reason and the conversation to show. On a run's page: the architect, then the assistant (elsewhere: in the chats). On a sub-task's page: the implementer (not yet), then the assistant.
+- *Markers.* The plan stays on the page; the architect's conversation gets a one-line `page_marker` for a new plan version, a plan put up for approval and the approval, each linking to its section of the page.
+- *Web.* The agent panel with the agent switch; a read-only conversation shows why instead of a composer; a reply in a conversation not shown marks its agent in the switch, and a reply from the architect while its run's page is not open marks the run in the side panel (in the browser, until the page is opened). A new chat is created with its first message; from a run's page it starts with the run named.
+- *Not done as planned.* Activities still name the conversation of a run or sub-task as the handle of its page instead of the page itself: the run's conversation is the architect's, so cards and the architect's turns share one handle. It changes nothing for the requester. The assistant's instructions are rewritten with its new tools in U3.
 
 ## Change history
 
@@ -1331,3 +1340,4 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 | 2.5 | User view as pages with an agent panel (layout C): AD-25, AD-38 and AD-43 revised, AD-44 new; §7.5 user view rewritten; flows, data model and traceability updated; build order in §25 |
 | 2.6 | The roles of the orchestrator and of the assistant: the assistant keeps its name and lives on the start page only (AD-38, §7.5); it reads other agents' conversations and prepares actions the requester confirms (AD-45, §8.6, threat model); §25 updated |
 | 2.7 | U1 built (§25): the card table and its migration, page queries, run and sub-task pages with Needs you, navigation to pages; data model of `card` |
+| 2.8 | U2 built (§25): conversations with an agent and the split of run conversations, routing by conversation, agent availability on pages, markers in the architect's conversation, the agent panel |

@@ -348,7 +348,6 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); cur
   display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 8px 12px;
   border-bottom: 1px solid var(--border); background: var(--surface);
 }
-.agent-chip { font-size: 12px; color: var(--orch); font-weight: 600; margin-left: 4px; }
 .agent-panel .conversation { flex: 1; min-height: 0; height: auto; }
 .agent-panel .timeline { padding: 12px; }
 .agent-panel .composer { padding: 10px 12px; }
@@ -358,4 +357,28 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); cur
   .page-layout { grid-template-columns: minmax(0, 1fr); }
   .agent-panel { position: fixed; inset: 0; z-index: 30; border-left: 0; }
   .panel-reopen { position: fixed; top: auto; bottom: 16px; right: 16px; }
+}
+
+/* Agent panel: one conversation per agent, chosen by the requester (AD-38, U2) */
+.agent-switch { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.agent-tab { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; font-size: 13px; border-radius: 999px; background: transparent; }
+.agent-tab.selected { background: var(--accent-soft); border-color: var(--accent); font-weight: 600; }
+.agent-tab.not_yet, .agent-tab.not_available, .agent-tab.elsewhere { color: var(--muted); }
+.agent-state { width: 8px; height: 8px; border-radius: 50%; flex: none; border: 1.5px solid var(--muted); }
+.agent-state.available { background: var(--success); border-color: var(--success); }
+.agent-state.read_only { background: var(--muted); }
+.agent-state.elsewhere { border-style: dashed; }
+.reply-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; display: inline-block; margin-right: 8px; }
+.agent-tab .reply-dot, .panel-reopen .reply-dot { margin: 0 0 0 4px; }
+.agent-empty { padding: 16px; display: flex; flex-direction: column; gap: 4px; }
+.agent-empty p { margin: 0 0 6px; }
+.primary-link {
+  align-self: flex-start; padding: 6px 12px; border-radius: 8px; background: var(--accent); color: var(--accent-text);
+}
+.primary-link:hover { text-decoration: none; filter: brightness(1.05); }
+.composer-closed { margin: 0; padding: 12px 16px; border-top: 1px solid var(--border); background: var(--surface-2); color: var(--muted); }
+.message.marker { align-items: center; }
+.page-marker {
+  display: inline-block; max-width: 100%; padding: 4px 12px; border-radius: 999px; font-size: 12.5px;
+  background: color-mix(in srgb, var(--orch) 9%, var(--surface)); color: var(--orch); border: 1px solid color-mix(in srgb, var(--orch) 25%, var(--border));
 }

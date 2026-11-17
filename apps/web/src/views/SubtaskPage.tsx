@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import type { SubtaskPageDto } from "@orch/contracts";
 import { useApp } from "../App";
 import { SUBTASK_STATE_LABEL } from "../components/Cards";
-import { Activity, ConversationPanel, NeedsYou, Sections, SUBTASK_SECTIONS, splitCards, useScrollToHash } from "../components/Page";
+import { Activity, AgentPanel, NeedsYou, Sections, SUBTASK_SECTIONS, splitCards, useScrollToHash } from "../components/Page";
 import { runPath } from "../components/TicketTree";
 import { usePage } from "./RunPage";
 
@@ -84,7 +84,7 @@ export function SubtaskPage() {
         {rest.length === 0 && notices.length === 0 && pending.length === 0 && <p className="muted small">Nothing has happened on this sub-task yet: it starts in build order.</p>}
         <Activity notices={notices} />
       </section>
-      {st.conversationId && <ConversationPanel conversationId={st.conversationId} kind="subtask" who="Assistant" />}
+      <AgentPanel key={`${run.id}:${st.key}`} agents={page.agents} runId={run.id} />
     </div>
   );
 }

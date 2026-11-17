@@ -960,6 +960,15 @@ export async function voidApprovals(db: Queryable, runId: string, kind: Approval
   return rows.map((r) => r.id);
 }
 
+/** Whether the requester approved a decision of this kind in the run (e.g. a plan), even before the workflow acted on it. */
+export async function wasApproved(db: Queryable, runId: string, kind: ApprovalKind): Promise<boolean> {
+  const { rows } = await db.query(
+    "select 1 from approvals where run_id = $1 and kind = $2 and state = 'resolved' and decision->>'decision' = 'approve' limit 1",
+    [runId, kind],
+  );
+  return rows.length > 0;
+}
+
 /** Expires the pending decisions of a run, or only those of one of its sub-tasks. */
 export async function expireApprovalsForRun(db: Queryable, runId: string, subtaskKey?: string): Promise<void> {
   const res = await db.query(
@@ -1022,12 +1031,16 @@ export async function listPendingApprovals(db: Queryable, runId?: string): Promi
  */
 export async function createConversation(db: Queryable, title: string, runId: string | null = null, subtaskKey: string | null = null): Promise<string> {
   const id = newId("conv");
-  await db.query("insert into conversations (id, title, focused_run_id, kind, subtask_key) values ($1,$2,$3,$4,$5)", [
+  const kind = !runId ? "general" : subtaskKey ? "subtask" : "run";
+  // A run's conversation is the architect's; a chat is the assistant's; a sub-task's waits for its implementer (AD-38).
+  const agent = kind === "general" ? "assistant" : kind === "run" ? "architect" : null;
+  await db.query("insert into conversations (id, title, focused_run_id, kind, subtask_key, agent) values ($1,$2,$3,$4,$5,$6)", [
     id,
     title,
     runId,
-    !runId ? "general" : subtaskKey ? "subtask" : "run",
+    kind,
     subtaskKey,
+    agent,
   ]);
   return id;
 }
@@ -1042,12 +1055,13 @@ export async function listConversations(db: Queryable, onlyId?: string): Promise
     id: string;
     title: string;
     kind: ConversationDto["kind"];
+    agent: ConversationDto["agent"];
     focused_run_id: string | null;
     subtask_key: string | null;
     updated_at: Date;
     pending: string;
   }>(
-    `select c.id, c.title, c.kind, c.focused_run_id, c.subtask_key, c.updated_at,
+    `select c.id, c.title, c.kind, c.agent, c.focused_run_id, c.subtask_key, c.updated_at,
        (select count(*) from approvals a join runs r on r.id = a.run_id
          where coalesce(a.conversation_id, r.conversation_id) = c.id and a.state = 'pending') as pending
      from conversations c ${onlyId ? "where c.id = $1" : ""} order by c.updated_at desc limit 200`,
@@ -1057,6 +1071,7 @@ export async function listConversations(db: Queryable, onlyId?: string): Promise
     id: r.id,
     title: r.title,
     kind: r.kind,
+    agent: r.agent,
     focusedRunId: r.focused_run_id,
     subtaskKey: r.subtask_key,
     updatedAt: iso(r.updated_at)!,
@@ -1147,11 +1162,12 @@ export async function putCard(db: Queryable, page: { runId: string; subtaskKey?:
 
 /**
  * Posts an orchestrator card from an activity that knows the conversation of a run or a sub-task: the card goes
- * on the page of that run or sub-task. A link to a run is the one card posted in a conversation (the chat that
- * started the run, or where the assistant pointed to it).
+ * on the page of that run or sub-task. Links are the only cards posted in a conversation: to a run (in the chat
+ * that started it, or where the assistant pointed to it) and to a section of its page (a marker in the
+ * architect's conversation).
  */
 export async function upsertCard(db: Queryable, conversationId: string, cardKey: string, card: OrchestratorCard): Promise<void> {
-  if (card.type !== "run_link") {
+  if (card.type !== "run_link" && card.type !== "page_marker") {
     const { rows } = await db.query<{ focused_run_id: string; subtask_key: string | null }>(
       "select focused_run_id, subtask_key from conversations where id = $1 and kind in ('run', 'subtask') and focused_run_id is not null",
       [conversationId],
@@ -1207,6 +1223,11 @@ export async function listPageCards(db: Queryable, runId: string, subtaskKey: st
 export async function listRunCards(db: Queryable, runId: string): Promise<PageCardDto[]> {
   const { rows } = await db.query<CardRow>("select * from cards where run_id = $1 order by created_at, version", [runId]);
   return rows.map(toPageCard);
+}
+
+export async function hasMessages(db: Queryable, conversationId: string): Promise<boolean> {
+  const { rows } = await db.query("select 1 from messages where conversation_id = $1 limit 1", [conversationId]);
+  return rows.length > 0;
 }
 
 export async function listMessages(db: Queryable, conversationId: string, afterVersion = 0): Promise<MessageDto[]> {

@@ -29,6 +29,9 @@ import {
   type DesignStateDto,
   type RunPageDto,
   type SubtaskPageDto,
+  type AgentAvailabilityDto,
+  type ConversationDto,
+  type RunDto,
 } from "@orch/contracts";
 import { GitHubClient } from "@orch/github";
 import {
@@ -60,6 +63,8 @@ import {
   listPageCards,
   patchCard,
   getSubtask,
+  hasMessages,
+  wasApproved,
 } from "@orch/store";
 import { FrontDoor, newConversationTitle } from "./frontdoor.js";
 import { StreamHub } from "./hub.js";
@@ -169,15 +174,71 @@ async function main(): Promise<void> {
     return getConversation(db, id);
   });
   /**
-   * Who answers in a conversation (AD-38): decided here from the run's state, never by a model. In a run's
-   * conversation the requester talks to the architect agent while the design session is open, and to the
-   * front-door agent otherwise.
+   * Whether the requester can talk with the architect of a run, and why not (FR-C4): its conversation takes
+   * messages while the design session is open, and stays readable after it.
    */
-  const openDesignSession = async (conversationId: string) => {
-    const conversation = await getConversation(db, conversationId);
-    if (!conversation || conversation.kind !== "run" || !conversation.focusedRunId) return null;
-    const session = await getDesignSession(db, conversation.focusedRunId);
-    return session && session.state !== "closed" ? session : null;
+  const architectOf = async (run: RunDto): Promise<AgentAvailabilityDto> => {
+    const base = { agent: "architect" as const, name: "Architect agent" };
+    const session = await getDesignSession(db, run.id);
+    if (session && session.state !== "closed") return { ...base, state: "available", why: null, conversationId: run.conversationId };
+    const spoke = !!run.conversationId && (await hasMessages(db, run.conversationId));
+    if (spoke) {
+      // The requester's approval counts at once: the session closes a moment before the version is marked approved.
+      const approved = (await wasApproved(db, run.id, "plan")) || (await listPlanVersions(db, run.id)).some((v) => v.status === "approved");
+      const why = approved
+        ? "The plan is approved: this conversation is kept for reference and takes no new messages."
+        : FINAL_RUN_STATES.includes(run.state)
+          ? "The run has ended: this conversation is kept for reference."
+          : run.track === "fast"
+            ? "The run moved to the fast track: the design session ended."
+            : "The design session is closed.";
+      return { ...base, state: "read_only", why, conversationId: run.conversationId };
+    }
+    if (run.track === "fast") return { ...base, state: "not_available", why: "On the fast track no agent talks with you: the change is built and reviewed by agents.", conversationId: null };
+    if (FINAL_RUN_STATES.includes(run.state)) return { ...base, state: "not_available", why: "The run ended before a design session.", conversationId: null };
+    if (!run.track) return { ...base, state: "not_yet", why: "The analysis decides the track first. On the guided track the architect opens a design session here.", conversationId: null };
+    return { ...base, state: "not_yet", why: "The design session is starting.", conversationId: null };
+  };
+  const ASSISTANT: AgentAvailabilityDto = {
+    agent: "assistant",
+    name: "Assistant",
+    state: "elsewhere",
+    why: "The assistant is in your chats, for all your runs: ask it there about this one.",
+    conversationId: null,
+  };
+  const IMPLEMENTER: AgentAvailabilityDto = {
+    agent: "implementer",
+    name: "Implementer agent",
+    state: "not_yet",
+    why: "Talking with the implementer of a sub-task comes later. What it did is on this page.",
+    conversationId: null,
+  };
+
+  /**
+   * Who answers in a conversation is decided by the conversation (AD-38), never by a model: in a run's, the
+   * architect while its design session is open; in a chat, the assistant. A sub-task's has no agent yet.
+   */
+  type Route = { to: "architect"; runId: string } | { to: "front-door" } | { to: null; why: string };
+  const routeOf = async (conversation: ConversationDto): Promise<Route> => {
+    if (conversation.agent === "assistant") return { to: "front-door" };
+    const run = conversation.agent === "architect" && conversation.focusedRunId ? await getRun(db, conversation.focusedRunId) : null;
+    if (run) {
+      const architect = await architectOf(run);
+      return architect.state === "available" ? { to: "architect", runId: run.id } : { to: null, why: architect.why ?? "The architect is not available." };
+    }
+    return { to: null, why: IMPLEMENTER.why! };
+  };
+  /** Sends a message to the agent of the conversation, or refuses it with the reason. */
+  const deliver = async (conversation: ConversationDto, text: string) => {
+    const route = await routeOf(conversation);
+    if (route.to === null) throw new UserError(route.why);
+    if (route.to === "architect") {
+      await toArchitect(conversation.id, route.runId, text);
+      return "architect" as const;
+    }
+    if (frontDoor.isBusy(conversation.id)) throw new UserError("The assistant is still replying");
+    void frontDoor.handle(conversation.id, text);
+    return "front-door" as const;
   };
 
   /**
@@ -236,41 +297,30 @@ async function main(): Promise<void> {
     const conversation = await getConversation(db, req.params.id);
     if (!conversation) return notFound(reply, "Conversation");
     const messages = await listMessages(db, req.params.id, Number(req.query.after ?? 0) || 0);
-    const design = conversation.kind === "run" && conversation.focusedRunId ? await designStateOf(conversation.focusedRunId, conversation.id) : null;
+    const design = conversation.agent === "architect" && conversation.focusedRunId ? await designStateOf(conversation.focusedRunId, conversation.id) : null;
+    const route = await routeOf(conversation);
     return {
       conversation,
       messages,
       busy: frontDoor.isBusy(req.params.id) || !!design?.turnRunning,
       design,
-      // The track of the run, and whether the requester can switch it now (FR-A3).
-      track: conversation.kind === "run" && conversation.focusedRunId ? await trackSwitchOf(conversation.focusedRunId) : null,
+      // Whether a message here reaches an agent now, and if not, why (AD-38).
+      canSend: route.to !== null,
+      why: route.to === null ? route.why : null,
     };
   });
   app.post<{ Params: { id: string } }>("/api/conversations/:id/messages", async (req, reply) => {
     const { text } = z.object({ text: z.string().min(1).max(8000) }).parse(req.body);
-    if (!(await getConversation(db, req.params.id))) return notFound(reply, "Conversation");
-    const session = await openDesignSession(req.params.id);
-    if (session) {
-      await toArchitect(req.params.id, session.runId, text);
-      return reply.code(202).send({ accepted: true, to: "architect" });
-    }
-    if (frontDoor.isBusy(req.params.id)) throw new UserError("The assistant is still replying");
-    void frontDoor.handle(req.params.id, text);
-    return reply.code(202).send({ accepted: true, to: "front-door" });
+    const conversation = await getConversation(db, req.params.id);
+    if (!conversation) return notFound(reply, "Conversation");
+    return reply.code(202).send({ accepted: true, to: await deliver(conversation, text) });
   });
   app.post<{ Params: { id: string } }>("/api/conversations/:id/form", async (req, reply) => {
     const body = z.object({ title: z.string().optional(), values: z.record(z.string(), z.string()) }).parse(req.body);
-    if (!(await getConversation(db, req.params.id))) return notFound(reply, "Conversation");
-    const text = frontDoor.formText(body.title, body.values);
-    const session = await openDesignSession(req.params.id);
-    if (session) {
-      // A choice made in a form the architect showed goes back to the architect, as a message.
-      await toArchitect(req.params.id, session.runId, text);
-      return reply.code(202).send({ accepted: true, to: "architect" });
-    }
-    if (frontDoor.isBusy(req.params.id)) throw new UserError("The assistant is still replying");
-    void frontDoor.handle(req.params.id, text);
-    return reply.code(202).send({ accepted: true, to: "front-door" });
+    const conversation = await getConversation(db, req.params.id);
+    if (!conversation) return notFound(reply, "Conversation");
+    // A choice made in a form an agent showed goes back to that agent, as a message.
+    return reply.code(202).send({ accepted: true, to: await deliver(conversation, frontDoor.formText(body.title, body.values)) });
   });
 
   // --- Pending actions ---------------------------------------------------------
@@ -443,12 +493,13 @@ async function main(): Promise<void> {
   app.get<{ Params: { id: string } }>("/api/runs/:id/page", async (req, reply): Promise<RunPageDto | undefined> => {
     const run = await getRun(db, req.params.id);
     if (!run) return notFound(reply, "Run");
-    const [cards, needsYou, tickets, track, design] = await Promise.all([
+    const [cards, needsYou, tickets, track, design, architect] = await Promise.all([
       listPageCards(db, run.id, null),
       listPendingApprovals(db, run.id),
       listTickets(db, 1, run.ticketKey),
       trackSwitchOf(run.id),
       designStateOf(run.id, run.conversationId),
+      architectOf(run),
     ]);
     const ticketRun = tickets[0]?.runs.find((r) => r.runId === run.id);
     return {
@@ -460,13 +511,14 @@ async function main(): Promise<void> {
       subtasks: ticketRun?.subtasks ?? [],
       track,
       design,
+      agents: [architect, ASSISTANT],
     };
   });
   app.get<{ Params: { id: string; key: string } }>("/api/runs/:id/subtasks/:key/page", async (req, reply): Promise<SubtaskPageDto | undefined> => {
     const [run, subtask] = await Promise.all([getRun(db, req.params.id), getSubtask(db, req.params.id, req.params.key)]);
     if (!run || !subtask) return notFound(reply, "Sub-task");
     const [cards, pending] = await Promise.all([listPageCards(db, run.id, subtask.key), listPendingApprovals(db, run.id)]);
-    return { run, subtask, cards, needsYou: pending.filter((p) => p.subtaskKey === subtask.key) };
+    return { run, subtask, cards, needsYou: pending.filter((p) => p.subtaskKey === subtask.key), agents: [IMPLEMENTER, ASSISTANT] };
   });
 
   // Every version of a run's plan, oldest first: earlier versions stay viewable (FR-P3).

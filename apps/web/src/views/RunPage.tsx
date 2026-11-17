@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import type { RunPageDto } from "@orch/contracts";
 import { api, put, subscribe } from "../api";
 import { useApp } from "../App";
-import { Activity, ConversationPanel, NeedsYou, RUN_SECTIONS, Sections, splitCards, useScrollToHash } from "../components/Page";
+import { Activity, AgentPanel, NeedsYou, RUN_SECTIONS, Sections, splitCards, useScrollToHash } from "../components/Page";
 import { TrackSwitch } from "../components/TrackSwitch";
 
 const label = (state: string) => state.replace(/_/g, " ");
@@ -96,14 +96,14 @@ export function RunPage() {
           ) : (
             page.track?.why && <p className="muted small">{page.track.why}</p>
           )}
-          {page.design && <p className="small design-note">The design session is open: talk with the architect in the conversation beside this page.</p>}
+          {page.design && <p className="small design-note">The design session is open: talk with the architect in the agent panel beside this page.</p>}
           {run.error && <p className="error small">{run.error}</p>}
         </header>
         <NeedsYou runId={run.id} pending={pending} approvals={page.needsYou} subtasks={page.subtasks} />
         <Sections cards={rest} sections={RUN_SECTIONS} />
         <Activity notices={notices} />
       </section>
-      {conversationId && <ConversationPanel conversationId={conversationId} kind="run" who={page.design ? "Architect agent" : "Assistant"} />}
+      <AgentPanel key={run.id} agents={page.agents} runId={run.id} />
     </div>
   );
 }

@@ -19,11 +19,14 @@ export function TicketTree({
   tickets,
   chats,
   currentPath,
+  replied = new Set(),
   onOpen,
 }: {
   tickets: TicketDto[];
   chats: ConversationDto[];
   currentPath: string;
+  /** Runs whose architect wrote while their page was not open. */
+  replied?: Set<string>;
   onOpen: (path: string) => void;
 }) {
   const [toggled, setToggled] = useState<Record<string, boolean>>({});
@@ -62,6 +65,8 @@ export function TicketTree({
               </button>
               {ticket.pending > 0 ? (
                 <span className="dot" title={`${ticket.pending} waiting for you`} />
+              ) : ticket.runs.some((r) => replied.has(r.runId)) ? (
+                <span className="reply-dot" title="The architect replied" />
               ) : (
                 <span className={`state-mark ${ticket.active ? "active" : ticket.state}`} title={label(ticket.state)} />
               )}
@@ -75,7 +80,11 @@ export function TicketTree({
                     onClick={() => onOpen(runPath(run.runId))}
                   >
                     <span className="title">{runLabel(run)}</span>
-                    {run.pending > 0 && <span className="dot" title={`${run.pending} waiting for you`} />}
+                    {run.pending > 0 ? (
+                      <span className="dot" title={`${run.pending} waiting for you`} />
+                    ) : (
+                      replied.has(run.runId) && <span className="reply-dot" title="The architect replied" />
+                    )}
                   </button>
                   {run.subtasks.map((st) => {
                     const path = subtaskPath(run.runId, st.key);

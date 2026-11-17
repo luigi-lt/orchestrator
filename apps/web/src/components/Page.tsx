@@ -1,6 +1,7 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
-import type { ApprovalDto, OrchestratorCard, PageCardDto, TicketSubtaskDto } from "@orch/contracts";
+import type { AgentAvailabilityDto, ApprovalDto, OrchestratorCard, PageCardDto, TicketSubtaskDto } from "@orch/contracts";
+import { subscribe } from "../api";
 import { Conversation } from "../views/ChatView";
 import { OrchestratorCardView } from "./Cards";
 import { subtaskPath } from "./TicketTree";
@@ -34,7 +35,7 @@ export const SUBTASK_SECTIONS: SectionDef[] = [
 ];
 
 /** Cards that are not shown as sections: the header shows the work item and the sub-task; links live in chats. */
-const NOT_A_SECTION = new Set<CardType>(["work_item", "subtask", "run_link", "notice"]);
+const NOT_A_SECTION = new Set<CardType>(["work_item", "subtask", "run_link", "page_marker", "notice"]);
 
 const approvalOf = (card: OrchestratorCard): string | null => ("approvalId" in card && typeof card.approvalId === "string" ? card.approvalId : null);
 
@@ -171,14 +172,27 @@ export function useScrollToHash(ready: boolean) {
   }, [ready, hash]);
 }
 
-const PANEL_KEY = "orch.conversationPanel";
+const PANEL_KEY = "orch.agentPanel";
 const narrow = () => typeof window !== "undefined" && window.matchMedia?.("(max-width: 860px)").matches;
 
+const STATE_WORD: Record<AgentAvailabilityDto["state"], string> = {
+  available: "talk now",
+  read_only: "read only",
+  elsewhere: "in your chats",
+  not_yet: "not yet",
+  not_available: "not on this run",
+};
+
+/** The agent the panel opens on: one that takes messages now, else one whose conversation can be read. */
+const firstChoice = (agents: AgentAvailabilityDto[]) =>
+  (agents.find((a) => a.state === "available") ?? agents.find((a) => a.state === "read_only") ?? agents[0])?.agent ?? null;
+
 /**
- * The conversation beside a page. Until the agent panel (U2) it holds the run's conversation as before: the
- * architect answers while the design session is open, the assistant otherwise.
+ * The agent panel beside a page (FR-C4, AD-38): the agents of this page, which of them the requester can talk
+ * with and why not, and the conversation with the one chosen. Each conversation belongs to one agent; the
+ * requester chooses the agent, the orchestrator says which are available.
  */
-export function ConversationPanel({ conversationId, kind, who, children }: { conversationId: string; kind: "run" | "subtask"; who: string; children?: ReactNode }) {
+export function AgentPanel({ agents, runId }: { agents: AgentAvailabilityDto[]; runId: string }) {
   const [open, setOpen] = useState(() => {
     if (narrow()) return false;
     try {
@@ -187,33 +201,93 @@ export function ConversationPanel({ conversationId, kind, who, children }: { con
       return true;
     }
   });
+  // Until the requester chooses, the panel follows the agents: it opens on the architect once its session opens.
+  const [chosen, setChosen] = useState<AgentAvailabilityDto["agent"] | null>(null);
+  const [unread, setUnread] = useState<Set<string>>(new Set());
+  const selected = agents.find((a) => a.agent === (chosen ?? firstChoice(agents))) ?? agents[0];
+
+  // A reply in the conversation of an agent that is not shown marks it in the switch.
+  const shownConversation = open ? selected?.conversationId : null;
+  const others = agents.filter((a) => a.conversationId && a.conversationId !== shownConversation).map((a) => a.conversationId!);
+  const othersKey = others.join();
+  useEffect(() => {
+    if (!othersKey) return;
+    const watched = new Set(othersKey.split(","));
+    return subscribe((n) => {
+      if (n.t === "msg" && watched.has(n.c)) setUnread((u) => new Set(u).add(n.c));
+    });
+  }, [othersKey]);
+
   const toggle = (next: boolean) => {
     setOpen(next);
+    // Opening the panel shows the chosen agent's conversation: its reply is seen.
+    const shown = selected?.conversationId;
+    if (next && shown) setUnread((u) => {
+      const rest = new Set(u);
+      rest.delete(shown);
+      return rest;
+    });
     try {
       window.localStorage.setItem(PANEL_KEY, next ? "open" : "closed");
     } catch {
       // the choice is only kept for this page
     }
   };
+  const choose = (agent: AgentAvailabilityDto) => {
+    setChosen(agent.agent);
+    if (agent.conversationId) setUnread((u) => {
+      const next = new Set(u);
+      next.delete(agent.conversationId!);
+      return next;
+    });
+  };
+  if (!selected) return null;
   if (!open) {
     return (
-      <button className="panel-reopen" onClick={() => toggle(true)} aria-label="Show the conversation">
-        Conversation · {who}
+      <button className="panel-reopen" onClick={() => toggle(true)} aria-label={`Show the agent panel: ${selected.name}`}>
+        {selected.name} · {STATE_WORD[selected.state]}
+        {unread.size > 0 && <span className="reply-dot" aria-label="new reply" />}
       </button>
     );
   }
   return (
-    <aside className="agent-panel" aria-label="Conversation">
+    <aside className="agent-panel" aria-label="Agents">
       <div className="agent-panel-head">
-        <div>
-          <strong>Conversation</strong> <span className="agent-chip">{who}</span>
+        <div className="agent-switch" role="tablist" aria-label="Agent">
+          {agents.map((a) => (
+            <button
+              key={a.agent}
+              role="tab"
+              aria-selected={a.agent === selected.agent}
+              className={`agent-tab ${a.state} ${a.agent === selected.agent ? "selected" : ""}`}
+              title={a.why ?? `${a.name}: ${STATE_WORD[a.state]}`}
+              onClick={() => choose(a)}
+            >
+              <span className={`agent-state ${a.state}`} aria-hidden />
+              {a.name}
+              {a.conversationId && unread.has(a.conversationId) && <span className="reply-dot" aria-label="new reply" />}
+            </button>
+          ))}
         </div>
-        <button className="ghost small" onClick={() => toggle(false)} aria-label="Hide the conversation">
+        <button className="ghost small" onClick={() => toggle(false)} aria-label="Hide the agent panel">
           Hide
         </button>
       </div>
-      {children}
-      <Conversation key={conversationId} id={conversationId} kind={kind} />
+      {selected.conversationId && (selected.state === "available" || selected.state === "read_only") ? (
+        <Conversation key={selected.conversationId} id={selected.conversationId} kind="run" />
+      ) : (
+        <div className="agent-empty">
+          <p>
+            <strong>{selected.name}</strong> · <span className="muted">{STATE_WORD[selected.state]}</span>
+          </p>
+          {selected.why && <p className="muted">{selected.why}</p>}
+          {selected.agent === "assistant" && (
+            <Link className="primary-link" to={`/chat/new?about=${encodeURIComponent(runId)}`}>
+              Ask the assistant about this run
+            </Link>
+          )}
+        </div>
+      )}
     </aside>
   );
 }

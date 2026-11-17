@@ -14,6 +14,16 @@ export function MessageView({ message, onSubmitForm }: { message: MessageDto; on
       </div>
     );
   }
+  // A marker that points to the page: one line from the orchestrator, between the agent's messages (AD-44).
+  if (message.role === "orchestrator" && message.components.every((c) => c.type === "page_marker")) {
+    return (
+      <div className="message marker" title="From the orchestrator: the record is on the page">
+        {message.components.map((c, i) => (
+          <OrchestratorCardView key={i} card={c as OrchestratorCard} />
+        ))}
+      </div>
+    );
+  }
   if (message.role === "orchestrator") {
     return (
       <div className="message orchestrator">

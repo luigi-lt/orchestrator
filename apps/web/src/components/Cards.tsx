@@ -12,6 +12,12 @@ export function OrchestratorCardView({ card }: { card: OrchestratorCard }) {
       return <WorkItemCard card={card} />;
     case "run_link":
       return <RunLinkCard card={card} />;
+    case "page_marker":
+      return (
+        <Link className="page-marker" to={`${runPath(card.runId)}#${card.section}`}>
+          <span aria-hidden>◆</span> {card.text} <span aria-hidden>→</span>
+        </Link>
+      );
     case "analysis":
       return <AnalysisCard card={card} />;
     case "progress":
@@ -299,8 +305,8 @@ function PlanBody({ plan, products }: { plan: HandoffPlan; products: Record<stri
 }
 
 const PLAN_STATUS = {
-  draft: "The architect is still shaping this plan with you. Ask for changes in the conversation beside this page.",
-  proposed: "The architect put this version up for your approval. To change it, ask the architect in the conversation; a new version replaces this one.",
+  draft: "The architect is still shaping this plan with you. Ask it for changes in the agent panel beside this page.",
+  proposed: "The architect put this version up for your approval. To change it, ask the architect in the agent panel; a new version replaces this one.",
   approved: "You approved this version. It is what the agents build.",
   expired: "This plan was not approved: the run ended, or moved to the fast track.",
 } as const;

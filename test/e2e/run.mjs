@@ -175,7 +175,13 @@ async function main() {
   check(fast.run.track === "fast" && fast.run.products.join() === "calc" && fast.run.homeProduct === "calc", `track ${fast.run.track}, products ${fast.run.products}`);
   check(fast.run.catalogHash === products.hash, "the run pinned the catalog version");
   const fastConversation = (await api("/api/conversations")).find((c) => c.id === fast.run.conversationId);
-  check(fastConversation?.kind === "run" && fastConversation.focusedRunId === fastRun.id, "the run has its own conversation");
+  check(fastConversation?.kind === "run" && fastConversation.agent === "architect" && fastConversation.focusedRunId === fastRun.id, "the run has its own conversation, the architect's");
+  const fastAgents = (await pageOf(fastRun.id)).agents;
+  check(
+    fastAgents.map((a) => `${a.agent}:${a.state}`).join() === "architect:not_available,assistant:elsewhere" && /fast track/.test(fastAgents[0].why) && fastAgents[0].conversationId === null,
+    "the agent panel of a fast-track run says that no agent talks with the requester, and that the assistant is in the chats",
+  );
+  check(await refused(say(fast.run.conversationId, "Can I talk to someone?")), "a message to a fast-track run's conversation is refused");
   const fastCards = await cardsOf(fast.run.conversationId);
   const analysisCard = fastCards.find((c) => c.type === "analysis");
   check(analysisCard?.track === "fast" && analysisCard.products[0]?.name === "Calculator library", "analysis card shows the product and the fast track");
@@ -258,8 +264,13 @@ async function main() {
     "a draft plan card shows sub-tasks in both repositories and the contract between them",
   );
   check(!cross.pending.some((p) => p.kind === "plan"), "a draft is not up for approval");
+  const crossAgents = (await pageOf(crossRun.id)).agents;
+  check(
+    crossAgents[0].agent === "architect" && crossAgents[0].state === "available" && crossAgents[0].conversationId === crossConversation && crossAgents[1].state === "elsewhere",
+    "the agent panel offers the architect, with its conversation, while the design session is open",
+  );
   const routed = await say(crossConversation, "Why two sub-tasks?");
-  check(routed.to === "architect", "a message in the run's conversation goes to the architect while the session is open");
+  check(routed.to === "architect", "a message in the architect's conversation goes to the architect while the session is open");
   await waitFor("the architect's answer", async () => (await architectSaid(crossConversation)).find((m) => /The plan stays as it is/.test(m.text)), 120_000);
   await say(crossConversation, "Compare the options in a table");
   const withOptions = await waitFor("the architect's table", async () => (await architectSaid(crossConversation)).find((m) => m.components.some((c) => c.type === "table")), 120_000);
@@ -270,7 +281,9 @@ async function main() {
   const afterCancel = await gh("/_test/state");
   check(crossCancelled.design.state === "closed" && crossCancelled.steps.every((st) => st.state !== "running"), "cancelling during the design closes the session and its workspace");
   check(crossCancelled.subtasks.length === 0 && afterCancel.subIssues.length === 0 && afterCancel.pulls.length === 1, "nothing was built, pushed or created on the ticket");
-  check((await api(`/api/conversations/${crossConversation}`)).design === null, "the conversation is no longer a design session");
+  const afterSession = await api(`/api/conversations/${crossConversation}`);
+  check(afterSession.design === null && !afterSession.canSend && /run has ended/.test(afterSession.why), "the conversation is no longer a design session: it stays readable and says why it takes no messages");
+  check((await pageOf(crossRun.id)).agents[0].state === "read_only", "the agent panel shows the architect's conversation as read-only");
 
   console.log("5. The same ticket run again: runs grouped by ticket; the plan is shaped in the conversation and approved");
   const again = await api("/api/runs", { method: "POST", body: { repo: "acme/demo", issueNumber: story.number } });
@@ -296,9 +309,15 @@ async function main() {
   );
   check(/do not touch/.test(v2.promptedBy ?? "") && v2.hash !== v1.hash, "version 2 records the request that prompted it");
   const timeline = (await api(`/api/conversations/${conv}`)).messages;
+  const markers = timeline.filter((m) => m.role === "orchestrator");
   check(
-    timeline.some((m) => m.author === "architect") && timeline.every((m) => m.role !== "orchestrator"),
-    "the conversation holds only the requester and the architect: the plan is on the run's page beside it",
+    timeline.some((m) => m.author === "architect") && timeline.every((m) => m.role !== "agent" || m.author === "architect") && markers.every((m) => m.components.every((c) => c.type === "page_marker")),
+    "the conversation holds the requester, the architect and markers only: the plan is on the run's page beside it",
+  );
+  check(
+    markers.some((m) => m.components[0].section === "plan" && /Plan version 2 is on the run's page: \d+ changes?/.test(m.components[0].text)) &&
+      timeline.findIndex((m) => m.role === "orchestrator" && /version 2/.test(m.components[0].text)) > timeline.findLastIndex((m) => m.author === "architect"),
+    "a one-line marker below the architect's reply points to version 2 on the page",
   );
   const draftPage = await pageOf(again.runId);
   check(
@@ -335,6 +354,13 @@ async function main() {
     planLink?.runId === again.runId && planLink.section === "plan" && !pointed.some((m) => m.components.some((c) => c.type === "plan")),
     "asked for the plan, the assistant shows a link to the plan section of the run's page, not a copy of it",
   );
+  // From a run's page the requester asks the assistant in a chat of its own, with the run named (FR-C5).
+  const aboutChat = await api("/api/conversations", { method: "POST", body: {} });
+  check(aboutChat.kind === "general" && aboutChat.agent === "assistant", "a new chat is the assistant's");
+  check((await say(aboutChat.id, `About acme/demo#${story.number} (run ${again.runId}): how is it going?`)).to === "front-door", "a message in a chat goes to the assistant");
+  const answered = await waitFor("the assistant's answer about the run", async () => (await api(`/api/conversations/${aboutChat.id}`)).messages.find((m) => m.author === "front-door"), 60_000);
+  check(/That run is awaiting approval/.test(answered.text ?? ""), `the assistant looked the run up: "${answered.text}"`);
+  check((await api(`/api/conversations/${conv}`)).messages.every((m) => m.author !== "front-door"), "the assistant never writes in the architect's conversation");
 
   await say(conv, "One more constraint: do not rename anything");
   const v3 = await waitForPlan(conv, "plan version 3", (c) => c.version === 3);
@@ -350,7 +376,12 @@ async function main() {
   console.log("6. The approved plan is built across two repositories: the requester checks each change before its pull request opens");
   const { d: firstCheck, st: c1 } = await subtaskIn(again.runId, "calc-negate", ["awaiting_check"]);
   check((await planCardOf(conv)).status === "approved" && firstCheck.design.state === "closed", "the plan card shows the approved version and the design session is closed");
-  check((await say(conv, "hello")).to === "front-door", "after the session the conversation is answered by the front-door agent again");
+  check(await refused(say(conv, "hello")), "after the approval the architect's conversation takes no new messages");
+  const closedConv = await api(`/api/conversations/${conv}`);
+  check(!closedConv.canSend && /plan is approved/.test(closedConv.why) && closedConv.messages.some((m) => m.components.some((c) => c.type === "page_marker" && /You approved plan version 3/.test(c.text))), "it says why, after a marker for the approval");
+  check(!closedConv.messages.some((m) => m.text === "hello"), "the refused message was not recorded");
+  const approvedAgents = (await pageOf(again.runId)).agents;
+  check(approvedAgents[0].state === "read_only" && approvedAgents[0].conversationId === conv, "the agent panel keeps the architect's conversation readable");
   versions = await api(`/api/runs/${again.runId}/plans`);
   check(versions.map((v) => v.status).join() === "superseded,superseded,approved", "all three versions are kept; the third is the approved one");
   let hub = await gh("/_test/state");
@@ -387,6 +418,8 @@ async function main() {
     "the run's page lists the check under Needs you as a link to the sub-task's page, without its card",
   );
   check((await api("/api/pending")).find((p) => p.id === check1.approvalId)?.subtaskKey === "calc-negate", "the pending badge knows on which page the decision is taken");
+  check(c1Page.agents.map((a) => `${a.agent}:${a.state}`).join() === "implementer:not_yet,assistant:elsewhere", "the sub-task's agent panel says the implementer joins later");
+  check(await refused(say(c1.conversationId, "Hi")), "a message to a sub-task's conversation is refused: no agent talks there yet");
   const listed = (await api("/api/tickets")).find((t) => t.issueNumber === story.number).runs[0].subtasks;
   check(
     runPageNow.subtasks.map((st) => st.key).join() === "calc-negate,shop-page" && listed.map((st) => st.key).join() === "calc-negate,shop-page" && listed[1].conversationId === null,

@@ -3,7 +3,7 @@ import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-
 import type { ApprovalDto, RunDto } from "@orch/contracts";
 import { api, put, subscribe } from "./api";
 import { runPath, subtaskPath } from "./components/TicketTree";
-import { ChatView } from "./views/ChatView";
+import { ChatView, NewChat } from "./views/ChatView";
 import { RunDetail } from "./views/RunDetail";
 import { RunPage } from "./views/RunPage";
 import { Products } from "./views/Products";
@@ -137,6 +137,7 @@ export function App() {
             <Route path="/" element={me ? <Navigate to={me.landingView === "operator" ? "/ops/runs" : "/chat"} replace /> : null} />
             <Route element={<UserLayout />}>
               <Route path="/chat" element={<ChatView />} />
+              <Route path="/chat/new" element={<NewChat />} />
               <Route path="/chat/:conversationId" element={<ChatView />} />
               <Route path="/runs/:runId" element={<RunPage />} />
               <Route path="/runs/:runId/subtasks/:key" element={<SubtaskPage />} />

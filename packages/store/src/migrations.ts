@@ -285,4 +285,42 @@ delete from messages m using conversations c
   where c.id = m.conversation_id and c.kind in ('run', 'subtask') and m.role = 'orchestrator' and m.card_key is null;
 `,
   },
+  {
+    // One conversation per run and agent (AD-38, U2): a run's conversation is the architect's; the assistant's
+    // messages there, and the requester's messages it answered, move to a chat of their own. A sub-task's
+    // conversation is kept for its implementer (FR-N2); what the assistant said there moves the same way.
+    version: 8,
+    sql: `
+alter table conversations add column agent text;
+update conversations set agent = 'architect' where kind = 'run';
+update conversations set agent = 'assistant' where kind = 'general';
+
+create temporary table assistant_split on commit drop as
+select m.id as message_id, m.conversation_id as from_conversation
+from messages m
+join conversations c on c.id = m.conversation_id
+where c.kind in ('run', 'subtask') and m.role in ('user', 'agent') and 'front-door' = case
+  when m.role = 'agent' then coalesce(m.author, 'front-door')
+  -- A requester's message went to whoever answered it next; one not answered yet goes to the architect while
+  -- the design session is open.
+  else coalesce(
+    (select coalesce(n.author, 'front-door') from messages n
+      where n.conversation_id = m.conversation_id and n.role = 'agent' and (n.created_at, n.version) > (m.created_at, m.version)
+      order by n.created_at, n.version limit 1),
+    case when c.kind = 'run' and exists (select 1 from design_sessions s where s.run_id = c.focused_run_id and s.state <> 'closed')
+      then 'architect' else 'front-door' end)
+  end;
+
+insert into conversations (id, title, kind, agent, focused_run_id, created_at, updated_at)
+select 'conv_' || substr(md5(s.from_conversation || ':assistant'), 1, 20), left('About ' || c.title, 120), 'general', 'assistant', null,
+  min(m.created_at), max(m.created_at)
+from assistant_split s
+join conversations c on c.id = s.from_conversation
+join messages m on m.id = s.message_id
+group by s.from_conversation, c.title;
+
+update messages m set conversation_id = 'conv_' || substr(md5(s.from_conversation || ':assistant'), 1, 20)
+from assistant_split s where m.id = s.message_id;
+`,
+  },
 ];

@@ -743,6 +743,17 @@ export const RunLinkCard = z.object({
   section: z.string().optional(),
   subtaskKey: z.string().optional(),
 });
+/**
+ * A one-line marker in an agent's conversation that points to a section of the run's page, e.g. a new version
+ * of the plan the architect wrote (AD-44). The record itself stays on the page.
+ */
+export const PageMarkerCard = z.object({
+  type: z.literal("page_marker"),
+  runId: z.string(),
+  /** The section of the run's page, e.g. "plan" or "needs-you". */
+  section: z.string(),
+  text: z.string(),
+});
 /** The header of a sub-task's page (FR-C3). */
 export const SubtaskCard = z.object({
   type: z.literal("subtask"),
@@ -879,6 +890,7 @@ export const NoticeCard = z.object({
 export const OrchestratorCard = z.discriminatedUnion("type", [
   WorkItemCard,
   RunLinkCard,
+  PageMarkerCard,
   AnalysisCard,
   ProgressCard,
   PlanCard,
@@ -900,6 +912,7 @@ export type OrchestratorCard = z.infer<typeof OrchestratorCard>;
 export const SYSTEM_ONLY_TYPES = new Set<string>([
   "work_item",
   "run_link",
+  "page_marker",
   "analysis",
   "progress",
   "plan",
@@ -952,11 +965,16 @@ export interface MessageDto {
   updatedAt: string;
 }
 
+/** The agent a conversation is with (AD-38): the architect's is a run's, the assistant's are the person's chats. */
+export type ConversationAgent = "architect" | "assistant";
+
 export interface ConversationDto {
   id: string;
   title: string;
   /** "run": the conversation of one run; "subtask": of one sub-task of a run; "general": a chat with the front-door agent. */
   kind: "general" | "run" | "subtask";
+  /** Who the requester talks with here; null for a sub-task's conversation until its implementer joins (FR-N2). */
+  agent: ConversationAgent | null;
   /** The run a run or sub-task conversation belongs to. */
   focusedRunId: string | null;
   subtaskKey: string | null;
@@ -1184,6 +1202,20 @@ export interface DesignStateDto {
   hasPlan: boolean;
 }
 
+/** Whether the requester can talk with an agent from a page, and why not (FR-C4). Decided by the orchestrator, never by a model. */
+export interface AgentAvailabilityDto {
+  agent: "architect" | "assistant" | "implementer";
+  name: string;
+  /**
+   * available: its conversation takes messages now; read_only: it can be read but takes no messages; elsewhere: it
+   * is on another page; not_yet: it may join this page later; not_available: it does not take part here.
+   */
+  state: "available" | "read_only" | "elsewhere" | "not_yet" | "not_available";
+  why: string | null;
+  /** The conversation with it, when there is one to show. */
+  conversationId: string | null;
+}
+
 /** The page of a run (FR-C2): its header, what needs the requester, and the cards of its sections. */
 export interface RunPageDto {
   run: RunDto;
@@ -1197,6 +1229,8 @@ export interface RunPageDto {
   subtasks: TicketSubtaskDto[];
   track: TrackSwitchDto | null;
   design: DesignStateDto | null;
+  /** The agents of the agent panel, in the order the panel lists them. */
+  agents: AgentAvailabilityDto[];
 }
 
 /** The page of one sub-task of a guided run (FR-C3). */
@@ -1206,6 +1240,7 @@ export interface SubtaskPageDto {
   cards: PageCardDto[];
   /** The decisions waiting for the requester on this page. */
   needsYou: ApprovalDto[];
+  agents: AgentAvailabilityDto[];
 }
 
 export interface ProgressDto {
