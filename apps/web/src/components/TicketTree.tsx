@@ -62,11 +62,11 @@ export function TicketTree({
                 <span className="title">{ticket.title}</span>
               </button>
               {ticket.pending > 0 ? (
-                <span className="dot" title={`${ticket.pending} waiting for you`} />
+                <span className="dot" role="img" title={`${ticket.pending} waiting for you`} aria-label={`${ticket.pending} waiting for you`} />
               ) : ticket.runs.some((r) => replied.has(r.runId)) ? (
-                <span className="reply-dot" title="The architect replied" />
+                <span className="reply-dot" role="img" title="The architect replied" aria-label="The architect replied" />
               ) : (
-                <span className={`state-mark ${ticket.active ? "active" : ticket.state}`} title={label(ticket.state)} />
+                <span className={`state-mark ${ticket.active ? "active" : ticket.state}`} role="img" title={label(ticket.state)} aria-label={label(ticket.state)} />
               )}
             </div>
             {open &&
@@ -79,9 +79,9 @@ export function TicketTree({
                   >
                     <span className="title">{runLabel(run)}</span>
                     {run.pending > 0 ? (
-                      <span className="dot" title={`${run.pending} waiting for you`} />
+                      <span className="dot" role="img" title={`${run.pending} waiting for you`} aria-label={`${run.pending} waiting for you`} />
                     ) : (
-                      replied.has(run.runId) && <span className="reply-dot" title="The architect replied" />
+                      replied.has(run.runId) && <span className="reply-dot" role="img" title="The architect replied" aria-label="The architect replied" />
                     )}
                   </button>
                   {run.subtasks.map((st) => {
@@ -98,7 +98,7 @@ export function TicketTree({
                           {st.index + 1}. {st.title}
                         </span>
                         {st.pending > 0 ? (
-                          <span className="dot" title={`${st.pending} waiting for you`} />
+                          <span className="dot" role="img" title={`${st.pending} waiting for you`} aria-label={`${st.pending} waiting for you`} />
                         ) : (
                           <span className="muted small subtask-state">{SUBTASK_STATE_LABEL[st.state] ?? label(st.state)}</span>
                         )}

@@ -192,7 +192,8 @@ export function Conversation({ id, kind }: { id: string; kind: ConversationDto["
   }, [id, kind, loadAfter]);
 
   useEffect(() => {
-    bottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    const still = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+    bottom.current?.scrollIntoView({ behavior: still ? "auto" : "smooth", block: "end" });
   }, [messages.length, streaming, typing]);
 
   const send = async (text: string) => {
@@ -237,7 +238,7 @@ export function Conversation({ id, kind }: { id: string; kind: ConversationDto["
           {!design.turnRunning && !typing && design.hasPlan && !design.fresh && <FreshSession key={`${design.state}-${messages.length}`} runId={design.runId} />}
         </div>
       )}
-      <div className="timeline">
+      <div className="timeline" role="log" aria-live="polite" aria-relevant="additions" aria-label="Messages" aria-busy={typing}>
         {timeline}
         {messages.length === 0 && !typing && (
           <p className="muted small">{kind === "general" ? "Ask about your runs, or start work on an issue." : "No messages yet. What the orchestrator records and asks is on the page."}</p>
@@ -245,7 +246,7 @@ export function Conversation({ id, kind }: { id: string; kind: ConversationDto["
         {typing && (
           <div className="message agent">
             {design && <div className="origin agent-origin">Architect agent</div>}
-            <div className="bubble streaming">{streaming ? streaming : <span className="typing">{design ? "The architect is working…" : "Thinking…"}</span>}</div>
+            <div className="bubble streaming" aria-hidden={!!streaming}>{streaming ? streaming : <span className="typing">{design ? "The architect is working…" : "Thinking…"}</span>}</div>
           </div>
         )}
         <div ref={bottom} />

@@ -5,12 +5,14 @@
   --text: #1b1f24;
   --muted: #5f6b7a;
   --border: #dde1e6;
-  --accent: #3b5bdb;
+  --accent: #3451c9;
   --accent-text: #ffffff;
   --accent-soft: #e7ecff;
-  --success: #2b8a3e;
-  --warning: #b35c00;
-  --danger: #c92a2a;
+  /* Dark enough for 4.5:1 as text on their own tints and on every surface (WCAG 2.2 AA). */
+  --success: #1c6a2e;
+  --warning: #8f4800;
+  --danger: #a61f1f;
+  --on-warning: #ffffff;
   --orch: #5f3dc4;
   --shadow: 0 1px 2px rgba(16, 24, 40, 0.06);
   --radius: 10px;
@@ -30,6 +32,7 @@
     --success: #69db7c;
     --warning: #ffa94d;
     --danger: #ff8787;
+    --on-warning: #111418;
     --orch: #b197fc;
     --shadow: none;
     color-scheme: dark;
@@ -81,7 +84,7 @@ textarea { resize: vertical; }
 .view-toggle button.active { background: var(--surface); color: var(--text); box-shadow: var(--shadow); font-weight: 600; }
 .topbar-right { display: flex; align-items: center; gap: 10px; }
 .pending-badge { border-radius: 999px; font-size: 12px; }
-.pending-badge.has { background: var(--warning); border-color: var(--warning); color: #fff; font-weight: 600; }
+.pending-badge.has { background: var(--warning); border-color: var(--warning); color: var(--on-warning); font-weight: 600; }
 .me { color: var(--muted); font-size: 12px; }
 .content { flex: 1; min-height: 0; }
 
@@ -405,3 +408,37 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); cur
 .chat-list .conversation-item:hover { background: var(--surface-2); }
 .chat-title { padding: 6px 16px; border-bottom: 1px solid var(--border); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ask-assistant { display: block; padding: 8px 16px; border-top: 1px solid var(--border); background: var(--surface); }
+
+/* Phone width (FR-C6): the side panel as a drawer, a compact header, sheets with a way back */
+.narrow-only { display: none; }
+.skip-link { position: absolute; left: 8px; top: -48px; z-index: 50; padding: 8px 12px; border-radius: 8px; background: var(--accent); color: var(--accent-text); }
+.skip-link:focus { top: 8px; }
+.content:focus { outline: none; }
+.menu-button { white-space: nowrap; }
+.view-toggle button, .pending-badge { white-space: nowrap; }
+.card blockquote.requested { margin: 6px 0; padding: 6px 10px; border-left: 3px solid var(--border); }
+@media (max-width: 860px) {
+  .narrow-only { display: initial; }
+  .wide-only { display: none; }
+  .topbar { gap: 8px; padding: 8px 12px; }
+  .me { display: none; }
+  .view-toggle button { padding: 5px 10px; }
+  .sidebar.open {
+    display: block; position: fixed; z-index: 40; top: 0; bottom: 0; left: 0; width: min(320px, 85vw);
+    box-shadow: 0 0 24px rgba(0, 0, 0, 0.25);
+  }
+  .drawer-backdrop { position: fixed; inset: 0; z-index: 35; background: rgba(0, 0, 0, 0.35); }
+  .page { padding-bottom: 88px; }
+  .agent-panel-head { position: sticky; top: 0; z-index: 1; }
+}
+
+/* Accessibility (NFR-UX-01, WCAG 2.2 AA) */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:focus-visible, a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+.version-nav button, .ticket-row .caret { min-width: 24px; min-height: 24px; }
+@media (prefers-reduced-motion: reduce) {
+  * { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
+}
+/* Links inside text are underlined, not told apart by colour alone (WCAG 1.4.1). */
+p a, li a, td a, .story-meta a, .crumbs a, .card-head a, .muted a { text-decoration: underline; text-underline-offset: 2px; }

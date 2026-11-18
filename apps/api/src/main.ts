@@ -9,6 +9,7 @@ import Fastify, { type FastifyReply } from "fastify";
 import { z } from "zod";
 import { config, errorMessage, log } from "@orch/common";
 import {
+  ActionDecision,
   BlockedDecision,
   ChangeDecision,
   ChangeTrackRequest,
@@ -21,11 +22,9 @@ import {
   FINAL_RUN_STATES,
   catalogRepositories,
   designWorkflowId,
-  isFastTrackKey,
   type ApprovalKind,
   type Catalog,
   type OrchestratorCard,
-  type TrackSwitchDto,
   type DesignStateDto,
   type RunPageDto,
   type SubtaskPageDto,
@@ -66,6 +65,7 @@ import {
   hasMessages,
   wasApproved,
 } from "@orch/store";
+import { decideAction, trackSwitchOf as trackSwitchOfRun } from "./actions.js";
 import { FrontDoor, newConversationTitle } from "./frontdoor.js";
 import { StreamHub } from "./hub.js";
 import { catalog, signalRun, startRunForIssue, temporal, UserError, type Services } from "./services.js";
@@ -234,35 +234,7 @@ async function main(): Promise<void> {
     return "front-door" as const;
   };
 
-  /**
-   * Whether the requester can switch the track of a run now (FR-A3): fast → guided until the change is published,
-   * guided → fast until a plan is approved and only when the work stays in one repository. The workflow checks again.
-   */
-  const trackSwitchOf = async (runId: string): Promise<TrackSwitchDto | null> => {
-    const run = await getRun(db, runId);
-    if (!run?.track) return null;
-    if (FINAL_RUN_STATES.includes(run.state)) return { current: run.track, to: null, why: "The run has ended." };
-    if (run.track === "fast") {
-      const change = (await listSubtasks(db, runId)).filter((st) => isFastTrackKey(st.key)).pop();
-      const published = !!change && (change.prNumber !== null || ["pr_open", "merged", "closed", "handed_over"].includes(change.state));
-      return published ? { current: "fast", to: null, why: "The pull request is open: the track can no longer be switched." } : { current: "fast", to: "guided", why: null };
-    }
-    const plans = await listPlanVersions(db, runId);
-    if (plans.some((v) => v.status === "approved")) return { current: "guided", to: null, why: "The plan is approved: the work stays on the guided track." };
-    if (run.state !== "designing" && run.state !== "awaiting_approval") return { current: "guided", to: null, why: null };
-    const latest = plans[plans.length - 1];
-    const repositories = new Set(
-      (latest ? latest.plan.subtasks.map((st) => st.repository) : (run.analysis?.products ?? []).flatMap((p) => p.repositories)).map((r) => r.toLowerCase()),
-    );
-    if (repositories.size !== 1) {
-      return {
-        current: "guided",
-        to: null,
-        why: `The fast track needs the work to stay in one repository; ${latest ? "the current plan" : "the analysis"} involves ${repositories.size}.`,
-      };
-    }
-    return { current: "guided", to: "fast", why: null };
-  };
+  const trackSwitchOf = (runId: string) => trackSwitchOfRun(db, runId);
 
   const toArchitect = async (conversationId: string, runId: string, text: string) => {
     const message = await insertMessage(db, { conversationId, role: "user", text });
@@ -416,6 +388,13 @@ async function main(): Promise<void> {
     await signalRun(services, workflowId, "approval", { approvalId: approval.id, decision: body.decision });
     await resolveApproval(db, approval.id, { decision: body.decision, by: me.login });
     await updateCard(`run:${run.id}:blocked:${approval.id}`, { status: body.decision } as Partial<OrchestratorCard>);
+    return { ok: true };
+  });
+
+  // An action the assistant prepared: the requester confirms it here, on the run's page, or dismisses it (AD-45).
+  app.post<{ Params: { id: string } }>("/api/approvals/:id/action", async (req) => {
+    const body = ActionDecision.parse(req.body);
+    await decideAction(services, req.params.id, body.decision, body.hash, me.login);
     return { ok: true };
   });
 

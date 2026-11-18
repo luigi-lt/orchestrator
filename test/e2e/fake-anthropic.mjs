@@ -382,6 +382,25 @@ function decide(body) {
   if (names.includes("submit_work_item")) {
     if (lastIsToolResult(messages)) {
       const lastTool = used[used.length - 1]?.name;
+      const resultText = () => {
+        const result = messages[messages.length - 1].content.find((b) => b.type === "tool_result");
+        return typeof result?.content === "string" ? result.content : (result?.content ?? []).map((c) => c.text ?? "").join("");
+      };
+      if (lastTool === "read_conversation") {
+        // Quotes the architect, as the assistant's instructions ask.
+        let said = null;
+        try {
+          said = (JSON.parse(resultText()).messages ?? []).filter((m) => m.from === "the architect").pop()?.text ?? null;
+        } catch {
+          // not JSON: the tool failed
+        }
+        return [{ type: "text", text: said ? `Quoting the architect's conversation, the architect said: "${said.slice(0, 120)}"` : "The architect has not said anything on that run." }];
+      }
+      if (lastTool === "prepare_action") {
+        const raw = resultText();
+        const error = /"error"\s*:\s*"([^"]+)"/.exec(raw)?.[1];
+        return [{ type: "text", text: error ? `I could not prepare it: ${error}` : "I prepared it. Confirm or dismiss it under Needs you on the run's page; nothing happens until you do." }];
+      }
       if (lastTool === "get_run_status") {
         // Answers from what the tool returned, as the real assistant would.
         const result = messages[messages.length - 1].content.find((b) => b.type === "tool_result");
@@ -391,6 +410,15 @@ function decide(body) {
       }
       const said = { render: "Here is the table you asked for.", show_card: "It is on the run's page: follow the link." }[lastTool];
       return [{ type: "text", text: said ?? "Done — the orchestrator is on it." }];
+    }
+    // Reading the architect's conversation, and preparing an action the person asks for (AD-45).
+    const reading = /what did the architect say (?:on|in|about) (run_[a-z0-9]+)/i.exec(prompt);
+    if (reading) return [{ type: "tool_use", id: id("toolu"), name: "read_conversation", input: { runId: reading[1] } }];
+    const cancelling = /\bcancel (run_[a-z0-9]+)/i.exec(prompt);
+    if (cancelling) return [{ type: "tool_use", id: id("toolu"), name: "prepare_action", input: { runId: cancelling[1], action: "cancel", reason: "You asked to stop it." } }];
+    const switching = /switch (run_[a-z0-9]+) to the (fast|guided) track/i.exec(prompt);
+    if (switching) {
+      return [{ type: "tool_use", id: id("toolu"), name: "prepare_action", input: { runId: switching[1], action: "switch_track", track: switching[2].toLowerCase(), reason: "You asked for the other track." } }];
     }
     // A chat started from a run's page names the run: the assistant looks it up.
     // The runtime may put context before the person's words, so the pattern is not anchored.

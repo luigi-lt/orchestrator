@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Outlet, useLocation, useNavigate, useOutletContext } from "react-router-dom";
 import type { ConversationDto, TicketDto } from "@orch/contracts";
 import { api, subscribe } from "../api";
+import { useApp } from "../App";
 import { runPath, TicketTree } from "../components/TicketTree";
 
 /** What the pages and chats of the user view share with the side panel. */
@@ -20,6 +21,7 @@ export const useUserNav = () => useOutletContext<UserNav>();
 export function UserLayout() {
   const location = useLocation();
   const navigate = useNavigate();
+  const { navOpen, setNavOpen } = useApp();
   const [conversations, setConversations] = useState<ConversationDto[]>([]);
   const [tickets, setTickets] = useState<TicketDto[]>([]);
   const [loaded, setLoaded] = useState(false);
@@ -53,6 +55,16 @@ export function UserLayout() {
     });
   }, [load]);
 
+  // The drawer closes when a page is opened from it, and with Escape.
+  useEffect(() => setNavOpen(false), [location.pathname, setNavOpen]);
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && setNavOpen(false);
+    window.addEventListener("keydown", onKey);
+    document.querySelector<HTMLElement>("#work-nav button")?.focus();
+    return () => window.removeEventListener("keydown", onKey);
+  }, [navOpen, setNavOpen]);
+
   useEffect(() => {
     setReplied((r) => {
       const open = [...r].filter((runId) => location.pathname.startsWith(runPath(runId)));
@@ -65,11 +77,15 @@ export function UserLayout() {
 
   return (
     <div className="chat-layout">
-      <aside className="sidebar">
+      {navOpen && <div className="drawer-backdrop narrow-only" onClick={() => setNavOpen(false)} aria-hidden />}
+      <aside className={`sidebar ${navOpen ? "open" : ""}`} id="work-nav" aria-label="Your work">
         <button
           className={`start-entry ${location.pathname === "/start" ? "active" : ""}`}
           aria-current={location.pathname === "/start" ? "page" : undefined}
-          onClick={() => navigate("/start")}
+          onClick={() => {
+            setNavOpen(false);
+            navigate("/start");
+          }}
         >
           <span className="title">Start</span>
           <span className="muted small">your work and the assistant</span>
@@ -78,7 +94,11 @@ export function UserLayout() {
           tickets={tickets}
           currentPath={location.pathname}
           replied={replied}
-          onOpen={(path) => navigate(path)}
+          onOpen={(path) => {
+            // Choosing an entry closes the drawer, also when it is the page already open.
+            setNavOpen(false);
+            navigate(path);
+          }}
         />
       </aside>
       <Outlet context={{ conversations, tickets, loaded } satisfies UserNav} />

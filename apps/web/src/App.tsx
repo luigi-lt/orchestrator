@@ -29,9 +29,12 @@ interface AppState {
   pending: ApprovalDto[];
   /** Where the toggle should go from the current page, set by each view (context-preserving switch). */
   setToggleTarget: (target: string | null) => void;
+  /** At phone width the side panel is a drawer, opened from the header (FR-C6). */
+  navOpen: boolean;
+  setNavOpen: (open: boolean) => void;
 }
 
-const AppContext = createContext<AppState>({ me: null, pending: [], setToggleTarget: () => undefined });
+const AppContext = createContext<AppState>({ me: null, pending: [], setToggleTarget: () => undefined, navOpen: false, setNavOpen: () => undefined });
 export const useApp = () => useContext(AppContext);
 
 const FINAL = new Set(["completed", "closed", "cancelled", "failed"]);
@@ -55,6 +58,7 @@ export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [pending, setPending] = useState<ApprovalDto[]>([]);
   const [toggleTarget, setToggleTarget] = useState<string | null>(null);
+  const [navOpen, setNavOpen] = useState(false);
   const [notifPermission, setNotifPermission] = useState<string>("Notification" in window ? Notification.permission : "unsupported");
   const location = useLocation();
   const navigate = useNavigate();
@@ -102,18 +106,31 @@ export function App() {
   const firstPending = pending[0];
 
   return (
-    <AppContext.Provider value={{ me, pending, setToggleTarget }}>
+    <AppContext.Provider value={{ me, pending, setToggleTarget, navOpen, setNavOpen }}>
       <div className="app">
+        <a className="skip-link" href="#main">
+          Skip to the page
+        </a>
         <header className="topbar">
+          {!isOps && (
+            <button
+              className="menu-button narrow-only"
+              aria-expanded={navOpen}
+              aria-controls="work-nav"
+              onClick={() => setNavOpen(!navOpen)}
+            >
+              <span aria-hidden>☰</span> Work
+            </button>
+          )}
           <div className="brand">
             <span className="logo">◆</span> Orchestrator
           </div>
           <div className="view-toggle" role="group" aria-label="Switch view">
             <button className={!isOps ? "active" : ""} onClick={() => isOps && switchView()} aria-pressed={!isOps}>
-              User view
+              User<span className="wide-only"> view</span>
             </button>
             <button className={isOps ? "active" : ""} onClick={() => !isOps && switchView()} aria-pressed={isOps}>
-              Operator view
+              Operator<span className="wide-only"> view</span>
             </button>
           </div>
           <div className="topbar-right">
@@ -126,14 +143,16 @@ export function App() {
               className={`pending-badge ${pending.length ? "has" : ""}`}
               title={pending.map((p) => p.title).join("\n") || "Nothing waiting for you"}
               onClick={() => firstPending && navigate(pageOfApproval(firstPending))}
+              aria-label={pending.length ? `${pending.length} decision${pending.length === 1 ? "" : "s"} waiting for you: open the first` : "Nothing waiting for you"}
             >
-              {pending.length} pending
+              {pending.length}
+              <span className="wide-only"> pending</span>
             </button>
             <span className="me">@{me?.login ?? "…"}</span>
           </div>
         </header>
         {me?.catalogError && <div className="error-banner">Product catalog problem: {me.catalogError}</div>}
-        <main className="content">
+        <main className="content" id="main" tabIndex={-1}>
           <Routes>
             <Route path="/" element={me ? <Navigate to={me.landingView === "operator" ? "/ops/runs" : "/start"} replace /> : null} />
             <Route element={<UserLayout />}>

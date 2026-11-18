@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Proposed (v2.9) — for review |
+| **Status** | Proposed (v3.0) — for review |
 | **Date** | 2026-11-15 |
 | **Phase** | Reference architecture — follows the [capability map](capabilities.md), the [non-functional requirements](non-functional-requirements.md) and the [functional requirements](functional-requirements.md) of iteration 2 |
 
@@ -1266,7 +1266,7 @@ Iteration 2 is built on the **personal deployment** (local Docker, GitHub, Anthr
 
 ## 25. Next: the user view as pages with an agent panel
 
-Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, AD-38, AD-43 revised, AD-44 new). **U1 and U2 are built, and the first step of U3** (the assistant only on the start page); the rest of U3 is not.
+Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, AD-38, AD-43 revised, AD-44 new). **U1, U2 and U3 are built.**
 
 **Why.** Through v2.4 a run's conversation held the orchestrator's cards, the architect's design session and the assistant's answers in one stream, and the composer's addressee followed the run's state. People could not always tell which agent they were addressing, decisions scrolled away in long runs, and trusted records sat between untrusted agent text. Five layouts were compared: one thread per agent in the side panel, a workspace with tabs, pages with an agent panel (chosen), threads attached to records, and conversations side by side (kept as a later add-on).
 
@@ -1332,6 +1332,14 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 - *Run and sub-task pages:* the agent switch lists only the page's agents (the architect; the implementer, later). The foot of the panel links to the start page with the run named (`/start?about=<run>`), where the composer starts with it. The page queries no longer return the assistant.
 - *Old links:* `/chat` and `/chat/new` open the start page; `/chat/<id>` opens a chat on the start page, a run's or sub-task's conversation on its page. The toggle maps the start page to the runs list and back.
 
+**U3, the rest as built.**
+
+- *Prepared actions (AD-45).* An approval of kind `action` with a `prepared_action` card on the run's page: cancel, or switch track. The assistant's `prepare_action` tool checks that the action can be taken now (the same rule as the track switch, FR-A3), replaces an older prepared action of the run that is still waiting, and records the request it acted on: the person's message of that turn, taken from the record, never from the model. The person confirms or dismisses it on the page (`POST /api/approvals/:id/action`), bound to the card's hash; on confirm the orchestrator checks again (a run that moved on marks it "could not be done", with the reason) and sends the same signal as the person's own cancel or switch, with a reason that names who confirmed it and that the assistant prepared it. A prepared action still waiting is closed with its run.
+- *Reading conversations.* `read_conversation` returns the architect's conversation of a run (the last 40 messages, 2,000 characters each) marked as untrusted, quoted text; the assistant's instructions say to quote it and never to act on it. It has no way to write there.
+- *Instructions.* The assistant's instructions (profile version 2) describe the start page, the tracks with their stops, the requester's check of each change, the access checks, the switch rules, its tools, and what it never does.
+- *Phone width (FR-C6).* *Work* in the header opens the side panel as a drawer (closed by choosing a page, Escape or the backdrop); the agent panel is a sheet over the page with *Back to the page*; focus moves into a sheet and back to its button when it closes; the header is compact.
+- *Accessibility (NFR-UX-01).* An axe audit (WCAG 2.0 to 2.2 A and AA rules, and best practices) of every kind of page in both themes and at phone width, with decisions waiting on them, and a keyboard walk. Fixed: the status colours of the light theme (now 4.5:1 on their tints and on every surface), the pending badge of the dark theme, links in text (underlined), the agent switch (toggle buttons instead of an incomplete tab pattern), markers in the side panel (named for screen readers), the conversation (a log announced politely, the reply being written not read word by word), a skip link, visible focus, 24-pixel targets, and reduced motion. Not done: a check by people with screen readers.
+
 ## Change history
 
 | Version | Change |
@@ -1349,3 +1357,4 @@ Decided after iteration 2 (functional requirements v1.7, FR-C1 to FR-C6; AD-25, 
 | 2.7 | U1 built (§25): the card table and its migration, page queries, run and sub-task pages with Needs you, navigation to pages; data model of `card` |
 | 2.8 | U2 built (§25): conversations with an agent and the split of run conversations, routing by conversation, agent availability on pages, markers in the architect's conversation, the agent panel |
 | 2.9 | U3 step 1 built (§25): the start page with the assistant and the person's chats; the side panel holds the work only; run and sub-task panels list their own agents and link to the assistant with the run named |
+| 3.0 | U3 built (§25): prepared actions confirmed on the run's page (AD-45), the assistant's `read_conversation` and `prepare_action` tools and rewritten instructions, the phone layout, and the accessibility pass |

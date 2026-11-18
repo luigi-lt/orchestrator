@@ -1007,6 +1007,7 @@ export async function listPendingApprovals(db: Queryable, runId?: string): Promi
     change: "Check a change before its pull request",
     dependents: "Decide on sub-tasks that depend on one that was not delivered",
     blocked: "Fix access to a repository, then retry",
+    action: "Confirm an action the assistant prepared",
   };
   return rows.map((r) => ({
     id: r.id,

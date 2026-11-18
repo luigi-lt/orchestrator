@@ -42,6 +42,8 @@ export function OrchestratorCardView({ card }: { card: OrchestratorCard }) {
       return <DependentsCard card={card} />;
     case "blocked":
       return <BlockedCard card={card} />;
+    case "prepared_action":
+      return <PreparedActionCard card={card} />;
     case "story":
       return <StoryCard card={card} />;
     case "pull_request":
@@ -94,7 +96,14 @@ function WorkItemCard({ card }: { card: CardOf<"work_item"> }) {
   );
 }
 
-const SECTION_NAME: Record<string, string> = { analysis: "analysis", plan: "plan", progress: "progress", pull_request: "pull request", work_item: "work item" };
+const SECTION_NAME: Record<string, string> = {
+  analysis: "analysis",
+  plan: "plan",
+  progress: "progress",
+  pull_request: "pull request",
+  work_item: "work item",
+  "needs-you": "decisions waiting for you",
+};
 
 /** A link to a run's page, or to one section of it: the record itself stays on the page (AD-44). */
 function RunLinkCard({ card }: { card: CardOf<"run_link"> }) {
@@ -103,13 +112,24 @@ function RunLinkCard({ card }: { card: CardOf<"run_link"> }) {
   return (
     <div className="card">
       <div className="card-head">
-        <span className="kicker">{card.section ? `The ${SECTION_NAME[card.section] ?? card.section} of a run` : "Run started · it has its own page"}</span>
+        <span className="kicker">
+          {card.section === "needs-you"
+            ? "Prepared · confirm it on the run's page"
+            : card.section
+              ? `The ${SECTION_NAME[card.section] ?? card.section} of a run`
+              : "Run started · it has its own page"}
+        </span>
         <Link className="small" to={`/ops/runs/${card.runId}`}>
           Run details
         </Link>
       </div>
       <Link to={to} className="card-title">
-        {card.section ? `Open the ${SECTION_NAME[card.section] ?? card.section} of` : "Open the page of"} {card.repo}#{card.number} · {card.title}
+        {card.section === "needs-you"
+          ? "Confirm or dismiss it on the page of"
+          : card.section
+            ? `Open the ${SECTION_NAME[card.section] ?? card.section} of`
+            : "Open the page of"}{" "}
+        {card.repo}#{card.number} · {card.title}
       </Link>
       {!card.section && <p className="muted small">The analysis, the plan, the questions and every decision for this work are on its page.</p>}
     </div>
@@ -742,6 +762,58 @@ function ChangeCard({ card }: { card: CardOf<"change"> }) {
           <textarea value={feedback} onChange={(e) => setFeedback(e.target.value)} rows={3} placeholder="Or say what should change; the implementer does another round and the change is reviewed again" />
           <button disabled={busy || !feedback.trim()} onClick={() => void decide("changes")}>
             Request changes
+          </button>
+        </div>
+      )}
+      {error && <p className="error small">{error}</p>}
+    </div>
+  );
+}
+
+const ACTION_STATUS = { confirmed: "confirmed", dismissed: "dismissed", expired: "replaced or closed", failed: "could not be done" } as const;
+
+/**
+ * An action the assistant prepared at the requester's request (AD-45): it says who prepared it and quotes the
+ * request from the record; nothing happens until the requester confirms it here.
+ */
+function PreparedActionCard({ card }: { card: CardOf<"prepared_action"> }) {
+  const { busy, error, run } = useDecision();
+  const pending = card.status === "pending";
+  const decide = (decision: "confirm" | "dismiss") => run(() => post(`/api/approvals/${card.approvalId}/action`, { decision, hash: card.hash }));
+  const what = card.action === "cancel" ? "Cancel this run" : `Switch this run to the ${card.track} track`;
+  const effect =
+    card.action === "cancel"
+      ? "The run stops: nothing more is built or pushed. Pull requests already open stay open on GitHub."
+      : card.track === "guided"
+        ? "The change being built is set aside, nothing is pushed, and a design session with the architect agent starts from the analysis."
+        : "The design session ends; the current plan, if there is one, becomes a single change built with no stops before the pull request.";
+  return (
+    <div className={`card prepared-action ${pending ? "needs-action" : ""}`}>
+      <div className="card-head">
+        <span className="kicker">Prepared by the assistant{pending ? " · your confirmation is needed" : ""}</span>
+        <StatusBadge status={card.status === "pending" ? "pending" : ACTION_STATUS[card.status]} />
+      </div>
+      <div className="card-title">{what}</div>
+      <blockquote className="requested">
+        <span className="muted small">You asked the assistant: </span>"{card.requested}"
+      </blockquote>
+      {card.reason && (
+        <p className="small">
+          <span className="agent-origin">Assistant:</span> {card.reason}
+        </p>
+      )}
+      <p className="muted small">{effect}</p>
+      {card.note && <p className="small">{card.note}</p>}
+      <p className="small">
+        <Link to={`/start?chat=${encodeURIComponent(card.conversationId)}`}>Open the chat</Link>
+      </p>
+      {pending && (
+        <div className="actions">
+          <button className={card.action === "cancel" ? "danger" : "primary"} disabled={busy} onClick={() => void decide("confirm")}>
+            {card.action === "cancel" ? "Confirm: cancel the run" : `Confirm: switch to the ${card.track} track`}
+          </button>
+          <button className="ghost" disabled={busy} onClick={() => void decide("dismiss")}>
+            Dismiss
           </button>
         </div>
       )}

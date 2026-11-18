@@ -2,12 +2,12 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import type { ConversationDto, TicketDto } from "@orch/contracts";
 import { pageOfApproval, useApp } from "../App";
+import { HideLabel, narrow, useSheet } from "../components/Page";
 import { runLabel, runPath } from "../components/TicketTree";
 import { Conversation, NewChat } from "./ChatView";
 import { useUserNav } from "./UserLayout";
 
 const PANEL_KEY = "orch.assistantPanel";
-const narrow = () => typeof window !== "undefined" && window.matchMedia?.("(max-width: 860px)").matches;
 
 /**
  * The start page (FR-C5, AD-44): the requester's tickets that need them or are active, and the assistant in the
@@ -112,16 +112,17 @@ function AssistantPanel({ chats, chatId, about, open }: { chats: ConversationDto
     if (about || chatId) setShown(true);
   }, [about, chatId]);
 
+  const { panel, opener } = useSheet(shown, () => toggle(false));
   const current = chats.find((c) => c.id === chatId);
   if (!shown) {
     return (
-      <button className="panel-reopen" onClick={() => toggle(true)} aria-label="Show the assistant">
+      <button ref={opener} className="panel-reopen" onClick={() => toggle(true)} aria-label="Show the assistant">
         Assistant
       </button>
     );
   }
   return (
-    <aside className="agent-panel assistant-panel" aria-label="Assistant">
+    <aside ref={panel} className="agent-panel assistant-panel" aria-label="Assistant">
       <div className="agent-panel-head">
         <div className="agent-switch">
           {chatId ? (
@@ -141,7 +142,7 @@ function AssistantPanel({ chats, chatId, about, open }: { chats: ConversationDto
             </button>
           )}
           <button className="ghost small" onClick={() => toggle(false)} aria-label="Hide the assistant">
-            Hide
+            <HideLabel />
           </button>
         </div>
       </div>

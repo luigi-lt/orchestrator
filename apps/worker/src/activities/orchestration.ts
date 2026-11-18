@@ -855,7 +855,7 @@ export async function postNotice(input: {
   });
 }
 
-const DECISION_CARDS = new Set(["plan", "questions", "risk", "findings", "limits", "change", "dependents", "blocked"]);
+const DECISION_CARDS = new Set(["plan", "questions", "risk", "findings", "limits", "change", "dependents", "blocked", "prepared_action"]);
 
 /**
  * Expires the pending decisions of a run (or of one sub-task) and marks their cards as expired, each on the

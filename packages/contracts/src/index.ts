@@ -841,6 +841,29 @@ export const BlockedCard = z.object({
   problems: z.array(z.string()),
   status: z.enum(["pending", "retry", "cancel", "expired"]),
 });
+/**
+ * A run action the assistant prepared at the requester's request (AD-45): cancelling the run or switching its
+ * track. It does nothing by itself; it happens only when the requester confirms it on the run's page. The request
+ * quoted is the requester's own message, from the record.
+ */
+export const PreparedActionCard = z.object({
+  type: z.literal("prepared_action"),
+  runId: z.string(),
+  approvalId: z.string(),
+  hash: z.string(),
+  action: z.enum(["cancel", "switch_track"]),
+  /** For a track switch: the track the run moves to. */
+  track: Track.optional(),
+  /** The requester's message in the chat that asked for it. */
+  requested: z.string(),
+  /** The assistant's note on why, shown as the assistant's text. */
+  reason: z.string().optional(),
+  /** The chat it was prepared in. */
+  conversationId: z.string(),
+  status: z.enum(["pending", "confirmed", "dismissed", "expired", "failed"]),
+  /** Why it was not done, when it failed or was replaced. */
+  note: z.string().optional(),
+});
 /** A sub-task was not delivered and others that have not started depend on it: the requester decides (FR-R4). */
 export const DependentsCard = z.object({
   type: z.literal("dependents"),
@@ -903,6 +926,7 @@ export const OrchestratorCard = z.discriminatedUnion("type", [
   ChangeCard,
   DependentsCard,
   BlockedCard,
+  PreparedActionCard,
   StoryCard,
   PullRequestCard,
   NoticeCard,
@@ -925,6 +949,7 @@ export const SYSTEM_ONLY_TYPES = new Set<string>([
   "change",
   "dependents",
   "blocked",
+  "prepared_action",
   "story",
   "pull_request",
   "notice",
@@ -1163,7 +1188,8 @@ export interface RunEventDto {
   occurredAt: string;
 }
 
-export type ApprovalKind = "plan" | "questions" | "risk" | "findings" | "limits" | "change" | "dependents" | "blocked";
+/** "action": a cancel or a track switch the assistant prepared, waiting for the requester's confirmation (AD-45). */
+export type ApprovalKind = "plan" | "questions" | "risk" | "findings" | "limits" | "change" | "dependents" | "blocked" | "action";
 
 export interface ApprovalDto {
   id: string;
@@ -1303,6 +1329,10 @@ export type DependentsDecision = z.infer<typeof DependentsDecision>;
 /** A sub-task blocked by missing access: retry once the access is fixed, or cancel (AD-42). */
 export const BlockedDecision = z.object({ decision: z.enum(["retry", "cancel"]), hash: z.string() });
 export type BlockedDecision = z.infer<typeof BlockedDecision>;
+
+/** The requester confirms or dismisses an action the assistant prepared (AD-45), bound to what the card shows. */
+export const ActionDecision = z.object({ decision: z.enum(["confirm", "dismiss"]), hash: z.string() });
+export type ActionDecision = z.infer<typeof ActionDecision>;
 
 /** The requester switches the track of a run (FR-A3). The orchestrator decides whether it still can. */
 export const ChangeTrackRequest = z.object({ track: Track, reason: z.string().max(500).optional() });

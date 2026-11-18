@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import type { AgentAvailabilityDto, ApprovalDto, OrchestratorCard, PageCardDto, TicketSubtaskDto } from "@orch/contracts";
 import { subscribe } from "../api";
@@ -23,6 +23,7 @@ export const RUN_SECTIONS: SectionDef[] = [
   { id: "story", title: "Story", types: ["story", "dependents"] },
   { id: "change", title: "The change", types: ["risk", "review", "findings", "limits", "change", "blocked"] },
   { id: "pull_request", title: "Pull request", types: ["pull_request"] },
+  { id: "actions", title: "Prepared actions", types: ["prepared_action"] },
 ];
 
 /** A sub-task's page (FR-C3). Its description is the page's header. */
@@ -173,7 +174,39 @@ export function useScrollToHash(ready: boolean) {
 }
 
 const PANEL_KEY = "orch.agentPanel";
-const narrow = () => typeof window !== "undefined" && window.matchMedia?.("(max-width: 860px)").matches;
+export const narrow = () => typeof window !== "undefined" && window.matchMedia?.("(max-width: 860px)").matches;
+
+/**
+ * At phone width an agent panel is a full-screen sheet over the page (FR-C6): opening it moves the focus into it,
+ * Escape closes it, and closing it gives the focus back to the button that opened it.
+ */
+export function useSheet(open: boolean, close: () => void) {
+  const panel = useRef<HTMLElement>(null);
+  const opener = useRef<HTMLButtonElement>(null);
+  const wasOpen = useRef(open);
+  const closeRef = useRef(close);
+  closeRef.current = close;
+  useEffect(() => {
+    if (open && !wasOpen.current && narrow()) panel.current?.querySelector<HTMLElement>("textarea, button")?.focus();
+    if (!open && wasOpen.current) opener.current?.focus();
+    wasOpen.current = open;
+    if (!open || !narrow()) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && closeRef.current();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+  return { panel, opener };
+}
+
+/** "Hide" beside the page; "Back to the page" when the panel is a sheet over it. */
+export function HideLabel() {
+  return (
+    <>
+      <span className="wide-only">Hide</span>
+      <span className="narrow-only">‹ Back to the page</span>
+    </>
+  );
+}
 
 const STATE_WORD: Record<AgentAvailabilityDto["state"], string> = {
   available: "talk now",
@@ -241,36 +274,36 @@ export function AgentPanel({ agents, runId }: { agents: AgentAvailabilityDto[]; 
       return next;
     });
   };
+  const { panel, opener } = useSheet(open, () => toggle(false));
   if (!selected) return null;
   if (!open) {
     return (
-      <button className="panel-reopen" onClick={() => toggle(true)} aria-label={`Show the agent panel: ${selected.name}`}>
+      <button ref={opener} className="panel-reopen" onClick={() => toggle(true)} aria-label={`Show the agent panel: ${selected.name}`}>
         {selected.name} · {STATE_WORD[selected.state]}
-        {unread.size > 0 && <span className="reply-dot" aria-label="new reply" />}
+        {unread.size > 0 && <span className="reply-dot" role="img" aria-label="new reply" />}
       </button>
     );
   }
   return (
-    <aside className="agent-panel" aria-label="Agents">
+    <aside ref={panel} className="agent-panel" aria-label="Agents">
       <div className="agent-panel-head">
-        <div className="agent-switch" role="tablist" aria-label="Agent">
+        <div className="agent-switch" role="group" aria-label="Agents of this page">
           {agents.map((a) => (
             <button
               key={a.agent}
-              role="tab"
-              aria-selected={a.agent === selected.agent}
+              aria-pressed={a.agent === selected.agent}
               className={`agent-tab ${a.state} ${a.agent === selected.agent ? "selected" : ""}`}
               title={a.why ?? `${a.name}: ${STATE_WORD[a.state]}`}
               onClick={() => choose(a)}
             >
               <span className={`agent-state ${a.state}`} aria-hidden />
               {a.name}
-              {a.conversationId && unread.has(a.conversationId) && <span className="reply-dot" aria-label="new reply" />}
+              {a.conversationId && unread.has(a.conversationId) && <span className="reply-dot" role="img" aria-label="new reply" />}
             </button>
           ))}
         </div>
         <button className="ghost small" onClick={() => toggle(false)} aria-label="Hide the agent panel">
-          Hide
+          <HideLabel />
         </button>
       </div>
       {selected.conversationId && (selected.state === "available" || selected.state === "read_only") ? (

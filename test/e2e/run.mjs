@@ -91,6 +91,16 @@ const waitForPlan = (conversationId, what, pred) =>
     const card = await planCardOf(conversationId);
     return card && pred(card) ? card : null;
   }, 300_000);
+/** Sends a message to the assistant in a chat and waits for its reply. */
+const askAssistant = async (chatId, text) => {
+  const said = async () => (await api(`/api/conversations/${chatId}`)).messages.filter((m) => m.author === "front-door");
+  const before = (await said()).length;
+  await say(chatId, text);
+  return waitFor("the assistant's reply", async () => {
+    const now = await said();
+    return now.length > before ? now[now.length - 1] : null;
+  }, 90_000);
+};
 const architectSaid = async (conversationId) =>
   (await api(`/api/conversations/${conversationId}`)).messages.filter((m) => m.role === "agent" && m.author === "architect");
 const refused = (promise) => promise.then(() => false, () => true);
@@ -367,6 +377,14 @@ async function main() {
   check((await say(aboutChat.id, `About acme/demo#${story.number} (run ${again.runId}): how is it going?`)).to === "front-door", "a message in a chat goes to the assistant");
   const answered = await waitFor("the assistant's answer about the run", async () => (await api(`/api/conversations/${aboutChat.id}`)).messages.find((m) => m.author === "front-door"), 60_000);
   check(/That run is awaiting approval/.test(answered.text ?? ""), `the assistant looked the run up: "${answered.text}"`);
+  // The assistant reads the architect's conversation, read-only, and quotes it (AD-45).
+  const readChat = await api("/api/conversations", { method: "POST", body: {} });
+  const quoted = await askAssistant(readChat.id, `What did the architect say on ${again.runId}?`);
+  const lastArchitect = (await architectSaid(conv)).pop();
+  check(
+    /Quoting the architect's conversation, the architect said: "/.test(quoted.text ?? "") && (quoted.text ?? "").includes((lastArchitect.text ?? "").slice(0, 40)),
+    "the assistant reads the architect's conversation and quotes it as such",
+  );
   check((await api(`/api/conversations/${conv}`)).messages.every((m) => m.author !== "front-door"), "the assistant never writes in the architect's conversation");
 
   await say(conv, "One more constraint: do not rename anything");
@@ -808,8 +826,54 @@ async function main() {
   await say(conv13, "Fine, put it up for approval");
   const proposed13 = await waitForPlan(conv13, "the plan put up for approval", (c) => c.status === "proposed" && !!c.approvalId);
   check(proposed13.version === 3, "with the access fixed, the plan is put up for approval");
-  await api(`/api/runs/${run13.id}/cancel`, { method: "POST", body: { reason: "end of test" } });
-  await waitForState(run13.id, ["cancelled"], 120_000);
+
+  // The assistant prepares the actions the requester asks for; they happen only when confirmed on the run's page (AD-45).
+  const actChat = await api("/api/conversations", { method: "POST", body: {} });
+  const actReply = await askAssistant(actChat.id, `Please switch ${run13.id} to the fast track`);
+  const switchPrepared = await decisionCard(run13.id, conv13, "action");
+  check(
+    switchPrepared.card.type === "prepared_action" && switchPrepared.card.action === "switch_track" && switchPrepared.card.track === "fast" &&
+      switchPrepared.card.requested === `Please switch ${run13.id} to the fast track` && switchPrepared.card.conversationId === actChat.id,
+    "asked in a chat, the assistant prepares the track switch: it waits on the run's page with the request quoted from the chat",
+  );
+  check(
+    (await pageOf(run13.id)).needsYou.some((a) => a.id === switchPrepared.approval.id && a.label === "Confirm an action the assistant prepared") &&
+      (await api(`/api/runs/${run13.id}`)).run.track === "guided",
+    "it is listed under Needs you, and nothing has changed yet",
+  );
+  check(
+    /Confirm or dismiss it under Needs you/.test(actReply.text ?? "") &&
+      (await api(`/api/conversations/${actChat.id}`)).messages.some((m) => m.components.some((c) => c.type === "run_link" && c.section === "needs-you" && c.runId === run13.id)),
+    "the chat says where to confirm it, with a link to the run's page",
+  );
+  await api(`/api/approvals/${switchPrepared.approval.id}/action`, { method: "POST", body: { decision: "dismiss", hash: switchPrepared.card.hash } });
+  check(
+    (await cardsOf(conv13)).find((c) => c.approvalId === switchPrepared.approval.id)?.status === "dismissed" &&
+      !(await api("/api/pending")).some((p) => p.id === switchPrepared.approval.id) &&
+      (await api(`/api/runs/${run13.id}`)).run.track === "guided",
+    "dismissed on the page, it leaves Needs you and the run stays as it was",
+  );
+  const notNow = await askAssistant(actChat.id, `Please switch ${fastRun.id} to the guided track`);
+  check(/could not prepare it: The run has ended/.test(notNow.text ?? "") && !(await api("/api/pending")).some((p) => p.runId === fastRun.id), "an action that cannot be taken now is not prepared, and the assistant says why");
+  await askAssistant(actChat.id, `Switch ${run13.id} to the fast track after all`);
+  const replaced = await decisionCard(run13.id, conv13, "action");
+  await askAssistant(actChat.id, `Actually, cancel ${run13.id}`);
+  const cancelPrepared = await waitFor("the prepared cancel", async () => {
+    const d = await decisionCard(run13.id, conv13, "action");
+    return d.card.action === "cancel" ? d : null;
+  }, 60_000);
+  check(
+    (await cardsOf(conv13)).find((c) => c.approvalId === replaced.approval.id)?.status === "expired" && !(await api("/api/pending")).some((p) => p.id === replaced.approval.id),
+    "a newer prepared action replaces the older one still waiting",
+  );
+  check(await refused(api(`/api/approvals/${cancelPrepared.approval.id}/action`, { method: "POST", body: { decision: "confirm", hash: "stale" } })), "a confirmation with a stale hash is refused");
+  await api(`/api/approvals/${cancelPrepared.approval.id}/action`, { method: "POST", body: { decision: "confirm", hash: cancelPrepared.card.hash } });
+  const cancelled13 = await waitForState(run13.id, ["cancelled"], 120_000);
+  check(
+    cancelled13.events.some((e) => e.type === "run.cancelled" && /Cancelled by tester \(prepared by the assistant at their request: "Actually, cancel/.test(e.payload.text ?? "")) &&
+      (await cardsOf(conv13)).find((c) => c.approvalId === cancelPrepared.approval.id)?.status === "confirmed",
+    "confirmed on the page, the run is cancelled; the record says who confirmed it and that the assistant prepared it",
+  );
 
   console.log("14. The model provider is overloaded: the step is tried again after a pause, and the run goes on");
   await call(MODEL, "/_test/overload", { method: "POST", body: { count: 15 } });
